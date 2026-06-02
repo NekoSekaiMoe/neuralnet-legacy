@@ -1,52 +1,63 @@
-cmake_minimum_required(VERSION 3.20)
+if(CMAKE_SOURCE_DIR STREQUAL CMAKE_BINARY_DIR AND NOT MSVC_IDE)
+  message(FATAL_ERROR "In-source builds are not allowed. Please create a separate build directory.")
+endif()
+
+cmake_minimum_required(VERSION 3.25)
 project(neuralnet.cpp VERSION 1.0.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_EXTENSIONS OFF)
+
+include(GNUInstallDirs)
 
 # 为所有目标添加编译标志
-add_compile_options(-Wall -Wextra -O2)
-
-# 启用 CTest
-enable_testing()
+add_compile_options(-Wall -Wextra -O3 -pipe)
 
 # 链接 TBB（GCC libstdc++ 的 <execution> 并行策略后端）
 find_package(TBB REQUIRED)
 
-# ── 主程序 ────────────────────────────────────────────────────────────────────
-add_executable(mnist_train src/train.cpp)
-add_executable(mnist_infer src/infer.cpp)
+# 子目录
+add_subdirectory(src)
 
-target_link_libraries(mnist_train PRIVATE TBB::tbb)
-target_link_libraries(mnist_infer PRIVATE TBB::tbb)
+# 启用 CTest
+enable_testing()
+add_subdirectory(tests)
 
-target_include_directories(mnist_train PRIVATE ${CMAKE_SOURCE_DIR}/include)
-target_include_directories(mnist_infer PRIVATE ${CMAKE_SOURCE_DIR}/include)
-
-# ── 测试 ──────────────────────────────────────────────────────────────────────
-add_executable(test_nn src/test_nn.cpp)
-target_link_libraries(test_nn PRIVATE TBB::tbb)
-target_include_directories(test_nn PRIVATE ${CMAKE_SOURCE_DIR}/include)
-
-# 每个 test_entry 注册为独立 CTest，方便 ctest 单独运行/过滤
-set(nn_test_names
-    counting_iterator
-    matrix_construction
-    matrix_arithmetic
-    matrix_transpose
-    matrix_multiplication
-    relu
-    linear_forward_backward
-    mse_loss
-    cross_entropy_loss
-    sgd
-    sgd_momentum
-    model_forward
-    model_io
-    one_hot
-    e2e_train
+# ── Install ────────────────────────────────────────────────────────────────────
+install(
+    TARGETS mnist_train mnist_infer
+    EXPORT neuralnet-targets
+    RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
 )
 
-foreach(name ${nn_test_names})
-    add_test(NAME ${name} COMMAND test_nn ${name})
-endforeach()
+install(
+    DIRECTORY ${PROJECT_SOURCE_DIR}/include/neuralnet
+    DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
+    FILES_MATCHING PATTERN "*.h"
+)
+
+install(
+    EXPORT neuralnet-targets
+    NAMESPACE neuralnet::
+    DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/neuralnet
+)
+
+include(CMakePackageConfigHelpers)
+configure_package_config_file(
+    ${CMAKE_CURRENT_SOURCE_DIR}/cmake/neuralnet-config.cmake.in
+    ${CMAKE_CURRENT_BINARY_DIR}/neuralnet-config.cmake
+    INSTALL_DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/neuralnet
+)
+write_basic_package_version_file(
+    ${CMAKE_CURRENT_BINARY_DIR}/neuralnet-config-version.cmake
+    VERSION ${PROJECT_VERSION}
+    COMPATIBILITY SameMajorVersion
+)
+
+install(
+    FILES
+        ${CMAKE_CURRENT_BINARY_DIR}/neuralnet-config.cmake
+        ${CMAKE_CURRENT_BINARY_DIR}/neuralnet-config-version.cmake
+    DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/neuralnet
+)
