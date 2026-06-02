@@ -8,13 +8,12 @@
 #include <functional>
 #include <numeric>
 #include <random>
-#include <ranges>
 #include <stdexcept>
 #include <utility>
 #include <vector>
-#include "matrix.hpp"
+#include <neuralnet/matrix.h>
 
-#include <neuralnet.cpp/nn_config.hpp>
+#include <neuralnet/nn/config.h>
 
 namespace nn
 {
@@ -48,15 +47,15 @@ namespace nn
         Linear(std::size_t in_features, std::size_t out_features)
             : W_(out_features, in_features),
               b_(out_features, 1),
-              grad_W_(out_features, in_features), // 添加
-              grad_b_(out_features, 1),           // 添加
+              grad_W_(out_features, in_features),
+              grad_b_(out_features, 1),
               input_cache_()
         {
             // Xavier 均匀初始化：适合 tanh/sigmoid，对 ReLU 也可用
             const double limit = std::sqrt(6.0 / static_cast<double>(in_features + out_features));
             std::uniform_real_distribution<double> dist(-limit, limit);
-            std::ranges::generate(W_.data(), [&]
-                                  { return dist(rng_); });
+            std::generate(W_.data().begin(), W_.data().end(),
+                          [&] { return dist(rng_); });
         }
 
         std::vector<std::reference_wrapper<Matrix>> parameters() override
@@ -80,9 +79,10 @@ namespace nn
             const Matrix product = W_ * input;
             Matrix result(product.rows(), product.cols());
 
-            // 并行 bias 加法：使用 iota 生成索引，避免 std::transform 值类型混淆
-            auto indices = std::views::iota(std::size_t{0}, product.size());
-            std::for_each(NN_EXEC_POLICY, indices.begin(), indices.end(),
+            // 并行 bias 加法：使用 counting_iterator 生成索引
+            std::for_each(NN_EXEC_POLICY,
+                          counting_iterator<std::size_t>(0),
+                          counting_iterator<std::size_t>(product.size()),
                           [&](std::size_t idx) noexcept
                           {
                               const std::size_t row = idx / product.cols();
@@ -109,8 +109,9 @@ namespace nn
 
             // 计算 grad_input: dL/dx = W^T * dL/dy
             Matrix grad_input(in_feat, batch);
-            auto grad_in_indices = std::views::iota(std::size_t{0}, in_feat * batch);
-            std::for_each(NN_EXEC_POLICY, grad_in_indices.begin(), grad_in_indices.end(),
+            std::for_each(NN_EXEC_POLICY,
+                          counting_iterator<std::size_t>(0),
+                          counting_iterator<std::size_t>(in_feat * batch),
                           [&, this](std::size_t idx) noexcept
                           {
                               const std::size_t input_feature = idx / batch;
@@ -125,8 +126,9 @@ namespace nn
                           });
 
             // 计算 grad_W: dL/dW = dL/dy * x^T
-            auto grad_w_indices = std::views::iota(std::size_t{0}, out_feat * in_feat);
-            std::for_each(NN_EXEC_POLICY, grad_w_indices.begin(), grad_w_indices.end(),
+            std::for_each(NN_EXEC_POLICY,
+                          counting_iterator<std::size_t>(0),
+                          counting_iterator<std::size_t>(out_feat * in_feat),
                           [&, this](std::size_t idx) noexcept
                           {
                               const std::size_t out_feature = idx / in_feat;
@@ -142,8 +144,9 @@ namespace nn
                           });
 
             // 计算 grad_b: dL/db = sum(dL/dy, dim=batch)
-            auto out_indices = std::views::iota(std::size_t{0}, out_feat);
-            std::for_each(NN_EXEC_POLICY, out_indices.begin(), out_indices.end(),
+            std::for_each(NN_EXEC_POLICY,
+                          counting_iterator<std::size_t>(0),
+                          counting_iterator<std::size_t>(out_feat),
                           [&, this](std::size_t out_feature) noexcept
                           {
                               double sum = 0.0;
@@ -151,9 +154,9 @@ namespace nn
                               {
                                   sum += grad_output.at_unchecked(out_feature, batch_index);
                               }
-                              grad_b_.set_value_unchecked(out_feature, 0,
-                                                          grad_b_.at_unchecked(out_feature, 0) + sum);
+                              grad_b_.set_value_unchecked(out_feature, 0, sum);
                           });
+
             return grad_input;
         }
     };
@@ -164,8 +167,6 @@ namespace nn
         Matrix input_cache_;
 
     public:
-        ReLU() = default;
-
         Matrix forward(const Matrix &input) override
         {
             input_cache_ = input;

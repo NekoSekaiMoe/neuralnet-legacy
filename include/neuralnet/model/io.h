@@ -7,9 +7,9 @@
 #include <stdexcept>
 #include <string>
 
-#include <neuralnet.cpp/nn_config.hpp>
-#include <neuralnet.cpp/layer.hpp>
-#include <neuralnet.cpp/model.hpp>
+#include <neuralnet/nn/config.h>
+#include <neuralnet/layer.h>
+#include <neuralnet/model/model.h>
 
 namespace nn
 {

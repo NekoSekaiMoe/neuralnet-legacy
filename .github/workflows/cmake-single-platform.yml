@@ -1,5 +1,5 @@
-# .github/workflows/cmake-clang-latest.yml
-name: CMake (Clang Latest, C++26)
+# .github/workflows/cmake-single-platform.yml
+name: CMake (GCC, C++17)
 
 on:
   push:
@@ -30,58 +30,60 @@ jobs:
     steps:
     - uses: actions/checkout@v4
 
-    # ========== Linux: 安装 LLVM Clang + Ninja ==========
-    - name: Install Clang & Ninja (Linux)
+    # ========== Linux: 安装 GCC + Ninja + TBB ==========
+    - name: Install GCC, Ninja & TBB (Linux)
       if: runner.os == 'Linux'
       run: |
-        wget https://apt.llvm.org/llvm.sh
-        chmod +x llvm.sh
-        sudo ./llvm.sh all
-        sudo ln -sf $(ls /usr/bin/clang-[0-9]* | sort -V | tail -n1) /usr/bin/clang
-        sudo ln -sf $(ls /usr/bin/clang++-[0-9]* | sort -V | tail -n1) /usr/bin/clang++
-        sudo apt-get install -y ninja-build p7zip-full
+        sudo apt-get update
+        sudo apt-get install -y g++ ninja-build libtbb-dev p7zip-full
 
-    # ========== Windows: 安装 LLVM Clang + Ninja ==========
-    - name: Install Clang & Ninja (Windows)
+    # ========== Windows: 安装 GCC (MinGW) + Ninja + TBB ==========
+    - name: Install GCC, Ninja & TBB (Windows)
       if: runner.os == 'Windows'
       shell: pwsh
       run: |
-        choco install llvm --yes --no-progress
+        choco install mingw --yes --no-progress
         choco install ninja --yes --no-progress
         choco install 7zip --yes --no-progress
-        # 将 LLVM 的 bin 目录加入 PATH
-        $llvmPath = "C:\Program Files\LLVM\bin"
-        echo "$llvmPath" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+        # vcpkg 安装 TBB
+        git clone https://github.com/microsoft/vcpkg.git C:\vcpkg
+        cd C:\vcpkg
+        .\bootstrap-vcpkg.bat
+        .\vcpkg install tbb:x64-mingw-dynamic
+        $vcpkgDir = "C:\vcpkg\installed\x64-mingw-dynamic"
+        echo "CMAKE_PREFIX_PATH=$vcpkgDir" >> $env:GITHUB_ENV
+        echo "TBB_DIR=$vcpkgDir\lib\cmake\TBB" >> $env:GITHUB_ENV
 
-    # ========== CMake 配置（分平台，因为 bash/pwsh 换行语法不同）==========
+    # ========== CMake 配置（Linux）==========
     - name: Configure CMake (Linux)
       if: runner.os == 'Linux'
       run: |
         cmake -B ${{github.workspace}}/build \
           -G Ninja \
-          -DCMAKE_CXX_COMPILER=clang++ \
-          -DCMAKE_C_COMPILER=clang \
+          -DCMAKE_CXX_COMPILER=g++ \
+          -DCMAKE_C_COMPILER=gcc \
           -DCMAKE_BUILD_TYPE=${{env.BUILD_TYPE}} \
-          -DCMAKE_CXX_STANDARD=26 \
+          -DCMAKE_CXX_STANDARD=17 \
           -DCMAKE_CXX_STANDARD_REQUIRED=ON
       env:
-        CC: clang
-        CXX: clang++
+        CC: gcc
+        CXX: g++
 
+    # ========== CMake 配置（Windows）==========
     - name: Configure CMake (Windows)
       if: runner.os == 'Windows'
       shell: pwsh
       run: |
         cmake -B ${{github.workspace}}/build `
           -G Ninja `
-          -DCMAKE_CXX_COMPILER=clang++ `
-          -DCMAKE_C_COMPILER=clang `
+          -DCMAKE_CXX_COMPILER=g++ `
+          -DCMAKE_C_COMPILER=gcc `
           -DCMAKE_BUILD_TYPE=${{env.BUILD_TYPE}} `
-          -DCMAKE_CXX_STANDARD=26 `
+          -DCMAKE_CXX_STANDARD=17 `
           -DCMAKE_CXX_STANDARD_REQUIRED=ON
       env:
-        CC: clang
-        CXX: clang++
+        CC: gcc
+        CXX: g++
 
     - name: Build
       run: cmake --build ${{github.workspace}}/build --config ${{env.BUILD_TYPE}}
@@ -143,8 +145,8 @@ jobs:
           自动构建版本，commit: ${{ github.sha }}
 
           ### 构建环境
-          - Compiler: Clang (Latest)
-          - C++ Standard: C++26
+          - Compiler: GCC
+          - C++ Standard: C++17
 
           | 平台 | 产物 |
           |------|------|

@@ -1,5 +1,5 @@
-#include <neuralnet.cpp/nn.hpp>
-#include <neuralnet.cpp/model_io.hpp>
+#include <neuralnet/nn/nn.h>
+#include <neuralnet/model/io.h>
 #include <iostream>
 #include <fstream>
 #include <sstream>

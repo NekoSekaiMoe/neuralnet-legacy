@@ -9,12 +9,11 @@
 #include <functional>
 #include <numeric>
 #include <random>
-#include <ranges>
 #include <stdexcept>
 #include <utility>
 #include <vector>
 
-#include <neuralnet.cpp/nn_config.hpp>
+#include <neuralnet/nn/config.h>
 
 namespace nn
 {
@@ -65,8 +64,8 @@ namespace nn
         // 访问器
         [[nodiscard]] constexpr std::size_t rows() const noexcept { return rows_; }
         [[nodiscard]] constexpr std::size_t cols() const noexcept { return cols_; }
-        [[nodiscard]] constexpr std::size_t size() const noexcept { return data_.size(); }
-        [[nodiscard]] constexpr bool empty() const noexcept { return data_.empty(); }
+        [[nodiscard]] std::size_t size() const noexcept { return data_.size(); }
+        [[nodiscard]] bool empty() const noexcept { return data_.empty(); }
         [[nodiscard]] double at(std::size_t row, std::size_t col) const
         {
             if (row >= rows_ || col >= cols_)
@@ -83,8 +82,8 @@ namespace nn
             }
             data_[index(row, col)] = value;
         }
-        [[nodiscard]] constexpr double at_unchecked(std::size_t row, std::size_t col) const noexcept { return data_[index(row, col)]; } // 无校验
-        constexpr void set_value_unchecked(std::size_t row, std::size_t col, double value) noexcept { data_[index(row, col)] = value; } // 无校验
+        [[nodiscard]] double at_unchecked(std::size_t row, std::size_t col) const noexcept { return data_[index(row, col)]; }
+        void set_value_unchecked(std::size_t row, std::size_t col, double value) noexcept { data_[index(row, col)] = value; }
         [[nodiscard]] const std::vector<double> &data() const noexcept { return data_; }
         [[nodiscard]] std::vector<double> &data() noexcept { return data_; }
         [[nodiscard]] std::vector<std::vector<double>> get_data() const
@@ -102,27 +101,6 @@ namespace nn
 
         void set_data(const std::vector<std::vector<double>> &new_data)
         {
-            if (new_data.empty())
-            {
-                rows_ = 0;
-                cols_ = 0;
-                data_.clear();
-                return;
-            }
-
-            const std::size_t new_rows = new_data.size();
-            const std::size_t new_cols = new_data.front().size();
-            for (const auto &row : new_data)
-            {
-                if (row.size() != new_cols)
-                {
-                    throw std::invalid_argument("all rows must have the same number of columns");
-                }
-            }
-
-            rows_ = new_rows;
-            cols_ = new_cols;
-            data_.resize(rows_ * cols_);
             for (std::size_t row = 0; row < rows_; ++row)
             {
                 for (std::size_t col = 0; col < cols_; ++col)
@@ -136,16 +114,12 @@ namespace nn
         {
             Matrix result(cols_, rows_);
 
-            // 块内行列数，32×32×8byte = 8KB，安全装入 L1
-
             const std::size_t i_blocks = (rows_ + BLOCK_SIZE - 1) / BLOCK_SIZE;
             const std::size_t j_blocks = (cols_ + BLOCK_SIZE - 1) / BLOCK_SIZE;
 
-            auto block_indices = std::views::iota(
-                std::size_t{0}, i_blocks * j_blocks);
-
             std::for_each(NN_EXEC_POLICY,
-                          block_indices.begin(), block_indices.end(),
+                          counting_iterator<std::size_t>(0),
+                          counting_iterator<std::size_t>(i_blocks * j_blocks),
                           [&](std::size_t block_idx) noexcept
                           {
                               const std::size_t ib = block_idx / j_blocks;
@@ -153,11 +127,9 @@ namespace nn
 
                               const std::size_t i0 = ib * BLOCK_SIZE;
                               const std::size_t j0 = jb * BLOCK_SIZE;
-                              const std::size_t i1 = std::min(i0 + BLOCK_SIZE, rows_); // 边界截断
+                              const std::size_t i1 = std::min(i0 + BLOCK_SIZE, rows_);
                               const std::size_t j1 = std::min(j0 + BLOCK_SIZE, cols_);
 
-                              // 块内转置：A[i][j] -> R[j][i]
-                              // 两层循环都在小块内，全部命中缓存
                               for (std::size_t i = i0; i < i1; ++i)
                                   for (std::size_t j = j0; j < j1; ++j)
                                       result.data_[j * rows_ + i] = data_[i * cols_ + j];
@@ -213,8 +185,9 @@ namespace nn
             const std::size_t i_blocks = (M + BLOCK_SIZE - 1) / BLOCK_SIZE;
             const std::size_t j_blocks = (N + BLOCK_SIZE - 1) / BLOCK_SIZE;
 
-            auto block_indices = std::views::iota(std::size_t{0}, i_blocks * j_blocks);
-            std::for_each(NN_EXEC_POLICY, block_indices.begin(), block_indices.end(),
+            std::for_each(NN_EXEC_POLICY,
+                          counting_iterator<std::size_t>(0),
+                          counting_iterator<std::size_t>(i_blocks * j_blocks),
                           [&](std::size_t block_idx)
                           {
                               const std::size_t i_block = block_idx / j_blocks;
@@ -288,6 +261,6 @@ namespace nn
             std::fill(data_.begin(), data_.end(), 0.0);
         }
     };
-}
+} // namespace nn
 
-#endif
+#endif // MATRIX_HPP
