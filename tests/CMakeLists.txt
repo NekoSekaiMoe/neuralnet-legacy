@@ -11,11 +11,20 @@ set(nn_test_names
     matrix_transpose
     matrix_multiplication
     relu
+    leaky_relu
+    sigmoid
+    tanh
+    gelu
+    dropout
     linear_forward_backward
     mse_loss
     cross_entropy_loss
     sgd
     sgd_momentum
+    adam
+    step_lr
+    cosine_lr
+    exp_lr
     model_forward
     model_io
     one_hot

@@ -1,6 +1,7 @@
 #include <neuralnet/nn/nn.h>
 #include <neuralnet/loss.h>
 #include <neuralnet/optimizer.h>
+#include <neuralnet/lr_scheduler.h>
 #include <neuralnet/model/model.h>
 #include <neuralnet/model/io.h>
 
@@ -342,6 +343,258 @@ static void test_sgd_momentum()
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
+// Adam 测试
+// ══════════════════════════════════════════════════════════════════════════════
+static void test_adam()
+{
+    std::puts("  [Adam] step ...");
+
+    nn::Matrix w(std::vector<double>{1.0, 2.0}, 2, 1);
+    nn::Matrix g(std::vector<double>{1.0, 1.0}, 2, 1);
+
+    nn::Adam opt({std::ref(w)}, {std::ref(g)}, 0.1); // lr=0.1 方便数值观察
+
+    // 第1步: m1 = 0.1*1 = 0.1, v1 = 0.999*1 = 0.999
+    //         m_hat = 0.1/0.1 = 1.0, v_hat = 0.999/0.001 = 999
+    //         w = 1.0 - 0.1 * 1.0 / (sqrt(999) + 1e-8)
+    opt.step();
+    // 只验证 w 下降（梯度为正，参数应减小）
+    assert(w.at(0, 0) < 1.0);
+    assert(w.at(1, 0) < 2.0);
+
+    opt.zero_grad();
+    assert(approx(g.at(0, 0), 0.0));
+    assert(approx(g.at(1, 0), 0.0));
+
+    std::puts("  [Adam] step PASSED");
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// LeakyReLU 测试
+// ══════════════════════════════════════════════════════════════════════════════
+static void test_leaky_relu()
+{
+    std::puts("  [LeakyReLU] forward & backward ...");
+
+    nn::LeakyReLU relu(0.01);
+    nn::Matrix x(std::vector<double>{-2.0, -1.0, 0.0, 1.0, 2.0}, 5, 1);
+    auto out = relu.forward(x);
+
+    assert(approx(out.at(0, 0), -0.02)); // -2 * 0.01
+    assert(approx(out.at(1, 0), -0.01)); // -1 * 0.01
+    assert(approx(out.at(2, 0), 0.0));
+    assert(approx(out.at(3, 0), 1.0));
+    assert(approx(out.at(4, 0), 2.0));
+
+    // backward: grad=1 对所有元素
+    nn::Matrix grad(std::vector<double>{1.0, 1.0, 1.0, 1.0, 1.0}, 5, 1);
+    auto grad_in = relu.backward(grad);
+    assert(approx(grad_in.at(0, 0), 0.01)); // 负区间
+    assert(approx(grad_in.at(1, 0), 0.01));
+    assert(approx(grad_in.at(2, 0), 0.0));  // x=0 处按 <=0 处理
+    assert(approx(grad_in.at(3, 0), 1.0));  // 正区间
+    assert(approx(grad_in.at(4, 0), 1.0));
+
+    std::puts("  [LeakyReLU] forward & backward PASSED");
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// Sigmoid 测试
+// ══════════════════════════════════════════════════════════════════════════════
+static void test_sigmoid()
+{
+    std::puts("  [Sigmoid] forward & backward ...");
+
+    nn::Sigmoid sig;
+    nn::Matrix x(std::vector<double>{0.0, 1.0, -1.0}, 3, 1);
+    auto out = sig.forward(x);
+
+    assert(approx(out.at(0, 0), 0.5));
+    assert(approx(out.at(1, 0), 1.0 / (1.0 + std::exp(-1.0))));
+    assert(approx(out.at(2, 0), 1.0 / (1.0 + std::exp(1.0))));
+
+    // backward at x=0: sigmoid'(0) = 0.5 * 0.5 = 0.25
+    nn::Matrix grad(std::vector<double>{1.0, 1.0, 1.0}, 3, 1);
+    auto grad_in = sig.backward(grad);
+    assert(approx(grad_in.at(0, 0), 0.25));
+
+    std::puts("  [Sigmoid] forward & backward PASSED");
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// Tanh 测试
+// ══════════════════════════════════════════════════════════════════════════════
+static void test_tanh()
+{
+    std::puts("  [Tanh] forward & backward ...");
+
+    nn::Tanh t;
+    nn::Matrix x(std::vector<double>{0.0, 1.0, -1.0}, 3, 1);
+    auto out = t.forward(x);
+
+    assert(approx(out.at(0, 0), 0.0));
+    assert(approx(out.at(1, 0), std::tanh(1.0)));
+    assert(approx(out.at(2, 0), std::tanh(-1.0)));
+
+    // backward at x=0: tanh'(0) = 1 - 0 = 1
+    nn::Matrix grad(std::vector<double>{1.0, 1.0, 1.0}, 3, 1);
+    auto grad_in = t.backward(grad);
+    assert(approx(grad_in.at(0, 0), 1.0));
+    // at x=1: tanh(1) ≈ 0.7616, grad = 1 - 0.7616^2 ≈ 0.42
+    double expected = 1.0 - std::tanh(1.0) * std::tanh(1.0);
+    assert(approx(grad_in.at(1, 0), expected));
+
+    std::puts("  [Tanh] forward & backward PASSED");
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// GELU 测试
+// ══════════════════════════════════════════════════════════════════════════════
+static void test_gelu()
+{
+    std::puts("  [GELU] forward & backward ...");
+
+    nn::GELU gelu;
+    nn::Matrix x(std::vector<double>{0.0, 1.0, -1.0, 5.0, -5.0}, 5, 1);
+    auto out = gelu.forward(x);
+
+    // GELU(0) ≈ 0
+    assert(approx(out.at(0, 0), 0.0, 1e-4));
+    // GELU(5) ≈ 5 (大正数趋近自身)
+    assert(approx(out.at(3, 0), 5.0, 1e-3));
+    // GELU(-5) ≈ 0 (大负数趋近 0)
+    assert(approx(out.at(4, 0), 0.0, 1e-3));
+    // GELU(1) > 0 且 < 1
+    assert(out.at(1, 0) > 0.0 && out.at(1, 0) < 1.0);
+    // GELU(-1) < 0 且 > -1
+    assert(out.at(2, 0) < 0.0 && out.at(2, 0) > -1.0);
+
+    // backward: GELU'(0) ≈ 0.5
+    nn::Matrix grad(std::vector<double>{1.0, 1.0, 1.0, 1.0, 1.0}, 5, 1);
+    auto grad_in = gelu.backward(grad);
+    assert(approx(grad_in.at(0, 0), 0.5, 1e-3));
+    // GELU'(5) ≈ 1
+    assert(approx(grad_in.at(3, 0), 1.0, 1e-2));
+    // GELU'(-5) ≈ 0
+    assert(approx(grad_in.at(4, 0), 0.0, 1e-2));
+
+    std::puts("  [GELU] forward & backward PASSED");
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// Dropout 测试
+// ══════════════════════════════════════════════════════════════════════════════
+static void test_dropout()
+{
+    std::puts("  [Dropout] forward & backward ...");
+
+    // 推理模式：不丢弃
+    nn::Dropout eval_drop(0.5, false);
+    nn::Matrix x(std::vector<double>{1.0, 2.0, 3.0, 4.0}, 4, 1);
+    auto out_eval = eval_drop.forward(x);
+    for (std::size_t i = 0; i < 4; ++i)
+        assert(approx(out_eval.at(i, 0), x.at(i, 0)));
+
+    // 训练模式：p=0（不丢弃）
+    nn::Dropout zero_drop(0.0, true);
+    auto out_zero = zero_drop.forward(x);
+    for (std::size_t i = 0; i < 4; ++i)
+        assert(approx(out_zero.at(i, 0), x.at(i, 0)));
+
+    // 训练模式：p=0.5，输出均值接近原始（inverted dropout 缩放）
+    nn::Dropout train_drop(0.5, true);
+    nn::Matrix big_x(1000, 1);
+    for (std::size_t i = 0; i < 1000; ++i)
+        big_x.set_value_unchecked(i, 0, 1.0);
+
+    auto out_train = train_drop.forward(big_x);
+    double sum = 0.0;
+    int zeros = 0;
+    for (std::size_t i = 0; i < 1000; ++i)
+    {
+        sum += out_train.at(i, 0);
+        if (out_train.at(i, 0) == 0.0)
+            ++zeros;
+    }
+    // 大约 50% 被置零
+    assert(zeros > 300 && zeros < 700);
+    // 均值应接近 1.0（因为 inverted scaling）
+    double mean = sum / 1000.0;
+    assert(mean > 0.7 && mean < 1.3);
+
+    std::puts("  [Dropout] forward & backward PASSED");
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// LR Scheduler 测试
+// ══════════════════════════════════════════════════════════════════════════════
+static void test_step_lr()
+{
+    std::puts("  [StepLR] step ...");
+
+    nn::StepLR sched(0.1, 3, 0.1); // lr=0.1, step_size=3, gamma=0.1
+    assert(approx(sched.get_lr(), 0.1));
+    sched.step(); // epoch 1
+    assert(approx(sched.get_lr(), 0.1));
+    sched.step(); // epoch 2
+    assert(approx(sched.get_lr(), 0.1));
+    sched.step(); // epoch 3 → 衰减
+    assert(approx(sched.get_lr(), 0.01));
+    sched.step(); // epoch 4
+    assert(approx(sched.get_lr(), 0.01));
+    sched.step(); // epoch 5
+    assert(approx(sched.get_lr(), 0.01));
+    sched.step(); // epoch 6 → 第二次衰减
+    assert(approx(sched.get_lr(), 0.001));
+
+    std::puts("  [StepLR] step PASSED");
+}
+
+static void test_cosine_lr()
+{
+    std::puts("  [CosineAnnealingLR] step ...");
+
+    nn::CosineAnnealingLR sched(1.0, 4, 0.0); // lr_max=1.0, T_max=4, lr_min=0
+    assert(approx(sched.get_lr(), 1.0)); // epoch 0: cos(0) = 1 → 1.0
+
+    sched.step(); // epoch 1: cos(π/4) ≈ 0.707 → 0.854
+    double lr1 = sched.get_lr();
+    assert(lr1 < 1.0 && lr1 > 0.0);
+
+    sched.step(); // epoch 2: cos(π/2) = 0 → 0.5
+    double lr2 = sched.get_lr();
+    assert(approx(lr2, 0.5, 1e-6));
+
+    sched.step(); // epoch 3: cos(3π/4) ≈ -0.707 → 0.146
+    double lr3 = sched.get_lr();
+    assert(lr3 > 0.0 && lr3 < lr2);
+
+    sched.step(); // epoch 4: cos(π) = -1 → 0.0
+    double lr4 = sched.get_lr();
+    assert(approx(lr4, 0.0, 1e-6));
+
+    std::puts("  [CosineAnnealingLR] step PASSED");
+}
+
+static void test_exp_lr()
+{
+    std::puts("  [ExponentialLR] step ...");
+
+    nn::ExponentialLR sched(1.0, 0.5); // lr=1.0, gamma=0.5
+    assert(approx(sched.get_lr(), 1.0));
+
+    sched.step(); // epoch 1: 1.0 * 0.5^1 = 0.5
+    assert(approx(sched.get_lr(), 0.5));
+
+    sched.step(); // epoch 2: 1.0 * 0.5^2 = 0.25
+    assert(approx(sched.get_lr(), 0.25));
+
+    sched.step(); // epoch 3: 1.0 * 0.5^3 = 0.125
+    assert(approx(sched.get_lr(), 0.125));
+
+    std::puts("  [ExponentialLR] step PASSED");
+}
+// ══════════════════════════════════════════════════════════════════════════════
 // Model 测试
 // ══════════════════════════════════════════════════════════════════════════════
 static void test_model_forward()
@@ -491,11 +744,20 @@ static const test_entry all_tests[] = {
     {"matrix_transpose",        test_matrix_transpose},
     {"matrix_multiplication",   test_matrix_multiplication_large},
     {"relu",                    test_relu},
+    {"leaky_relu",              test_leaky_relu},
+    {"sigmoid",                 test_sigmoid},
+    {"tanh",                    test_tanh},
+    {"gelu",                    test_gelu},
+    {"dropout",                 test_dropout},
     {"linear_forward_backward", test_linear_forward_backward},
     {"mse_loss",                test_mse_loss},
     {"cross_entropy_loss",      test_cross_entropy_loss},
     {"sgd",                     test_sgd},
     {"sgd_momentum",            test_sgd_momentum},
+    {"adam",                    test_adam},
+    {"step_lr",                 test_step_lr},
+    {"cosine_lr",               test_cosine_lr},
+    {"exp_lr",                  test_exp_lr},
     {"model_forward",           test_model_forward},
     {"model_io",                test_model_io},
     {"one_hot",                 test_one_hot},

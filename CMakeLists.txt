@@ -11,8 +11,32 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 
 include(GNUInstallDirs)
 
+# ── 构建类型 ──────────────────────────────────────────────────────────────────
+if(NOT CMAKE_BUILD_TYPE)
+    set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
+endif()
+
+# ── Sanitizers（仅 Debug / ASan 构建时启用）─────────────────────────────────
+option(ENABLE_ASAN "Enable AddressSanitizer" OFF)
+option(ENABLE_UBSAN "Enable UndefinedBehaviorSanitizer" OFF)
+
+if(ENABLE_ASAN)
+    add_compile_options(-fsanitize=address -fno-omit-frame-pointer)
+    add_link_options(-fsanitize=address)
+endif()
+
+if(ENABLE_UBSAN)
+    add_compile_options(-fsanitize=undefined -fno-omit-frame-pointer)
+    add_link_options(-fsanitize=undefined)
+endif()
+
 # 为所有目标添加编译标志
-add_compile_options(-Wall -Wextra -O3 -pipe)
+add_compile_options(-Wall -Wextra -pipe)
+
+# Release 专用优化；其他类型由 CMake 默认处理
+if(CMAKE_BUILD_TYPE STREQUAL "Release")
+    add_compile_options(-O3)
+endif()
 
 # 链接 TBB（GCC libstdc++ 的 <execution> 并行策略后端）
 find_package(TBB REQUIRED)
