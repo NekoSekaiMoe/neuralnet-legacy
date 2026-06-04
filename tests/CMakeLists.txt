@@ -30,6 +30,13 @@ if(BUILD_TESTING)
         model_io
         one_hot
         e2e_train
+        set_data_match
+        set_data_resize_grow
+        set_data_resize_shrink
+        set_data_from_empty
+        set_data_empty_throws
+        set_data_inconsistent_throws
+        set_data_exception_safety
     )
 
     foreach(name ${nn_test_names})

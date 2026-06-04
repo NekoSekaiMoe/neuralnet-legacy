@@ -730,6 +730,186 @@ static void test_end_to_end_train()
     std::puts("  [e2e] tiny training loop PASSED");
 }
 
+// ══════════════════════════════════════════════════════════════════════════════
+// Matrix::set_data 测试
+// ══════════════════════════════════════════════════════════════════════════════
+
+// 场景 1：尺寸匹配 → 静默填充（不应抛、不应 resize）
+static void test_set_data_match()
+{
+    std::puts("  [set_data] match: dimensions match, silent copy ...");
+
+    nn::Matrix m(2, 3);
+    m.set_data({{1, 2, 3},
+                {4, 5, 6}});
+
+    assert(m.rows() == 2);
+    assert(m.cols() == 3);
+    assert(approx(m.at(0, 0), 1.0));
+    assert(approx(m.at(0, 2), 3.0));
+    assert(approx(m.at(1, 0), 4.0));
+    assert(approx(m.at(1, 2), 6.0));
+
+    std::puts("  [set_data] match PASSED");
+}
+
+// 场景 2：尺寸不匹配（smaller matrix ← larger data）→ 警告 + 自动 resize
+static void test_set_data_resize_grow()
+{
+    std::puts("  [set_data] resize grow: 2x3 -> 3x4, warn + auto-resize ...");
+
+    nn::Matrix m(2, 3);
+    m.set_data({{1, 2, 3, 4},
+                {5, 6, 7, 8},
+                {9, 10, 11, 12}});
+
+    assert(m.rows() == 3);
+    assert(m.cols() == 4);
+    assert(approx(m.at(0, 0), 1.0));
+    assert(approx(m.at(0, 3), 4.0));
+    assert(approx(m.at(2, 0), 9.0));
+    assert(approx(m.at(2, 3), 12.0));
+
+    std::puts("  [set_data] resize grow PASSED");
+}
+
+// 场景 3：尺寸不匹配（larger matrix ← smaller data）→ 警告 + 自动 resize
+static void test_set_data_resize_shrink()
+{
+    std::puts("  [set_data] resize shrink: 4x4 -> 2x2, warn + auto-resize ...");
+
+    nn::Matrix m(4, 4, 7.0);  // 初始填 7
+    m.set_data({{10, 20},
+                {30, 40}});
+
+    assert(m.rows() == 2);
+    assert(m.cols() == 2);
+    assert(approx(m.at(0, 0), 10.0));
+    assert(approx(m.at(0, 1), 20.0));
+    assert(approx(m.at(1, 0), 30.0));
+    assert(approx(m.at(1, 1), 40.0));
+
+    std::puts("  [set_data] resize shrink PASSED");
+}
+
+// 场景 4：默认构造的 0x0 矩阵 → 警告 + 自动 resize 到非零
+static void test_set_data_from_empty()
+{
+    std::puts("  [set_data] from empty: 0x0 default -> 2x3, warn + auto-resize ...");
+
+    nn::Matrix m;  // 默认 0x0
+    assert(m.rows() == 0);
+    assert(m.cols() == 0);
+    assert(m.empty());
+
+    m.set_data({{1, 2, 3},
+                {4, 5, 6}});
+
+    assert(m.rows() == 2);
+    assert(m.cols() == 3);
+    assert(!m.empty());
+    assert(approx(m.at(0, 0), 1.0));
+    assert(approx(m.at(1, 2), 6.0));
+
+    std::puts("  [set_data] from empty PASSED");
+}
+
+// 场景 5：空 new_data → 抛 std::invalid_argument
+static void test_set_data_empty_throws()
+{
+    std::puts("  [set_data] empty: empty new_data throws invalid_argument ...");
+
+    nn::Matrix m(2, 2);
+    bool threw = false;
+    try
+    {
+        m.set_data({});
+    }
+    catch (const std::invalid_argument &)
+    {
+        threw = true;
+    }
+    catch (...)
+    {
+        // 不应该走到这里
+    }
+    assert(threw);
+
+    std::puts("  [set_data] empty throws PASSED");
+}
+
+// 场景 6：行宽不一致 → 抛 std::invalid_argument
+static void test_set_data_inconsistent_throws()
+{
+    std::puts("  [set_data] inconsistent: row widths differ throws invalid_argument ...");
+
+    nn::Matrix m(2, 2);
+    bool threw = false;
+    try
+    {
+        m.set_data({{1, 2, 3},
+                    {4, 5}});
+    }
+    catch (const std::invalid_argument &)
+    {
+        threw = true;
+    }
+    catch (...)
+    {
+    }
+    assert(threw);
+
+    std::puts("  [set_data] inconsistent throws PASSED");
+}
+
+// 场景 7：异常安全 — 抛错后矩阵状态完全保持
+static void test_set_data_exception_safety()
+{
+    std::puts("  [set_data] exception safety: state preserved after throw ...");
+
+    nn::Matrix m(2, 3);
+    m.set_data({{10, 20, 30},
+                {40, 50, 60}});
+
+    // 故意触发异常
+    try
+    {
+        m.set_data({});
+    }
+    catch (...)
+    {
+    }
+
+    // shape 必须不变
+    assert(m.rows() == 2);
+    assert(m.cols() == 3);
+
+    // 数据必须不变
+    assert(approx(m.at(0, 0), 10.0));
+    assert(approx(m.at(0, 1), 20.0));
+    assert(approx(m.at(0, 2), 30.0));
+    assert(approx(m.at(1, 0), 40.0));
+    assert(approx(m.at(1, 1), 50.0));
+    assert(approx(m.at(1, 2), 60.0));
+
+    // 再触发一次行宽不一致的异常
+    try
+    {
+        m.set_data({{1, 2}, {3, 4, 5}});
+    }
+    catch (...)
+    {
+    }
+
+    // 状态仍然不变
+    assert(m.rows() == 2);
+    assert(m.cols() == 3);
+    assert(approx(m.at(0, 0), 10.0));
+    assert(approx(m.at(1, 2), 60.0));
+
+    std::puts("  [set_data] exception safety PASSED");
+}
+
 // ── 测试注册表 ──────────────────────────────────────────────────────────────
 struct test_entry
 {
@@ -762,6 +942,13 @@ static const test_entry all_tests[] = {
     {"model_io",                test_model_io},
     {"one_hot",                 test_one_hot},
     {"e2e_train",               test_end_to_end_train},
+    {"set_data_match",          test_set_data_match},
+    {"set_data_resize_grow",    test_set_data_resize_grow},
+    {"set_data_resize_shrink",  test_set_data_resize_shrink},
+    {"set_data_from_empty",     test_set_data_from_empty},
+    {"set_data_empty_throws",   test_set_data_empty_throws},
+    {"set_data_inconsistent_throws", test_set_data_inconsistent_throws},
+    {"set_data_exception_safety",    test_set_data_exception_safety},
 };
 
 static constexpr std::size_t num_tests = sizeof(all_tests) / sizeof(all_tests[0]);
