@@ -7,6 +7,7 @@
 #include <cstddef>
 #include <execution>
 #include <functional>
+#include <iostream>
 #include <numeric>
 #include <random>
 #include <stdexcept>
@@ -101,6 +102,31 @@ namespace nn
 
         void set_data(const std::vector<std::vector<double>> &new_data)
         {
+            if (new_data.empty())
+            {
+                throw std::invalid_argument("set_data: new_data is empty");
+            }
+
+            const std::size_t new_rows = new_data.size();
+            const std::size_t new_cols = new_data.front().size();
+            for (const auto &row : new_data)
+            {
+                if (row.size() != new_cols)
+                {
+                    throw std::invalid_argument("set_data: all rows must have the same number of columns");
+                }
+            }
+
+            if (new_rows != rows_ || new_cols != cols_)
+            {
+                std::cerr << "warning: Matrix::set_data resizing from "
+                          << rows_ << "x" << cols_ << " to "
+                          << new_rows << "x" << new_cols << std::endl;
+                rows_ = new_rows;
+                cols_ = new_cols;
+                data_.resize(rows_ * cols_);
+            }
+
             for (std::size_t row = 0; row < rows_; ++row)
             {
                 for (std::size_t col = 0; col < cols_; ++col)
