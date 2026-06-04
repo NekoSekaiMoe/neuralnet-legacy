@@ -144,17 +144,17 @@ namespace nn
 
             // grad_input = W^T * grad_output       (in_feat × batch)
             // grad_W     = grad_output * input^T   (out_feat × in_feat) — REPLACE not +=
-            // grad_b     = colwise_sum(grad_output) along batch dim → (out_feat × 1)
+            // grad_b     = rowwise_sum(grad_output) along batch dim → (out_feat × 1)
             // The `=` on grad_W_ is a replace, not accumulate. The optimizer is
             // responsible for zeroing gradients before each backward pass.
+            //
+            // 用 matmul_TN / matmul_NT 直接消化转置，避免两次中间矩阵分配
+            // （旧实现先 W.transpose() / input_cache_.transpose() 后再常规 matmul）。
 
-            Matrix W_T = W_.transpose();
-            Matrix grad_input = W_T * grad_output;
+            Matrix grad_input = W_.matmul_TN(grad_output);
+            grad_W_ = grad_output.matmul_NT(input_cache_);
 
-            Matrix input_T = input_cache_.transpose();
-            grad_W_ = grad_output * input_T;
-
-            std::vector<double> b_vec = grad_output.colwise_sum();
+            std::vector<double> b_vec = grad_output.rowwise_sum();
             grad_b_ = Matrix(out_feat, 1);
             for (std::size_t i = 0; i < out_feat; ++i)
             {
@@ -347,6 +347,8 @@ namespace nn
         }
 
     public:
+        const char *name() const override { return "GELU"; }
+
         Matrix forward(const Matrix &input) override
         {
             input_cache_ = input;
@@ -396,7 +398,7 @@ namespace nn
 
         const char *name() const override { return "Dropout"; }
 
-        void set_training(bool training) noexcept { training_ = training; }
+        void on_mode_change(bool training) noexcept override { training_ = training; }
 
         Matrix forward(const Matrix &input) override
         {

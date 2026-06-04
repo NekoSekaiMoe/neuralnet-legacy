@@ -4,6 +4,17 @@ if(BUILD_TESTING)
     target_link_libraries(test_nn PRIVATE neuralnet::neuralnet)
     target_include_directories(test_nn PRIVATE ${PROJECT_SOURCE_DIR}/include)
 
+    # 测试断言基于 <cassert>。Release 构建（CMake 默认行为）会注入 -DNDEBUG，
+    # 使 assert(...) 变为空表达式，整个用例无论真假都会打印 "PASSED" — 测试形同虚设。
+    # 这里在编译标志末尾追加 -UNDEBUG，强制无视上游 NDEBUG，让 assert 始终生效。
+    # 用 -UNDEBUG 而不是 PRIVATE_OPTIONS 控制构建类型，是因为它独立于 BUILD_TYPE，
+    # CI 跑 Release 也能保留断言。
+    if(MSVC)
+        target_compile_options(test_nn PRIVATE /UNDEBUG)
+    else()
+        target_compile_options(test_nn PRIVATE -UNDEBUG)
+    endif()
+
     # 每个 test_entry 注册为独立 CTest，方便 ctest 单独运行/过滤
     set(nn_test_names
         counting_iterator
@@ -11,6 +22,7 @@ if(BUILD_TESTING)
         matrix_arithmetic
         matrix_transpose
         matrix_multiplication
+        matrix_matmul_nt_tn
         matrix_norm
         matrix_colwise_mean
         relu
@@ -21,6 +33,7 @@ if(BUILD_TESTING)
         dropout
         linear_forward_backward
         linear_backward_blocked_matmul
+        linear_backward_grad_b_nonsquare
         mse_loss
         cross_entropy_loss
         sgd

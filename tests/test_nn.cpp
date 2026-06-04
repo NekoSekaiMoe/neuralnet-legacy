@@ -12,8 +12,10 @@
 #include <fstream>
 #include <limits>
 #include <numeric>
+#include <random>
 #include <sstream>
 #include <string>
+#include <tuple>
 #include <vector>
 
 // ── 辅助：浮点近似比较 ────────────────────────────────────────────────────────
@@ -24,9 +26,9 @@ static bool approx(double a, double b, double tol = 1e-6)
 
 // ── 辅助：有限差分梯度（中心差分） ─────────────────────────────────────────────
 // 用于 BatchNorm 数值梯度校验：对 layer.parameters()[param_idx] 的
-// (row, col) 元素施加 ±eps 扰动，forward 后比较 sum(output)。
-// dL/dθ ≈ (f(θ+ε) - f(θ-ε)) / (2ε)，其中 L = Σ f(input; θ)。
-// 返回该元素对 sum-of-outputs 的偏导数。
+// (row, col) 元素施加 ±eps 扰动，forward 后比较 Σ out^2。
+// 解析路径调用方传入 grad_output = 2*out（对应 L = Σ out^2，dL/dout = 2*out），
+// 所以 FD 必须用同一个 L = Σ out^2，否则 analytical 与 fd 比较的不是同一个量。
 static double finite_diff_grad(nn::Layer &layer, const nn::Matrix &input,
                                std::size_t param_idx, std::size_t row,
                                std::size_t col, double eps = 1e-5)
@@ -35,13 +37,19 @@ static double finite_diff_grad(nn::Layer &layer, const nn::Matrix &input,
     nn::Matrix &param = params[param_idx].get();
     const double original = param.at_unchecked(row, col);
 
+    auto sum_sq = [](const nn::Matrix &m) noexcept
+    {
+        double s = 0.0;
+        for (std::size_t k = 0; k < m.size(); ++k)
+            s += m.data()[k] * m.data()[k];
+        return s;
+    };
+
     param.set_value_unchecked(row, col, original + eps);
-    auto out_plus = layer.forward(input);
-    const double loss_plus = out_plus.sum();
+    const double loss_plus = sum_sq(layer.forward(input));
 
     param.set_value_unchecked(row, col, original - eps);
-    auto out_minus = layer.forward(input);
-    const double loss_minus = out_minus.sum();
+    const double loss_minus = sum_sq(layer.forward(input));
 
     param.set_value_unchecked(row, col, original); // 还原
     return (loss_plus - loss_minus) / (2.0 * eps);
@@ -70,7 +78,7 @@ static void test_counting_iterator()
     assert(sum == 15); // 1+2+3+4+5
 
     // 非成员 operator+
-    [[maybe_unused]] auto it2 = 3 + nn::counting_iterator<std::size_t>(10);
+    auto it2 = 3 + nn::counting_iterator<std::size_t>(10);
     assert(*it2 == 13);
 
     // operator[]
@@ -216,6 +224,53 @@ static void test_matrix_multiplication_large()
     std::puts("  [Matrix] block multiplication PASSED");
 }
 
+// matmul_NT / matmul_TN 是 Linear::backward 的快路径：与朴素 (transpose + matmul)
+// 必须产生相同结果。覆盖 BLOCK_SIZE 边界（64）+ 非整除尺寸 + 极小矩阵。
+static void test_matrix_matmul_nt_tn()
+{
+    std::puts("  [Matrix] matmul_NT / matmul_TN equivalence ...");
+
+    std::mt19937_64 rng(42);
+    std::uniform_real_distribution<double> dist(-1.0, 1.0);
+
+    auto rand_mat = [&](std::size_t r, std::size_t c)
+    {
+        nn::Matrix m(r, c);
+        for (std::size_t i = 0; i < r; ++i)
+            for (std::size_t j = 0; j < c; ++j)
+                m.set_value_unchecked(i, j, dist(rng));
+        return m;
+    };
+    auto max_diff = [](const nn::Matrix &a, const nn::Matrix &b)
+    {
+        double d = 0.0;
+        for (std::size_t i = 0; i < a.size(); ++i)
+            d = std::max(d, std::fabs(a.data()[i] - b.data()[i]));
+        return d;
+    };
+
+    const std::tuple<std::size_t, std::size_t, std::size_t> shapes[] = {
+        {3, 4, 5}, {64, 64, 64}, {65, 130, 33}, {1, 1, 1}, {7, 1, 9}, {128, 200, 50},
+    };
+    for (const auto &[M, K, N] : shapes)
+    {
+        const nn::Matrix A_MK = rand_mat(M, K);
+        const nn::Matrix B_NK = rand_mat(N, K);   // for A * B^T
+        const nn::Matrix A_KM = rand_mat(K, M);   // for A^T * B
+        const nn::Matrix B_KN = rand_mat(K, N);
+
+        const nn::Matrix want_nt = A_MK * B_NK.transpose();
+        const nn::Matrix got_nt = A_MK.matmul_NT(B_NK);
+        assert(max_diff(want_nt, got_nt) < 1e-9);
+
+        const nn::Matrix want_tn = A_KM.transpose() * B_KN;
+        const nn::Matrix got_tn = A_KM.matmul_TN(B_KN);
+        assert(max_diff(want_tn, got_tn) < 1e-9);
+    }
+
+    std::puts("  [Matrix] matmul_NT / matmul_TN equivalence PASSED");
+}
+
 // ══════════════════════════════════════════════════════════════════════════════
 // Layer 测试
 // ══════════════════════════════════════════════════════════════════════════════
@@ -266,7 +321,7 @@ static void test_linear_forward_backward()
     // 参数梯度应该非零
     auto param_grads = lin.param_gradients();
     assert(param_grads.size() == 2);
-    [[maybe_unused]] bool grad_w_has_nonzero = false;
+    bool grad_w_has_nonzero = false;
     for (std::size_t i = 0; i < param_grads[0].get().rows(); ++i)
         for (std::size_t j = 0; j < param_grads[0].get().cols(); ++j)
             if (!approx(param_grads[0].get().at(i, j), 0.0))
@@ -291,13 +346,13 @@ static void test_linear_backward_blocked_matmul()
         input.data()[i] = static_cast<double>(i % 5) * 0.1;
     }
 
-    [[maybe_unused]] auto out = model.forward(input);
+    auto out = model.forward(input);
     nn::Matrix grad_out(4, 4);
     for (std::size_t i = 0; i < grad_out.size(); ++i) grad_out.data()[i] = 0.25;
     model.backward(grad_out);
 
     bool all_finite = true;
-    [[maybe_unused]] bool any_nonzero = false;
+    bool any_nonzero = false;
     for (auto& g_ref : model.param_gradients())
     {
         for (double v : g_ref.get().data())
@@ -313,8 +368,40 @@ static void test_linear_backward_blocked_matmul()
     std::puts("  [Linear::backward] blocked matmul PASSED");
 }
 
-// ══════════════════════════════════════════════════════════════════════════════
-// Loss 测试
+static void test_linear_backward_grad_b_nonsquare()
+{
+    std::puts("  [Linear::backward] grad_b correctness: out_feat(8) != batch(3) ...");
+
+    nn::Linear lin(5, 8);
+    nn::Matrix input(5, 3);
+    for (std::size_t i = 0; i < input.size(); ++i)
+        input.data()[i] = static_cast<double>(i) * 0.1;
+
+    auto out = lin.forward(input);
+    assert(out.rows() == 8);
+    assert(out.cols() == 3);
+
+    nn::Matrix grad_output(8, 3);
+    for (std::size_t i = 0; i < grad_output.size(); ++i)
+        grad_output.data()[i] = static_cast<double>(i % 7) * 0.2;
+
+    lin.backward(grad_output);
+
+    auto param_grads = lin.param_gradients();
+    const nn::Matrix &grad_b = param_grads[1].get();
+    assert(grad_b.rows() == 8);
+    assert(grad_b.cols() == 1);
+
+    for (std::size_t i = 0; i < 8; ++i)
+    {
+        double expected = 0.0;
+        for (std::size_t j = 0; j < 3; ++j)
+            expected += grad_output.at_unchecked(i, j);
+        assert(approx(grad_b.at_unchecked(i, 0), expected, 1e-12));
+    }
+
+    std::puts("  [Linear::backward] grad_b nonsquare PASSED");
+}
 // ══════════════════════════════════════════════════════════════════════════════
 static void test_mse_loss()
 {
@@ -324,11 +411,11 @@ static void test_mse_loss()
     nn::Matrix pred(std::vector<double>{1.0, 2.0, 3.0}, 3, 1);
     nn::Matrix target(std::vector<double>{1.5, 2.5, 3.5}, 3, 1);
 
-    [[maybe_unused]] double val = loss.forward(pred, target);
+    double val = loss.forward(pred, target);
     // MSE = mean((0.5)^2 + (0.5)^2 + (0.5)^2) = 0.25
     assert(approx(val, 0.25));
 
-    [[maybe_unused]] auto &grad = loss.backward();
+    auto &grad = loss.backward();
     assert(grad.rows() == 3);
     assert(grad.cols() == 1);
     // grad = 2*(pred-target)/N = 2*(-0.5)/3 = -1/3
@@ -347,10 +434,10 @@ static void test_cross_entropy_loss()
     std::vector<std::size_t> labels = {2};
     nn::Matrix target_onehot = nn::one_hot(labels, 3);
 
-    [[maybe_unused]] double val = loss.forward(logits, target_onehot);
+    double val = loss.forward(logits, target_onehot);
     assert(val > 0.0); // loss 为正
 
-    [[maybe_unused]] auto &grad = loss.backward();
+    auto &grad = loss.backward();
     assert(grad.rows() == 3);
     assert(grad.cols() == 1);
     // 梯度 = softmax(logits) - target_onehot
@@ -506,7 +593,7 @@ static void test_tanh()
     auto grad_in = t.backward(grad);
     assert(approx(grad_in.at(0, 0), 1.0));
     // at x=1: tanh(1) ≈ 0.7616, grad = 1 - 0.7616^2 ≈ 0.42
-    [[maybe_unused]] double expected = 1.0 - std::tanh(1.0) * std::tanh(1.0);
+    double expected = 1.0 - std::tanh(1.0) * std::tanh(1.0);
     assert(approx(grad_in.at(1, 0), expected));
 
     std::puts("  [Tanh] forward & backward PASSED");
@@ -584,7 +671,7 @@ static void test_dropout()
     // 大约 50% 被置零
     assert(zeros > 300 && zeros < 700);
     // 均值应接近 1.0（因为 inverted scaling）
-    [[maybe_unused]] double mean = sum / 1000.0;
+    double mean = sum / 1000.0;
     assert(mean > 0.7 && mean < 1.3);
 
     std::puts("  [Dropout] forward & backward PASSED");
@@ -623,19 +710,19 @@ static void test_cosine_lr()
     assert(approx(sched.get_lr(), 1.0)); // epoch 0: cos(0) = 1 → 1.0
 
     sched.step(); // epoch 1: cos(π/4) ≈ 0.707 → 0.854
-    [[maybe_unused]] double lr1 = sched.get_lr();
+    double lr1 = sched.get_lr();
     assert(lr1 < 1.0 && lr1 > 0.0);
 
     sched.step(); // epoch 2: cos(π/2) = 0 → 0.5
-    [[maybe_unused]] double lr2 = sched.get_lr();
+    double lr2 = sched.get_lr();
     assert(approx(lr2, 0.5, 1e-6));
 
     sched.step(); // epoch 3: cos(3π/4) ≈ -0.707 → 0.146
-    [[maybe_unused]] double lr3 = sched.get_lr();
+    double lr3 = sched.get_lr();
     assert(lr3 > 0.0 && lr3 < lr2);
 
     sched.step(); // epoch 4: cos(π) = -1 → 0.0
-    [[maybe_unused]] double lr4 = sched.get_lr();
+    double lr4 = sched.get_lr();
     assert(approx(lr4, 0.0, 1e-6));
 
     std::puts("  [CosineAnnealingLR] step PASSED");
@@ -803,7 +890,7 @@ static void test_end_to_end_train()
     nn::Matrix x(std::vector<double>{1.0, 0.0}, 2, 1);
     nn::Matrix target(std::vector<double>{0.0, 1.0}, 2, 1);
 
-    [[maybe_unused]] double loss_before = loss_fn.forward(model.forward(x), target);
+    double loss_before = loss_fn.forward(model.forward(x), target);
 
     // 训练 100 步
     for (int i = 0; i < 100; ++i)
@@ -815,7 +902,7 @@ static void test_end_to_end_train()
         optimizer.zero_grad();
     }
 
-    [[maybe_unused]] double loss_after = loss_fn.forward(model.forward(x), target);
+    double loss_after = loss_fn.forward(model.forward(x), target);
     // loss 应该下降
     assert(loss_after < loss_before);
 
@@ -1148,7 +1235,7 @@ static void test_model_save_load_v1_roundtrip()
 
     nn::Model model;
     model.add<SingleParamLayer>(1, 2);
-    [[maybe_unused]] auto &W = model.parameters()[0].get();
+    auto &W = model.parameters()[0].get();
     assert(approx(W.at(0, 0), 0.0));
     assert(approx(W.at(0, 1), 0.0));
 
@@ -1207,8 +1294,8 @@ static void test_model_save_load_v2_no_batchnorm()
 
     for (std::size_t i = 0; i < p1.size(); ++i)
     {
-        [[maybe_unused]] const auto &a = p1[i].get();
-        [[maybe_unused]] const auto &b = p2[i].get();
+        const auto &a = p1[i].get();
+        const auto &b = p2[i].get();
         assert(a.rows() == b.rows());
         assert(a.cols() == b.cols());
         for (std::size_t r = 0; r < a.rows(); ++r)
@@ -1243,7 +1330,7 @@ static void test_model_load_state_count_mismatch()
     model2.add<nn::Linear>(2, 3);
 
     ss.seekg(0);
-    [[maybe_unused]] bool threw = false;
+    bool threw = false;
     try
     {
         model2.load(ss);
@@ -1306,8 +1393,10 @@ static void test_batchnorm1d_forward_normalize()
             double d = out.at_unchecked(i, j) - mean;
             var += d * d;
         }
-        var /= 999.0;
-        assert(std::fabs(var - 1.0) < 1e-5);
+        // BN 内部用总体方差（分母 N，PyTorch 约定），所以归一化后总体方差严格为
+        // 1.0（除 eps=1e-5 引入的偏移外）。这里用同样的分母 N 才能匹配。
+        var /= 1000.0;
+        assert(std::fabs(var - 1.0) < 1e-4);
     }
 
     std::puts("  [BatchNorm1d] forward normalize PASSED");
@@ -1347,15 +1436,15 @@ static void test_batchnorm1d_eval_mode()
     auto out_eval = bn.forward(test_input);
 
     // eval 模式的输出应满足 (input - running_mean) / sqrt(running_var + eps) * gamma + beta
-    [[maybe_unused]] const auto &rm = bn.running_mean();
-    [[maybe_unused]] const auto &rv = bn.running_var();
+    const auto &rm = bn.running_mean();
+    const auto &rv = bn.running_var();
     for (std::size_t i = 0; i < 2; ++i)
     {
         const double m = rm.at_unchecked(i, 0);
         const double s = std::sqrt(rv.at_unchecked(i, 0) + 1e-5);
         for (std::size_t j = 0; j < 3; ++j)
         {
-            [[maybe_unused]] const double expected = (test_input.at_unchecked(i, j) - m) / s;
+            const double expected = (test_input.at_unchecked(i, j) - m) / s;
             assert(approx(out_eval.at_unchecked(i, j), expected, 1e-9));
         }
     }
@@ -1363,7 +1452,7 @@ static void test_batchnorm1d_eval_mode()
     // 训练模式与 eval 模式输出应有显著差异
     bn.on_mode_change(true);
     auto out_train = bn.forward(test_input);
-    [[maybe_unused]] double diff = 0.0;
+    double diff = 0.0;
     for (std::size_t i = 0; i < 2; ++i)
         for (std::size_t j = 0; j < 3; ++j)
             diff += std::fabs(out_train.at_unchecked(i, j) - out_eval.at_unchecked(i, j));
@@ -1385,7 +1474,7 @@ static void test_batchnorm1d_running_stats_update()
     bn.forward(input);
     // batch_mean[0] = 5.5, batch_mean[1] = 15.5
     // new_running_mean = (1-0.1)*0 + 0.1*batch_mean = 0.55, 1.55
-    [[maybe_unused]] const auto &rm = bn.running_mean();
+    const auto &rm = bn.running_mean();
     assert(approx(rm.at_unchecked(0, 0), 0.55, 1e-9));
     assert(approx(rm.at_unchecked(1, 0), 1.55, 1e-9));
     assert(bn.num_batches_tracked() == 1);
@@ -1403,7 +1492,8 @@ static void test_batchnorm1d_no_affine()
 
     nn::Matrix input(std::vector<double>{1.0, 2.0, 3.0, 4.0, 5.0, 6.0}, 2, 3);
     auto out = bn.forward(input);
-    auto means = out.colwise_mean();
+    // BN 按行（每个特征）归一化：每行均值应≈0、方差应≈1（总体方差，分母=N）。
+    auto means = out.rowwise_mean();
     assert(std::fabs(means[0]) < 1e-9);
     assert(std::fabs(means[1]) < 1e-9);
 
@@ -1425,7 +1515,7 @@ static void test_batchnorm1d_save_load_v2()
 
     model1.eval();
     auto out_before = model1.forward(input);
-    [[maybe_unused]] const int64_t nbt_before = bn1->num_batches_tracked();
+    const int64_t nbt_before = bn1->num_batches_tracked();
 
     const std::string path = "/tmp/nn_test_bn1d_v2.bin";
     model1.save(path);
@@ -1445,7 +1535,7 @@ static void test_batchnorm1d_save_load_v2()
         }
     }
 
-    [[maybe_unused]] auto *bn2 = static_cast<nn::BatchNorm1d *>(model2.get_layers()[0].get());
+    auto *bn2 = static_cast<nn::BatchNorm1d *>(model2.get_layers()[0].get());
     assert(bn2->num_batches_tracked() == nbt_before);
 
     std::remove(path.c_str());
@@ -1484,8 +1574,8 @@ static void test_batchnorm1d_gradient_check()
     // 检查 dgamma_ 每个元素的解析梯度 vs 有限差分
     for (std::size_t i = 0; i < 2; ++i)
     {
-        [[maybe_unused]] const double analytical = param_grads[0].get().at_unchecked(i, 0);
-        [[maybe_unused]] const double fd = finite_diff_grad(bn, input, /*param_idx=*/0, i, 0, 1e-5);
+        const double analytical = param_grads[0].get().at_unchecked(i, 0);
+        const double fd = finite_diff_grad(bn, input, /*param_idx=*/0, i, 0, 1e-5);
         assert(approx(analytical, fd, 1e-4));
     }
 
@@ -1493,8 +1583,8 @@ static void test_batchnorm1d_gradient_check()
     // 解析=0，FD=0，approx(0,0,1e-4) 仍通过。dgamma 才是真正捕捉到梯度的检查项。）
     for (std::size_t i = 0; i < 2; ++i)
     {
-        [[maybe_unused]] const double analytical = param_grads[1].get().at_unchecked(i, 0);
-        [[maybe_unused]] const double fd = finite_diff_grad(bn, input, /*param_idx=*/1, i, 0, 1e-5);
+        const double analytical = param_grads[1].get().at_unchecked(i, 0);
+        const double fd = finite_diff_grad(bn, input, /*param_idx=*/1, i, 0, 1e-5);
         assert(approx(analytical, fd, 1e-4));
     }
 
@@ -1513,7 +1603,7 @@ static void test_batchnorm1d_batch_size_one()
     assert(out.cols() == 1);
     for (std::size_t i = 0; i < out.size(); ++i)
     {
-        [[maybe_unused]] const double v = out.data()[i];
+        const double v = out.data()[i];
         assert(std::isfinite(v));
         assert(std::fabs(v) < 1e-6);
     }
@@ -1527,7 +1617,7 @@ static void test_batchnorm1d_batch_size_one()
     assert(dx.cols() == 1);
     for (std::size_t i = 0; i < dx.size(); ++i)
     {
-        [[maybe_unused]] const double v = dx.data()[i];
+        const double v = dx.data()[i];
         assert(std::isfinite(v));
         assert(std::fabs(v) < 1e-6);
     }
@@ -1586,13 +1676,13 @@ static void test_batchnorm1d_input_gradient_check()
             for (std::size_t k = 0; k < out_m.size(); ++k)
                 loss_m += out_m.data()[k] * out_m.data()[k];
 
-            [[maybe_unused]] const double fd = (loss_p - loss_m) / (2.0 * h);
+            const double fd = (loss_p - loss_m) / (2.0 * h);
             const double analytical = dx_analytical.at_unchecked(i, j);
 
             const double abs_tol = 1e-4;
             const double ref = std::fabs(analytical) > 1e-8
                                    ? std::fabs(analytical) : 1.0;
-            [[maybe_unused]] const double tol = std::max(abs_tol, 1e-4 * ref);
+            const double tol = std::max(abs_tol, 1e-4 * ref);
             assert(approx(analytical, fd, tol));
         }
     }
@@ -1625,7 +1715,8 @@ static void test_batchnorm2d_normalize()
                                          6.0, 7.0, 8.0, 9.0, 10.0},
                       2, 5);
     auto out = bn.forward(input);
-    auto means = out.colwise_mean();
+    // BN2d 按通道（行）归一化：每行均值应≈0。
+    auto means = out.rowwise_mean();
     assert(std::fabs(means[0]) < 1e-9);
     assert(std::fabs(means[1]) < 1e-9);
 
@@ -1814,13 +1905,13 @@ static void test_grad_clip_no_op_below_threshold()
     nn::Matrix g2(1, 1, 0.5);
     nn::Matrix g3(1, 1, 0.5);
 
-    [[maybe_unused]] const double total_norm =
+    const double total_norm =
         nn::clip_grad_norm_({std::ref(g1), std::ref(g2), std::ref(g3)}, 1.0);
 
     assert(approx(total_norm, std::sqrt(0.75), 1e-9));
 
     // 各梯度未变
-    for ([[maybe_unused]] auto &g_ref : {std::ref(g1), std::ref(g2), std::ref(g3)})
+    for (auto &g_ref : {std::ref(g1), std::ref(g2), std::ref(g3)})
     {
         assert(approx(g_ref.get().at_unchecked(0, 0), 0.5));
     }
@@ -1836,15 +1927,15 @@ static void test_grad_clip_scales_above_threshold()
     nn::Matrix g2(1, 1, 5.0);
     nn::Matrix g3(1, 1, 5.0);
 
-    [[maybe_unused]] const double total_norm =
+    const double total_norm =
         nn::clip_grad_norm_({std::ref(g1), std::ref(g2), std::ref(g3)}, 1.0, 1e-6);
 
     // pre-clip 总范数
     assert(approx(total_norm, std::sqrt(75.0), 1e-9));
 
     // 各梯度按 max_norm / (total_norm + eps) 缩放
-    [[maybe_unused]] const double expected = 5.0 / (std::sqrt(75.0) + 1e-6);
-    for ([[maybe_unused]] auto &g_ref : {std::ref(g1), std::ref(g2), std::ref(g3)})
+    const double expected = 5.0 / (std::sqrt(75.0) + 1e-6);
+    for (auto &g_ref : {std::ref(g1), std::ref(g2), std::ref(g3)})
     {
         assert(approx(g_ref.get().at_unchecked(0, 0), expected, 1e-9));
     }
@@ -1858,7 +1949,7 @@ static void test_grad_clip_nan_throws()
 
     nn::Matrix g(1, 1, std::numeric_limits<double>::quiet_NaN());
 
-    [[maybe_unused]] bool threw = false;
+    bool threw = false;
     try
     {
         nn::clip_grad_norm_({std::ref(g)}, 1.0);
@@ -1878,7 +1969,7 @@ static void test_grad_clip_inf_throws()
 
     nn::Matrix g(1, 1, std::numeric_limits<double>::infinity());
 
-    [[maybe_unused]] bool threw = false;
+    bool threw = false;
     try
     {
         nn::clip_grad_norm_({std::ref(g)}, 1.0);
@@ -1955,6 +2046,7 @@ static const test_entry all_tests[] = {
     {"matrix_arithmetic",       test_matrix_arithmetic},
     {"matrix_transpose",        test_matrix_transpose},
     {"matrix_multiplication",   test_matrix_multiplication_large},
+    {"matrix_matmul_nt_tn",     test_matrix_matmul_nt_tn},
     {"matrix_norm",             test_matrix_norm},
     {"matrix_colwise_mean",     test_matrix_colwise_mean},
     {"relu",                    test_relu},
@@ -1965,6 +2057,7 @@ static const test_entry all_tests[] = {
     {"dropout",                 test_dropout},
     {"linear_forward_backward", test_linear_forward_backward},
     {"linear_backward_blocked_matmul", test_linear_backward_blocked_matmul},
+    {"linear_backward_grad_b_nonsquare", test_linear_backward_grad_b_nonsquare},
     {"mse_loss",                test_mse_loss},
     {"cross_entropy_loss",      test_cross_entropy_loss},
     {"sgd",                     test_sgd},

@@ -260,6 +260,137 @@ namespace nn
             return result;
         }
 
+        // ── matmul_NT: this * other^T ─────────────────────────────────────────
+        // 等价于 (*this) * other.transpose() 但跳过显式 transpose 内存分配。
+        // 形状：this = (M, K)，other = (N, K)，result = (M, N)。
+        // 访问模式：A 行连续 + B 行连续（B^T 的列就是 B 的行），无需 b_block 转置。
+        [[nodiscard]] Matrix matmul_NT(const Matrix &other) const
+        {
+            if (cols_ != other.cols_)
+            {
+                throw std::invalid_argument("matmul_NT dimension mismatch (cols)");
+            }
+
+            const std::size_t M = rows_;
+            const std::size_t N = other.rows_;
+            const std::size_t K = cols_;
+
+            Matrix result(M, N);
+
+            const std::size_t i_blocks = (M + BLOCK_SIZE - 1) / BLOCK_SIZE;
+            const std::size_t j_blocks = (N + BLOCK_SIZE - 1) / BLOCK_SIZE;
+
+            std::for_each(NN_EXEC_POLICY,
+                          counting_iterator<std::size_t>(0),
+                          counting_iterator<std::size_t>(i_blocks * j_blocks),
+                          [&](std::size_t block_idx)
+                          {
+                              const std::size_t i_block = block_idx / j_blocks;
+                              const std::size_t j_block = block_idx % j_blocks;
+
+                              const std::size_t i_start = i_block * BLOCK_SIZE;
+                              const std::size_t i_end = std::min(i_start + BLOCK_SIZE, M);
+                              const std::size_t j_start = j_block * BLOCK_SIZE;
+                              const std::size_t j_end = std::min(j_start + BLOCK_SIZE, N);
+
+                              for (std::size_t k_start = 0; k_start < K; k_start += BLOCK_SIZE)
+                              {
+                                  const std::size_t k_end = std::min(k_start + BLOCK_SIZE, K);
+                                  const std::size_t k_len = k_end - k_start;
+
+                                  // A[i, k_start..k_end) 和 B[j, k_start..k_end) 都是行连续，
+                                  // 直接做内积，免去 b_block 转置 staging。
+                                  for (std::size_t i = i_start; i < i_end; ++i)
+                                  {
+                                      const std::size_t a_base = i * K + k_start;
+                                      for (std::size_t j = j_start; j < j_end; ++j)
+                                      {
+                                          const std::size_t b_base = j * K + k_start;
+                                          double sum = 0.0;
+                                          for (std::size_t kk = 0; kk < k_len; ++kk)
+                                              sum += data_[a_base + kk] * other.data_[b_base + kk];
+                                          result.data_[result.index(i, j)] += sum;
+                                      }
+                                  }
+                              }
+                          });
+
+            return result;
+        }
+
+        // ── matmul_TN: this^T * other ─────────────────────────────────────────
+        // 等价于 this.transpose() * other 但跳过显式 transpose 内存分配。
+        // 形状：this = (K, M)，other = (K, N)，result = (M, N)。
+        // 访问模式：A 列连续（this^T 的行）+ B 列连续。把 A 的 (K_block × M_block)
+        // 子块和 B 的 (K_block × N_block) 子块加载到栈数组，在内核里按 k 累加。
+        [[nodiscard]] Matrix matmul_TN(const Matrix &other) const
+        {
+            if (rows_ != other.rows_)
+            {
+                throw std::invalid_argument("matmul_TN dimension mismatch (rows)");
+            }
+
+            const std::size_t M = cols_;       // this^T 的行数
+            const std::size_t N = other.cols_;
+            const std::size_t K = rows_;       // 共同维度
+
+            Matrix result(M, N);
+
+            const std::size_t i_blocks = (M + BLOCK_SIZE - 1) / BLOCK_SIZE;
+            const std::size_t j_blocks = (N + BLOCK_SIZE - 1) / BLOCK_SIZE;
+
+            std::for_each(NN_EXEC_POLICY,
+                          counting_iterator<std::size_t>(0),
+                          counting_iterator<std::size_t>(i_blocks * j_blocks),
+                          [&](std::size_t block_idx)
+                          {
+                              const std::size_t i_block = block_idx / j_blocks;
+                              const std::size_t j_block = block_idx % j_blocks;
+
+                              const std::size_t i_start = i_block * BLOCK_SIZE;
+                              const std::size_t i_end = std::min(i_start + BLOCK_SIZE, M);
+                              const std::size_t j_start = j_block * BLOCK_SIZE;
+                              const std::size_t j_end = std::min(j_start + BLOCK_SIZE, N);
+                              const std::size_t i_len = i_end - i_start;
+
+                              for (std::size_t k_start = 0; k_start < K; k_start += BLOCK_SIZE)
+                              {
+                                  const std::size_t k_end = std::min(k_start + BLOCK_SIZE, K);
+                                  const std::size_t k_len = k_end - k_start;
+
+                                  // 加载 A 子块并转置到栈数组：
+                                  // a_block[ii * k_len + kk] = A(k_start+kk, i_start+ii) = this(k, i)
+                                  // 这样内层 kk 循环对 a_block 行连续。
+                                  std::array<double, BLOCK_SIZE * BLOCK_SIZE> a_block{};
+                                  for (std::size_t ii = 0; ii < i_len; ++ii)
+                                  {
+                                      for (std::size_t kk = 0; kk < k_len; ++kk)
+                                      {
+                                          a_block[ii * k_len + kk] =
+                                              data_[(k_start + kk) * cols_ + (i_start + ii)];
+                                      }
+                                  }
+
+                                  // 累加：C(i,j) += Σ a_block[ii,kk] * other(k_start+kk, j)
+                                  for (std::size_t ii = 0; ii < i_len; ++ii)
+                                  {
+                                      const std::size_t a_base = ii * k_len;
+                                      const std::size_t i = i_start + ii;
+                                      for (std::size_t j = j_start; j < j_end; ++j)
+                                      {
+                                          double sum = 0.0;
+                                          for (std::size_t kk = 0; kk < k_len; ++kk)
+                                              sum += a_block[a_base + kk] *
+                                                     other.data_[(k_start + kk) * other.cols_ + j];
+                                          result.data_[result.index(i, j)] += sum;
+                                      }
+                                  }
+                              }
+                          });
+
+            return result;
+        }
+
         void scale_inplace(double scalar) noexcept
         {
             std::for_each(NN_EXEC_POLICY, data_.begin(), data_.end(),
@@ -332,6 +463,40 @@ namespace nn
                                   s += data_[i * cols_ + j];
                               result[j] = s;
                           });
+            return result;
+        }
+
+        // 每行求和。返回长度 rows_ 的向量。
+        // 用于 Linear::backward 的 grad_b（按 batch 维聚合）以及 BatchNorm 的
+        // per-feature 统计校验。
+        [[nodiscard]] std::vector<double> rowwise_sum() const
+        {
+            std::vector<double> result(rows_, 0.0);
+            if (rows_ == 0) return result;
+            std::for_each(NN_EXEC_POLICY,
+                          counting_iterator<std::size_t>(0),
+                          counting_iterator<std::size_t>(rows_),
+                          [&](std::size_t i)
+                          {
+                              const double *row_ptr = data_.data() + i * cols_;
+                              double s = 0.0;
+                              for (std::size_t j = 0; j < cols_; ++j)
+                                  s += row_ptr[j];
+                              result[i] = s;
+                          });
+            return result;
+        }
+
+        // 每行均值：rowwise_sum() / cols_。cols_ == 0 时返回全 0 向量。
+        [[nodiscard]] std::vector<double> rowwise_mean() const
+        {
+            std::vector<double> result = rowwise_sum();
+            if (cols_ == 0) return result;
+            const double denom = static_cast<double>(cols_);
+            std::for_each(NN_EXEC_POLICY,
+                          counting_iterator<std::size_t>(0),
+                          counting_iterator<std::size_t>(rows_),
+                          [&](std::size_t i) noexcept { result[i] /= denom; });
             return result;
         }
 
