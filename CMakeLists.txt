@@ -75,7 +75,10 @@ target_compile_features(neuralnet INTERFACE cxx_std_17)
 target_link_libraries(neuralnet INTERFACE TBB::tbb)
 
 # 子目录
-add_subdirectory(src)
+option(BUILD_EXAMPLES "Build example programs" ON)
+if(BUILD_EXAMPLES)
+    add_subdirectory(examples/mnist)
+endif()
 
 # 启用 CTest
 enable_testing()
@@ -87,12 +90,7 @@ if(BUILD_TESTING)
 endif()
 
 # ── Install ────────────────────────────────────────────────────────────────────
-# 可执行文件（dev-only；保留安装）
-install(
-    TARGETS mnist_train mnist_infer
-    RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
-)
-
+# 示例程序不安装（保留 build-only 行为）
 # 头文件（PATTERN 同时匹配 .h 和 .hpp，防止未来扩展漏装）
 install(DIRECTORY ${PROJECT_SOURCE_DIR}/include/neuralnet
     DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}

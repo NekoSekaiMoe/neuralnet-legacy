@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <array>
 #include <cassert>
+#include <cmath>
 #include <cstddef>
 #include <execution>
 #include <functional>
@@ -285,6 +286,90 @@ namespace nn
         void zero() noexcept
         {
             std::fill(data_.begin(), data_.end(), 0.0);
+        }
+
+        // ── Reduction 规约操作 (F8) ──────────────────────────────────────────────
+        // 全部基于 NN_EXEC_POLICY 并行；空矩阵返回值由各方法文档说明。
+        // 存储布局：行主序（data_[row * cols_ + col]）。
+
+        // Frobenius 范数：sqrt(sum(x^2))。空矩阵返回 0。
+        [[nodiscard]] double norm() const noexcept
+        {
+            const double sumsq = std::transform_reduce(
+                NN_EXEC_POLICY, data_.begin(), data_.end(),
+                0.0, std::plus{},
+                [](double x) noexcept { return x * x; });
+            return std::sqrt(sumsq);
+        }
+
+        // 全元素求和。空矩阵返回 0。
+        [[nodiscard]] double sum() const noexcept
+        {
+            return std::reduce(NN_EXEC_POLICY, data_.begin(), data_.end(),
+                                0.0, std::plus{});
+        }
+
+        // 全元素均值。空矩阵返回 0（避免 0/0）。
+        [[nodiscard]] double mean() const noexcept
+        {
+            if (data_.empty()) return 0.0;
+            return sum() / static_cast<double>(data_.size());
+        }
+
+        // 每列求和。行主序下，列 j 的元素位于 strided 位置（j, j+cols_, j+2*cols_, ...）。
+        // 返回长度 cols_ 的向量。
+        [[nodiscard]] std::vector<double> colwise_sum() const
+        {
+            std::vector<double> result(cols_, 0.0);
+            if (cols_ == 0) return result;
+            std::for_each(NN_EXEC_POLICY,
+                          counting_iterator<std::size_t>(0),
+                          counting_iterator<std::size_t>(cols_),
+                          [&](std::size_t j)
+                          {
+                              double s = 0.0;
+                              for (std::size_t i = 0; i < rows_; ++i)
+                                  s += data_[i * cols_ + j];
+                              result[j] = s;
+                          });
+            return result;
+        }
+
+        // 每列均值：colwise_sum() / rows_。rows_ == 0 时返回全 0 向量。
+        [[nodiscard]] std::vector<double> colwise_mean() const
+        {
+            std::vector<double> result = colwise_sum();
+            if (rows_ == 0) return result;
+            const double denom = static_cast<double>(rows_);
+            std::for_each(NN_EXEC_POLICY,
+                          counting_iterator<std::size_t>(0),
+                          counting_iterator<std::size_t>(cols_),
+                          [&](std::size_t j) noexcept { result[j] /= denom; });
+            return result;
+        }
+
+        // 每列方差（无偏估计，分母 rows_-1）。给 BatchNorm 预留。
+        // rows_ <= 1 时无法估计，返回全 0 向量。
+        [[nodiscard]] std::vector<double> colwise_var(const std::vector<double> &mean) const
+        {
+            std::vector<double> result(cols_, 0.0);
+            if (cols_ == 0) return result;
+            if (rows_ <= 1) return result;
+            std::for_each(NN_EXEC_POLICY,
+                          counting_iterator<std::size_t>(0),
+                          counting_iterator<std::size_t>(cols_),
+                          [&](std::size_t j)
+                          {
+                              const double m = mean[j];
+                              double s = 0.0;
+                              for (std::size_t i = 0; i < rows_; ++i)
+                              {
+                                  const double d = data_[i * cols_ + j] - m;
+                                  s += d * d;
+                              }
+                              result[j] = s / static_cast<double>(rows_ - 1);
+                          });
+            return result;
         }
     };
 } // namespace nn

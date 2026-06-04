@@ -24,9 +24,11 @@ neuralnet.cpp/
 │       └── nn/
 │           ├── config.h
 │           └── nn.h
-├── src/
-│   ├── infer.cpp
-│   └── train.cpp
+├── examples/
+│   └── mnist/
+│       ├── CMakeLists.txt
+│       ├── infer.cpp
+│       └── train.cpp
 ├── tests/
 │   ├── CMakeLists.txt
 │   └── test_nn.cpp
@@ -39,9 +41,12 @@ neuralnet.cpp/
 
 ```
 build/
-├── mnist_train        # 训练入口
-├── mnist_infer        # 推理入口
-└── test_nn            # 测试入口（24 个 CTest 用例）
+├── examples/
+│   └── mnist/
+│       ├── mnist_train        # 训练入口
+│       └── mnist_infer        # 推理入口
+└── tests/
+    └── test_nn                # 测试入口（60 个 CTest 用例）
 ```
 
 ## 依赖
@@ -71,20 +76,21 @@ python save_dataset.py
 
 ```bash
 # 从头开始训练
-./build/src/mnist_train
+./build/examples/mnist/mnist_train
 
 # 从已有模型恢复训练
-./build/src/mnist_train --load mnist_model.bin
+./build/examples/mnist/mnist_train --load mnist_model.bin
 
 # 指定保存路径
-./build/src/mnist_train --save my_model.bin
+./build/examples/mnist/mnist_train --save my_model.bin
 ```
 
 ### 验证安装
 
 ```bash
-ctest --test-dir build --output-on-failure    # 跑全部 24 个测试
-cmake --install build --prefix /tmp/nn-test   # 装到临时目录验证 install 流程
+ctest --test-dir build --output-on-failure       # 跑全部 60 个测试
+cmake --install build --prefix /tmp/nn-test      # 装到临时目录验证 install 流程
+ls /tmp/nn-test/bin 2>&1                         # 应当 "No such file or directory"（demos 不安装）
 ```
 
 ## 作为库消费 (find_package)
@@ -135,6 +141,7 @@ int main() {
 | 选项 | 默认 | 说明 |
 |------|------|------|
 | `BUILD_TESTING` | `${PROJECT_IS_TOP_LEVEL}` | 关闭后不构建 `test_nn` 也不注册 CTest |
+| `BUILD_EXAMPLES` | ON | 关闭后不构建 `examples/mnist/` 下的 demo 程序（不影响库本身） |
 | `ENABLE_ASAN` | OFF | 启用 AddressSanitizer（必须搭配 Debug 或 RelWithDebInfo，不能与 Release 同用） |
 | `ENABLE_UBSAN` | OFF | 启用 UndefinedBehaviorSanitizer（同上） |
 
@@ -142,6 +149,41 @@ int main() {
 
 ```
 输入 (784) → Linear(64) → ReLU → Linear(64) → ReLU → Linear(64) → ReLU → Linear(10)
+```
+
+## 新功能（v2 特性）
+
+5 大新功能 + v2 模型格式 + 3 项性能优化：
+
+### 5 大新功能
+
+| 功能 | API | 文件 |
+|------|-----|------|
+| **DataLoader** (F1) | `nn::DataLoader(ds, batch_size, shuffle, drop_last, seed)` | `dataloader.h` |
+| **BatchNorm 1D+2D** (F2) | `nn::BatchNorm1d(num_features, eps, momentum, affine)` | `layer.h` |
+| **`clip_grad_norm_`** (F3) | `nn::clip_grad_norm_(grads, max_norm, eps)` | `grad_clip.h` |
+| **`Model::summary()`** (F4) | `model.summary()` 或 `nn::summary(model, &stream)` | `summary.h` |
+| **`Model::train()/eval()`** (F6) | `model.train()` / `model.eval()` / `model.is_training()` | `model.h` |
+
+### v2 模型格式
+
+- 文件 magic 不变 (`0x4E4E4E4E`)，版本号 2
+- 额外写入每层的非参数状态（BatchNorm 的 `running_mean`、`running_var`、`num_batches_tracked`）
+- v1 文件向后兼容，可正常读取
+- 升级到 v2 后：含 BatchNorm 的模型推理前需调用 `model.eval()` 使用 running stats
+
+### 3 项性能优化（Linear 层）
+
+- **P1**: bias 加法从逐元素 `idx / cols` 整数除法改为外行-内列 stride 循环
+- **P2**: `Linear::forward` 从 2 次内存分配（product + result）改为 1 次（matmul 结果直接作为输出，bias 原地加）
+- **P3**: `Linear::backward` 从 3 个朴素 O(n³) 三重循环改为 `Matrix::matmul` 调用（已使用 BLOCK_SIZE=64 的 blocked GEMM）
+
+### 测试覆盖
+
+**60 个 CTest**（之前 31 + 4 大新功能测试 28 + 性能测试 1）：
+
+```
+ctest --test-dir build --output-on-failure       # 跑全部 60 个测试
 ```
 
 ## 提供的组件
@@ -154,4 +196,5 @@ int main() {
 | `nn::MSELoss` | 均方误差损失 |
 | `CrossEntropyLoss` | 交叉熵损失（含数值稳定 Softmax，在 `train.cpp` 中定义） |
 | `nn::SGD` | 随机梯度下降优化器 |
-| `save_model` / `load_model` | 二进制模型序列化 |
+| `nn::Model::save` / `nn::Model::load` | 成员函数，二进制模型序列化 |
+| `nn::save_model` / `nn::load_model` | 自由函数，委托给 Model 成员函数 |

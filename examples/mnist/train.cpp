@@ -142,10 +142,13 @@ int main(int argc, char *argv[])
         // 构建网络 — 使用 nn::Model
         nn::Model model;
         model.add<nn::Linear>(784, 64)
+             .add<nn::BatchNorm1d>(64)
              .add<nn::ReLU>()
              .add<nn::Linear>(64, 64)
+             .add<nn::BatchNorm1d>(64)
              .add<nn::ReLU>()
              .add<nn::Linear>(64, 64)
+             .add<nn::BatchNorm1d>(64)
              .add<nn::ReLU>()
              .add<nn::Linear>(64, 10);
 
@@ -154,7 +157,7 @@ int main(int argc, char *argv[])
         {
             try
             {
-                nn::load_model(model_path, model);
+                model.load(model_path);
             }
             catch (const std::exception &e)
             {
@@ -163,7 +166,7 @@ int main(int argc, char *argv[])
         }
 
         // 收集参数和梯度（Model 自动聚合所有层）
-        nn::SGD_w_Momentum optimizer(model.parameters(), model.param_gradients(), 0.01);
+        nn::Adam optimizer(model.parameters(), model.param_gradients(), 0.001);
         nn::CrossEntropyLoss ce_loss;
 
         const std::size_t batch_size = 64;
@@ -174,28 +177,17 @@ int main(int argc, char *argv[])
 
         // 训练
         const int epochs = 5;
+        model.train();
+        nn::TensorDataset train_ds(std::move(train_x), std::move(train_y));
+        nn::DataLoader train_loader(train_ds, batch_size, /*shuffle=*/true);
+
         for (int epoch = 0; epoch < epochs; ++epoch)
         {
             double total_loss = 0.0;
+            std::size_t batch_count = 0;
 
-            for (std::size_t batch = 0; batch < num_batches; ++batch)
+            for (auto [x_batch, y_batch] : train_loader)
             {
-                // 提取当前 batch
-                std::size_t start = batch * batch_size;
-                nn::Matrix x_batch(train_x.rows(), batch_size);
-                nn::Matrix y_batch(train_y.rows(), batch_size);
-                for (std::size_t i = 0; i < batch_size; ++i)
-                {
-                    for (std::size_t r = 0; r < train_x.rows(); ++r)
-                    {
-                        x_batch.set_value_unchecked(r, i, train_x.at_unchecked(r, start + i));
-                    }
-                    for (std::size_t r = 0; r < train_y.rows(); ++r)
-                    {
-                        y_batch.set_value_unchecked(r, i, train_y.at_unchecked(r, start + i));
-                    }
-                }
-
                 // 前向 — Model 自动串联所有层
                 auto out = model.forward(x_batch);
                 double loss = ce_loss.forward(out, y_batch);
@@ -208,19 +200,22 @@ int main(int argc, char *argv[])
                 // 更新参数
                 optimizer.step();
                 optimizer.zero_grad();
+                ++batch_count;
             }
 
-            double avg_loss = total_loss / num_batches;
-            double train_acc = evaluate(model, train_x, train_y);
+            model.eval();
             double test_acc = evaluate(model, test_x, test_y);
+            double avg_loss = (batch_count > 0) ? (total_loss / batch_count) : 0.0;
             std::cout << "Epoch " << epoch + 1 << "/" << epochs
                       << "  loss = " << avg_loss
-                      << "  train acc = " << train_acc
                       << "  test acc = " << test_acc << std::endl;
+            if (epoch + 1 < epochs)
+            {
+                model.train();
+            }
         }
 
-        // 训练结束后保存模型（Model 版本）
-        nn::save_model(model_path, model);
+        model.save(model_path);
         return 0;
     }
     catch (const std::exception &e)

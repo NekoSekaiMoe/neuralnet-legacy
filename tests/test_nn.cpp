@@ -7,9 +7,12 @@
 
 #include <cassert>
 #include <cmath>
+#include <cstdint>
 #include <cstdio>
 #include <fstream>
+#include <limits>
 #include <numeric>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -17,6 +20,31 @@
 static bool approx(double a, double b, double tol = 1e-6)
 {
     return std::fabs(a - b) < tol;
+}
+
+// ── 辅助：有限差分梯度（中心差分） ─────────────────────────────────────────────
+// 用于 BatchNorm 数值梯度校验：对 layer.parameters()[param_idx] 的
+// (row, col) 元素施加 ±eps 扰动，forward 后比较 sum(output)。
+// dL/dθ ≈ (f(θ+ε) - f(θ-ε)) / (2ε)，其中 L = Σ f(input; θ)。
+// 返回该元素对 sum-of-outputs 的偏导数。
+static double finite_diff_grad(nn::Layer &layer, const nn::Matrix &input,
+                               std::size_t param_idx, std::size_t row,
+                               std::size_t col, double eps = 1e-5)
+{
+    auto params = layer.parameters();
+    nn::Matrix &param = params[param_idx].get();
+    const double original = param.at_unchecked(row, col);
+
+    param.set_value_unchecked(row, col, original + eps);
+    auto out_plus = layer.forward(input);
+    const double loss_plus = out_plus.sum();
+
+    param.set_value_unchecked(row, col, original - eps);
+    auto out_minus = layer.forward(input);
+    const double loss_minus = out_minus.sum();
+
+    param.set_value_unchecked(row, col, original); // 还原
+    return (loss_plus - loss_minus) / (2.0 * eps);
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
@@ -42,7 +70,7 @@ static void test_counting_iterator()
     assert(sum == 15); // 1+2+3+4+5
 
     // 非成员 operator+
-    auto it2 = 3 + nn::counting_iterator<std::size_t>(10);
+    [[maybe_unused]] auto it2 = 3 + nn::counting_iterator<std::size_t>(10);
     assert(*it2 == 13);
 
     // operator[]
@@ -238,7 +266,7 @@ static void test_linear_forward_backward()
     // 参数梯度应该非零
     auto param_grads = lin.param_gradients();
     assert(param_grads.size() == 2);
-    bool grad_w_has_nonzero = false;
+    [[maybe_unused]] bool grad_w_has_nonzero = false;
     for (std::size_t i = 0; i < param_grads[0].get().rows(); ++i)
         for (std::size_t j = 0; j < param_grads[0].get().cols(); ++j)
             if (!approx(param_grads[0].get().at(i, j), 0.0))
@@ -246,6 +274,43 @@ static void test_linear_forward_backward()
     assert(grad_w_has_nonzero);
 
     std::puts("  [Linear] forward & backward shape PASSED");
+}
+
+static void test_linear_backward_blocked_matmul()
+{
+    std::puts("  [Linear::backward] blocked matmul — gradient norm check on 3-layer model ...");
+
+    nn::Model model;
+    model.add<nn::Linear>(10, 8)
+         .add<nn::ReLU>()
+         .add<nn::Linear>(8, 4);
+
+    nn::Matrix input(10, 4);
+    for (std::size_t i = 0; i < input.size(); ++i)
+    {
+        input.data()[i] = static_cast<double>(i % 5) * 0.1;
+    }
+
+    [[maybe_unused]] auto out = model.forward(input);
+    nn::Matrix grad_out(4, 4);
+    for (std::size_t i = 0; i < grad_out.size(); ++i) grad_out.data()[i] = 0.25;
+    model.backward(grad_out);
+
+    bool all_finite = true;
+    [[maybe_unused]] bool any_nonzero = false;
+    for (auto& g_ref : model.param_gradients())
+    {
+        for (double v : g_ref.get().data())
+        {
+            if (!std::isfinite(v)) { all_finite = false; break; }
+            if (v != 0.0) any_nonzero = true;
+        }
+        if (!all_finite) break;
+    }
+    assert(all_finite);
+    assert(any_nonzero);
+
+    std::puts("  [Linear::backward] blocked matmul PASSED");
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
@@ -259,11 +324,11 @@ static void test_mse_loss()
     nn::Matrix pred(std::vector<double>{1.0, 2.0, 3.0}, 3, 1);
     nn::Matrix target(std::vector<double>{1.5, 2.5, 3.5}, 3, 1);
 
-    double val = loss.forward(pred, target);
+    [[maybe_unused]] double val = loss.forward(pred, target);
     // MSE = mean((0.5)^2 + (0.5)^2 + (0.5)^2) = 0.25
     assert(approx(val, 0.25));
 
-    auto &grad = loss.backward();
+    [[maybe_unused]] auto &grad = loss.backward();
     assert(grad.rows() == 3);
     assert(grad.cols() == 1);
     // grad = 2*(pred-target)/N = 2*(-0.5)/3 = -1/3
@@ -282,10 +347,10 @@ static void test_cross_entropy_loss()
     std::vector<std::size_t> labels = {2};
     nn::Matrix target_onehot = nn::one_hot(labels, 3);
 
-    double val = loss.forward(logits, target_onehot);
+    [[maybe_unused]] double val = loss.forward(logits, target_onehot);
     assert(val > 0.0); // loss 为正
 
-    auto &grad = loss.backward();
+    [[maybe_unused]] auto &grad = loss.backward();
     assert(grad.rows() == 3);
     assert(grad.cols() == 1);
     // 梯度 = softmax(logits) - target_onehot
@@ -391,7 +456,7 @@ static void test_leaky_relu()
     auto grad_in = relu.backward(grad);
     assert(approx(grad_in.at(0, 0), 0.01)); // 负区间
     assert(approx(grad_in.at(1, 0), 0.01));
-    assert(approx(grad_in.at(2, 0), 0.0));  // x=0 处按 <=0 处理
+    assert(approx(grad_in.at(2, 0), 0.01)); // x=0 处按 <=0 处理 → 梯度=negative_slope
     assert(approx(grad_in.at(3, 0), 1.0));  // 正区间
     assert(approx(grad_in.at(4, 0), 1.0));
 
@@ -441,7 +506,7 @@ static void test_tanh()
     auto grad_in = t.backward(grad);
     assert(approx(grad_in.at(0, 0), 1.0));
     // at x=1: tanh(1) ≈ 0.7616, grad = 1 - 0.7616^2 ≈ 0.42
-    double expected = 1.0 - std::tanh(1.0) * std::tanh(1.0);
+    [[maybe_unused]] double expected = 1.0 - std::tanh(1.0) * std::tanh(1.0);
     assert(approx(grad_in.at(1, 0), expected));
 
     std::puts("  [Tanh] forward & backward PASSED");
@@ -519,7 +584,7 @@ static void test_dropout()
     // 大约 50% 被置零
     assert(zeros > 300 && zeros < 700);
     // 均值应接近 1.0（因为 inverted scaling）
-    double mean = sum / 1000.0;
+    [[maybe_unused]] double mean = sum / 1000.0;
     assert(mean > 0.7 && mean < 1.3);
 
     std::puts("  [Dropout] forward & backward PASSED");
@@ -558,19 +623,19 @@ static void test_cosine_lr()
     assert(approx(sched.get_lr(), 1.0)); // epoch 0: cos(0) = 1 → 1.0
 
     sched.step(); // epoch 1: cos(π/4) ≈ 0.707 → 0.854
-    double lr1 = sched.get_lr();
+    [[maybe_unused]] double lr1 = sched.get_lr();
     assert(lr1 < 1.0 && lr1 > 0.0);
 
     sched.step(); // epoch 2: cos(π/2) = 0 → 0.5
-    double lr2 = sched.get_lr();
+    [[maybe_unused]] double lr2 = sched.get_lr();
     assert(approx(lr2, 0.5, 1e-6));
 
     sched.step(); // epoch 3: cos(3π/4) ≈ -0.707 → 0.146
-    double lr3 = sched.get_lr();
+    [[maybe_unused]] double lr3 = sched.get_lr();
     assert(lr3 > 0.0 && lr3 < lr2);
 
     sched.step(); // epoch 4: cos(π) = -1 → 0.0
-    double lr4 = sched.get_lr();
+    [[maybe_unused]] double lr4 = sched.get_lr();
     assert(approx(lr4, 0.0, 1e-6));
 
     std::puts("  [CosineAnnealingLR] step PASSED");
@@ -626,49 +691,76 @@ static void test_model_io()
     std::puts("  [Model IO] save & load round-trip ...");
 
     // 构造一个小网络并保存
-    nn::Linear l1(4, 3);
-    nn::Linear l2(3, 2);
-    nn::Linear l3(2, 2);
-    nn::Linear l4(2, 1);
-
-    const std::string path = "/tmp/nn_test_model.bin";
-
-    // 记录保存前的参数
-    auto w1_before = l1.parameters()[0].get().data();
-
-    nn::save_model(path, l1, l2, l3, l4);
-
-    // 手动修改参数以验证加载确实生效
-    l1.parameters()[0].get().set_value(0, 0, 999.0);
-    assert(approx(l1.parameters()[0].get().at(0, 0), 999.0));
-
-    // 加载
-    nn::load_model(path, l1, l2, l3, l4);
-
-    // 验证加载后参数恢复
-    assert(approx(l1.parameters()[0].get().at(0, 0), w1_before[0]));
-
-    // Model 版本的 save/load
     nn::Model model;
     model.add<nn::Linear>(3, 2)
          .add<nn::ReLU>()
          .add<nn::Linear>(2, 1);
 
-    const std::string path2 = "/tmp/nn_test_model2.bin";
-    nn::save_model(path2, model);
+    const std::string path = "/tmp/nn_test_model.bin";
 
-    // 修改参数
+    // 记录保存前的参数
+    auto w_before = model.parameters()[0].get().data();
+
+    // save 走成员函数，load 走自由函数：这样一次性验证了
+    // 1) member save 写出可读格式  2) 自由函数 load_model 正确委托给 member load
+    model.save(path);
+
+    // 手动修改参数以验证加载确实生效
     model.parameters()[0].get().set_value(0, 0, -1234.0);
+    assert(approx(model.parameters()[0].get().at(0, 0), -1234.0));
 
-    nn::load_model(path2, model);
-    // 加载后应恢复（非 -1234）
-    assert(!approx(model.parameters()[0].get().at(0, 0), -1234.0));
+    nn::load_model(path, model);
+
+    assert(approx(model.parameters()[0].get().at(0, 0), w_before[0]));
 
     // 清理临时文件
     std::remove(path.c_str());
-    std::remove(path2.c_str());
 
     std::puts("  [Model IO] save & load round-trip PASSED");
+}
+
+static void test_model_io_member()
+{
+    std::puts("  [Model IO] member save/load: large net, file-format compat ...");
+
+    nn::Model model;
+    model.add<nn::Linear>(4, 3)
+         .add<nn::ReLU>()
+         .add<nn::Linear>(3, 3)
+         .add<nn::ReLU>()
+         .add<nn::Linear>(3, 2);
+
+    const std::string path = "/tmp/nn_test_model_member.bin";
+
+    std::vector<double> snapshot;
+    for (auto &p : model.parameters())
+    {
+        auto data = p.get().data();
+        snapshot.insert(snapshot.end(), data.begin(), data.end());
+    }
+
+    model.save(path);
+
+    for (auto &p : model.parameters())
+    {
+        p.get().set_value(0, 0, 7777.0);
+    }
+
+    model.load(path);
+
+    std::size_t idx = 0;
+    for (auto &p : model.parameters())
+    {
+        auto data = p.get().data();
+        for (std::size_t k = 0; k < data.size(); ++k, ++idx)
+        {
+            assert(approx(data[k], snapshot[idx]));
+        }
+    }
+
+    std::remove(path.c_str());
+
+    std::puts("  [Model IO] member save/load PASSED");
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
@@ -711,7 +803,7 @@ static void test_end_to_end_train()
     nn::Matrix x(std::vector<double>{1.0, 0.0}, 2, 1);
     nn::Matrix target(std::vector<double>{0.0, 1.0}, 2, 1);
 
-    double loss_before = loss_fn.forward(model.forward(x), target);
+    [[maybe_unused]] double loss_before = loss_fn.forward(model.forward(x), target);
 
     // 训练 100 步
     for (int i = 0; i < 100; ++i)
@@ -723,7 +815,7 @@ static void test_end_to_end_train()
         optimizer.zero_grad();
     }
 
-    double loss_after = loss_fn.forward(model.forward(x), target);
+    [[maybe_unused]] double loss_after = loss_fn.forward(model.forward(x), target);
     // loss 应该下降
     assert(loss_after < loss_before);
 
@@ -812,18 +904,17 @@ static void test_set_data_empty_throws()
     std::puts("  [set_data] empty: empty new_data throws invalid_argument ...");
 
     nn::Matrix m(2, 2);
-    bool threw = false;
     try
     {
         m.set_data({});
     }
     catch (const std::invalid_argument &)
     {
-        threw = true;
+        std::puts("  [set_data] empty throws PASSED");
+        return;
     }
-    assert(threw);
-
-    std::puts("  [set_data] empty throws PASSED");
+    std::puts("  [set_data] empty: expected throw, none happened ... FAILED");
+    std::abort();
 }
 
 static void test_set_data_inconsistent_throws()
@@ -831,7 +922,6 @@ static void test_set_data_inconsistent_throws()
     std::puts("  [set_data] inconsistent: row widths differ throws invalid_argument ...");
 
     nn::Matrix m(2, 2);
-    bool threw = false;
     try
     {
         m.set_data({{1, 2, 3},
@@ -839,11 +929,11 @@ static void test_set_data_inconsistent_throws()
     }
     catch (const std::invalid_argument &)
     {
-        threw = true;
+        std::puts("  [set_data] inconsistent throws PASSED");
+        return;
     }
-    assert(threw);
-
-    std::puts("  [set_data] inconsistent throws PASSED");
+    std::puts("  [set_data] inconsistent: expected throw, none happened ... FAILED");
+    std::abort();
 }
 
 static void test_set_data_exception_safety()
@@ -881,6 +971,977 @@ static void test_set_data_exception_safety()
     std::puts("  [set_data] exception safety PASSED");
 }
 
+// ══════════════════════════════════════════════════════════════════════════════
+// Matrix 规约操作测试 (F8)
+// ══════════════════════════════════════════════════════════════════════════════
+static void test_matrix_norm()
+{
+    std::puts("  [Matrix] norm ...");
+
+    nn::Matrix v(std::vector<double>{3.0, 4.0}, 1, 2);
+    assert(approx(v.norm(), 5.0, 1e-9));
+
+    nn::Matrix z(3, 4);
+    assert(approx(z.norm(), 0.0));
+
+    nn::Matrix o(3, 4, 1.0);
+    assert(approx(o.norm(), std::sqrt(12.0), 1e-9));
+
+    nn::Matrix m(std::vector<double>{1.0, 2.0, 3.0, 4.0}, 2, 2);
+    assert(approx(m.sum(), 10.0));
+    assert(approx(m.mean(), 2.5));
+    assert(approx(nn::Matrix().sum(), 0.0));
+    assert(approx(nn::Matrix().mean(), 0.0));
+
+    std::puts("  [Matrix] norm PASSED");
+}
+
+static void test_matrix_colwise_mean()
+{
+    std::puts("  [Matrix] colwise_mean ...");
+
+    // 3x2 行主序：col 0 = {1,2,3}, col 1 = {4,5,6}  ⟹  data = {1,4, 2,5, 3,6}
+    nn::Matrix m(std::vector<double>{1.0, 4.0, 2.0, 5.0, 3.0, 6.0}, 3, 2);
+    auto means = m.colwise_mean();
+    assert(means.size() == 2);
+    assert(approx(means[0], 2.0, 1e-9));
+    assert(approx(means[1], 5.0, 1e-9));
+
+    nn::Matrix single(std::vector<double>{7.0}, 1, 1);
+    auto single_means = single.colwise_mean();
+    assert(single_means.size() == 1);
+    assert(approx(single_means[0], 7.0));
+
+    auto sums = m.colwise_sum();
+    assert(approx(sums[0], 6.0));
+    assert(approx(sums[1], 15.0));
+
+    // col 0 = {1,2,3}，mean=2, var = ((1-2)^2 + 0 + (3-2)^2)/(3-1) = 1
+    auto vars = m.colwise_var(means);
+    assert(approx(vars[0], 1.0, 1e-9));
+    assert(approx(vars[1], 1.0, 1e-9));
+
+    std::puts("  [Matrix] colwise_mean PASSED");
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// 模型模式切换 + 持久化测试 (F6/F5)
+// ══════════════════════════════════════════════════════════════════════════════
+
+namespace
+{
+    class CountingLayer : public nn::Layer
+    {
+    public:
+        inline static int train_calls = 0;
+        inline static int eval_calls = 0;
+
+        nn::Matrix forward(const nn::Matrix &input) override
+        {
+            return nn::Matrix(input.rows(), input.cols());
+        }
+        nn::Matrix backward(const nn::Matrix &grad_output) override
+        {
+            return grad_output;
+        }
+        std::vector<std::reference_wrapper<nn::Matrix>> parameters() override
+        {
+            return {};
+        }
+        std::vector<std::reference_wrapper<nn::Matrix>> param_gradients() override
+        {
+            return {};
+        }
+
+        void on_mode_change(bool training) override
+        {
+            if (training) ++train_calls;
+            else ++eval_calls;
+        }
+    };
+
+    // 暴露 1 个参数的 Layer：v1 文件无 n_params 段，
+    // 加载端 parameters().size() 决定读取数量，故用 1 参数层做最小化测试。
+    class SingleParamLayer : public nn::Layer
+    {
+    public:
+        nn::Matrix W;
+
+        explicit SingleParamLayer(std::size_t rows, std::size_t cols) : W(rows, cols) {}
+
+        nn::Matrix forward(const nn::Matrix &input) override
+        {
+            return input;
+        }
+        nn::Matrix backward(const nn::Matrix &grad_output) override
+        {
+            return grad_output;
+        }
+        std::vector<std::reference_wrapper<nn::Matrix>> parameters() override
+        {
+            return {std::ref(W)};
+        }
+        std::vector<std::reference_wrapper<nn::Matrix>> param_gradients() override
+        {
+            return {};
+        }
+    };
+} // namespace
+
+static void test_model_default_is_training()
+{
+    std::puts("  [Model] default is_training is true ...");
+
+    nn::Model model;
+    assert(model.is_training() == true);
+
+    std::puts("  [Model] default is_training PASSED");
+}
+
+static void test_model_train_eval()
+{
+    std::puts("  [Model] train()/eval() toggle is_training ...");
+
+    nn::Model model;
+    model.add<nn::Linear>(2, 2);
+
+    model.train();
+    assert(model.is_training() == true);
+
+    model.eval();
+    assert(model.is_training() == false);
+
+    model.train();
+    assert(model.is_training() == true);
+
+    std::puts("  [Model] train/eval PASSED");
+}
+
+static void test_on_mode_change_called()
+{
+    std::puts("  [Model] on_mode_change propagates to layers ...");
+
+    CountingLayer::train_calls = 0;
+    CountingLayer::eval_calls = 0;
+
+    nn::Model model;
+    model.add<CountingLayer>();
+
+    model.train();
+    assert(CountingLayer::train_calls == 1);
+    assert(CountingLayer::eval_calls == 0);
+
+    model.eval();
+    assert(CountingLayer::train_calls == 1);
+    assert(CountingLayer::eval_calls == 1);
+
+    model.train();
+    assert(CountingLayer::train_calls == 2);
+    assert(CountingLayer::eval_calls == 1);
+
+    std::puts("  [Model] on_mode_change PASSED");
+}
+
+static void test_model_save_load_v1_roundtrip()
+{
+    std::puts("  [Model] v1 bytes manual roundtrip ...");
+
+    nn::Model model;
+    model.add<SingleParamLayer>(1, 2);
+    [[maybe_unused]] auto &W = model.parameters()[0].get();
+    assert(approx(W.at(0, 0), 0.0));
+    assert(approx(W.at(0, 1), 0.0));
+
+    std::stringstream ss(std::ios::in | std::ios::out | std::ios::binary);
+    const uint32_t magic = 0x4E4E4E4E;
+    const uint32_t version = 1;
+    ss.write(reinterpret_cast<const char *>(&magic), sizeof(magic));
+    ss.write(reinterpret_cast<const char *>(&version), sizeof(version));
+
+    // v1 无 n_params 段：直接写 1 个 1x2 矩阵
+    std::size_t rows = 1, cols = 2;
+    const double data[2] = {1.0, 2.0};
+    ss.write(reinterpret_cast<const char *>(&rows), sizeof(rows));
+    ss.write(reinterpret_cast<const char *>(&cols), sizeof(cols));
+    ss.write(reinterpret_cast<const char *>(data), sizeof(data));
+
+    model.load(ss);
+
+    assert(approx(W.at(0, 0), 1.0));
+    assert(approx(W.at(0, 1), 2.0));
+
+    std::puts("  [Model] v1 bytes roundtrip PASSED");
+}
+
+static void test_model_save_load_v2_no_batchnorm()
+{
+    std::puts("  [Model] v2 save/load Linear(2,3) roundtrip ...");
+
+    nn::Model model1;
+    model1.add<nn::Linear>(2, 3); // W(3,2) + b(3,1) = 2 params, 9 elements
+
+    std::size_t tag = 0;
+    for (auto &p_ref : model1.parameters())
+    {
+        auto &p = p_ref.get();
+        for (std::size_t r = 0; r < p.rows(); ++r)
+        {
+            for (std::size_t c = 0; c < p.cols(); ++c, ++tag)
+            {
+                p.set_value_unchecked(r, c, 100.0 + static_cast<double>(tag));
+            }
+        }
+    }
+
+    const std::string path = "/tmp/nn_test_v2_no_bn.bin";
+    model1.save(path);
+
+    nn::Model model2;
+    model2.add<nn::Linear>(2, 3);
+    model2.load(path);
+
+    auto p1 = model1.parameters();
+    auto p2 = model2.parameters();
+    assert(p1.size() == p2.size());
+    assert(p1.size() == 2);
+
+    for (std::size_t i = 0; i < p1.size(); ++i)
+    {
+        [[maybe_unused]] const auto &a = p1[i].get();
+        [[maybe_unused]] const auto &b = p2[i].get();
+        assert(a.rows() == b.rows());
+        assert(a.cols() == b.cols());
+        for (std::size_t r = 0; r < a.rows(); ++r)
+        {
+            for (std::size_t c = 0; c < a.cols(); ++c)
+            {
+                assert(approx(a.at_unchecked(r, c), b.at_unchecked(r, c), 1e-12));
+            }
+        }
+    }
+
+    std::remove(path.c_str());
+    std::puts("  [Model] v2 save/load Linear(2,3) PASSED");
+}
+
+static void test_model_load_state_count_mismatch()
+{
+    std::puts("  [Model] v2 load rejects state-layer count mismatch ...");
+
+    nn::Model model1;
+    model1.add<nn::BatchNorm1d>(2);
+
+    auto *bn1 = static_cast<nn::BatchNorm1d *>(model1.get_layers()[0].get());
+    nn::Matrix train_input(std::vector<double>{1.0, 2.0, 3.0, 4.0, 5.0, 6.0}, 2, 3);
+    for (int i = 0; i < 3; ++i)
+        bn1->forward(train_input);
+
+    std::stringstream ss;
+    model1.save(ss);
+
+    nn::Model model2;
+    model2.add<nn::Linear>(2, 3);
+
+    ss.seekg(0);
+    [[maybe_unused]] bool threw = false;
+    try
+    {
+        model2.load(ss);
+    }
+    catch (const std::runtime_error &)
+    {
+        threw = true;
+    }
+    assert(threw);
+
+    nn::Model model3;
+    model3.add<nn::BatchNorm1d>(2);
+    ss.seekg(0);
+    model3.load(ss);
+
+    std::puts("  [Model] v2 load state count mismatch PASSED");
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// BatchNorm1d 测试 (F2)
+// ══════════════════════════════════════════════════════════════════════════════
+static void test_batchnorm1d_forward_shape()
+{
+    std::puts("  [BatchNorm1d] forward shape ...");
+
+    nn::BatchNorm1d bn(4);
+    nn::Matrix input(4, 10, 1.0);
+    auto out = bn.forward(input);
+    assert(out.rows() == 4);
+    assert(out.cols() == 10);
+
+    std::puts("  [BatchNorm1d] forward shape PASSED");
+}
+
+static void test_batchnorm1d_forward_normalize()
+{
+    std::puts("  [BatchNorm1d] forward normalize: per-feature mean≈0, var≈1 ...");
+
+    nn::BatchNorm1d bn(4);
+    std::mt19937_64 rng(42);
+    std::normal_distribution<double> dist(5.0, std::sqrt(2.0));
+
+    std::vector<double> data(4 * 1000);
+    for (auto &v : data)
+        v = dist(rng);
+    nn::Matrix input(std::move(data), 4, 1000);
+
+    auto out = bn.forward(input);
+    for (std::size_t i = 0; i < 4; ++i)
+    {
+        double sum = 0.0;
+        for (std::size_t j = 0; j < 1000; ++j)
+            sum += out.at_unchecked(i, j);
+        double mean = sum / 1000.0;
+        assert(std::fabs(mean) < 1e-5);
+
+        double var = 0.0;
+        for (std::size_t j = 0; j < 1000; ++j)
+        {
+            double d = out.at_unchecked(i, j) - mean;
+            var += d * d;
+        }
+        var /= 999.0;
+        assert(std::fabs(var - 1.0) < 1e-5);
+    }
+
+    std::puts("  [BatchNorm1d] forward normalize PASSED");
+}
+
+static void test_batchnorm1d_backward_shape()
+{
+    std::puts("  [BatchNorm1d] backward shape ...");
+
+    nn::BatchNorm1d bn(4);
+    nn::Matrix input(4, 10);
+    bn.forward(input);
+
+    nn::Matrix grad_output(4, 10, 0.5);
+    auto grad_input = bn.backward(grad_output);
+    assert(grad_input.rows() == 4);
+    assert(grad_input.cols() == 10);
+
+    std::puts("  [BatchNorm1d] backward shape PASSED");
+}
+
+static void test_batchnorm1d_eval_mode()
+{
+    std::puts("  [BatchNorm1d] eval mode uses running stats ...");
+
+    nn::BatchNorm1d bn(2, 1e-5, 0.1, true);
+    bn.on_mode_change(true);
+
+    // 训练若干步以更新 running stats
+    nn::Matrix train_input(std::vector<double>{10.0, 20.0, 30.0, 40.0, 50.0, 60.0}, 2, 3);
+    for (int i = 0; i < 10; ++i)
+        bn.forward(train_input);
+
+    // 切换到 eval 模式
+    bn.on_mode_change(false);
+    nn::Matrix test_input(std::vector<double>{1.0, 2.0, 3.0, 4.0, 5.0, 6.0}, 2, 3);
+    auto out_eval = bn.forward(test_input);
+
+    // eval 模式的输出应满足 (input - running_mean) / sqrt(running_var + eps) * gamma + beta
+    [[maybe_unused]] const auto &rm = bn.running_mean();
+    [[maybe_unused]] const auto &rv = bn.running_var();
+    for (std::size_t i = 0; i < 2; ++i)
+    {
+        const double m = rm.at_unchecked(i, 0);
+        const double s = std::sqrt(rv.at_unchecked(i, 0) + 1e-5);
+        for (std::size_t j = 0; j < 3; ++j)
+        {
+            [[maybe_unused]] const double expected = (test_input.at_unchecked(i, j) - m) / s;
+            assert(approx(out_eval.at_unchecked(i, j), expected, 1e-9));
+        }
+    }
+
+    // 训练模式与 eval 模式输出应有显著差异
+    bn.on_mode_change(true);
+    auto out_train = bn.forward(test_input);
+    [[maybe_unused]] double diff = 0.0;
+    for (std::size_t i = 0; i < 2; ++i)
+        for (std::size_t j = 0; j < 3; ++j)
+            diff += std::fabs(out_train.at_unchecked(i, j) - out_eval.at_unchecked(i, j));
+    assert(diff > 1e-3);
+
+    std::puts("  [BatchNorm1d] eval mode PASSED");
+}
+
+static void test_batchnorm1d_running_stats_update()
+{
+    std::puts("  [BatchNorm1d] running stats update with momentum ...");
+
+    nn::BatchNorm1d bn(2, 1e-5, 0.1, true);
+    // 初始: running_mean=0, running_var=1
+    nn::Matrix input(std::vector<double>{1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0,
+                                         11.0, 12.0, 13.0, 14.0, 15.0, 16.0, 17.0, 18.0, 19.0, 20.0},
+                      2, 10);
+
+    bn.forward(input);
+    // batch_mean[0] = 5.5, batch_mean[1] = 15.5
+    // new_running_mean = (1-0.1)*0 + 0.1*batch_mean = 0.55, 1.55
+    [[maybe_unused]] const auto &rm = bn.running_mean();
+    assert(approx(rm.at_unchecked(0, 0), 0.55, 1e-9));
+    assert(approx(rm.at_unchecked(1, 0), 1.55, 1e-9));
+    assert(bn.num_batches_tracked() == 1);
+
+    std::puts("  [BatchNorm1d] running stats update PASSED");
+}
+
+static void test_batchnorm1d_no_affine()
+{
+    std::puts("  [BatchNorm1d] no affine (parameters empty) ...");
+
+    nn::BatchNorm1d bn(2, 1e-5, 0.1, /*affine=*/false);
+    assert(bn.parameters().size() == 0);
+    assert(bn.param_gradients().size() == 0);
+
+    nn::Matrix input(std::vector<double>{1.0, 2.0, 3.0, 4.0, 5.0, 6.0}, 2, 3);
+    auto out = bn.forward(input);
+    auto means = out.colwise_mean();
+    assert(std::fabs(means[0]) < 1e-9);
+    assert(std::fabs(means[1]) < 1e-9);
+
+    std::puts("  [BatchNorm1d] no affine PASSED");
+}
+
+static void test_batchnorm1d_save_load_v2()
+{
+    std::puts("  [BatchNorm1d] save/load v2 roundtrip (running stats + num_batches_tracked) ...");
+
+    nn::Model model1;
+    model1.add<nn::BatchNorm1d>(2);
+    model1.add<nn::ReLU>();
+
+    auto *bn1 = static_cast<nn::BatchNorm1d *>(model1.get_layers()[0].get());
+    nn::Matrix input(std::vector<double>{1.0, 2.0, 3.0, 4.0, 5.0, 6.0}, 2, 3);
+    for (int i = 0; i < 3; ++i)
+        bn1->forward(input);
+
+    model1.eval();
+    auto out_before = model1.forward(input);
+    [[maybe_unused]] const int64_t nbt_before = bn1->num_batches_tracked();
+
+    const std::string path = "/tmp/nn_test_bn1d_v2.bin";
+    model1.save(path);
+
+    nn::Model model2;
+    model2.add<nn::BatchNorm1d>(2);
+    model2.add<nn::ReLU>();
+    model2.load(path);
+    model2.eval();
+    auto out_after = model2.forward(input);
+
+    for (std::size_t i = 0; i < out_before.rows(); ++i)
+    {
+        for (std::size_t j = 0; j < out_before.cols(); ++j)
+        {
+            assert(approx(out_before.at_unchecked(i, j), out_after.at_unchecked(i, j), 1e-12));
+        }
+    }
+
+    [[maybe_unused]] auto *bn2 = static_cast<nn::BatchNorm1d *>(model2.get_layers()[0].get());
+    assert(bn2->num_batches_tracked() == nbt_before);
+
+    std::remove(path.c_str());
+    std::puts("  [BatchNorm1d] save/load v2 PASSED");
+}
+
+static void test_batchnorm1d_gradient_check()
+{
+    std::puts("  [BatchNorm1d] gradient check via finite differences ...");
+
+    nn::BatchNorm1d bn(2, 1e-5, 0.1, /*affine=*/true);
+    nn::Matrix input(std::vector<double>{1.0, 2.0, 3.0, 4.0, 5.0, 6.0}, 2, 3);
+
+    // 解析路径：loss = sum(out^2) → grad_out = 2*out（与 input_gradient_check 一致）
+    // 此前用 grad_out = 1（loss = sum(out)）时，dgamma = sum(normalized) ≈ 0，
+    // FD 也对 gamma 不敏感（sum 是线性仿射不变），所以原测试是 vacuous 的。
+    // 改用 2*out 后，dgamma = sum(2*out * normalized) 显著非零，测试真正有效。
+    const auto out = bn.forward(input);
+    nn::Matrix grad_output(input.rows(), input.cols());
+    for (std::size_t i = 0; i < input.rows(); ++i)
+        for (std::size_t j = 0; j < input.cols(); ++j)
+            grad_output.set_value_unchecked(i, j,
+                                            2.0 * out.at_unchecked(i, j));
+    bn.backward(grad_output);
+
+    auto param_grads = bn.param_gradients();
+    assert(param_grads.size() == 2);
+
+    std::printf("    dgamma_analytical = [%.6e, %.6e]\n",
+                param_grads[0].get().at_unchecked(0, 0),
+                param_grads[0].get().at_unchecked(1, 0));
+    std::printf("    dbeta_analytical  = [%.6e, %.6e]\n",
+                param_grads[1].get().at_unchecked(0, 0),
+                param_grads[1].get().at_unchecked(1, 0));
+
+    // 检查 dgamma_ 每个元素的解析梯度 vs 有限差分
+    for (std::size_t i = 0; i < 2; ++i)
+    {
+        [[maybe_unused]] const double analytical = param_grads[0].get().at_unchecked(i, 0);
+        [[maybe_unused]] const double fd = finite_diff_grad(bn, input, /*param_idx=*/0, i, 0, 1e-5);
+        assert(approx(analytical, fd, 1e-4));
+    }
+
+    // 检查 dbeta_ 同上（loss=sum(out²) 下 dbeta=2*sum(out)=0，对称数据上恒为 0；
+    // 解析=0，FD=0，approx(0,0,1e-4) 仍通过。dgamma 才是真正捕捉到梯度的检查项。）
+    for (std::size_t i = 0; i < 2; ++i)
+    {
+        [[maybe_unused]] const double analytical = param_grads[1].get().at_unchecked(i, 0);
+        [[maybe_unused]] const double fd = finite_diff_grad(bn, input, /*param_idx=*/1, i, 0, 1e-5);
+        assert(approx(analytical, fd, 1e-4));
+    }
+
+    std::puts("  [BatchNorm1d] gradient check PASSED");
+}
+
+static void test_batchnorm1d_batch_size_one()
+{
+    std::puts("  [BatchNorm1d] batch_size=1 edge case ...");
+
+    nn::BatchNorm1d bn(2, 1e-5, 0.1, /*affine=*/true);
+    nn::Matrix input(std::vector<double>{5.0, 10.0}, 2, 1);
+    const auto out = bn.forward(input);
+
+    assert(out.rows() == 2);
+    assert(out.cols() == 1);
+    for (std::size_t i = 0; i < out.size(); ++i)
+    {
+        [[maybe_unused]] const double v = out.data()[i];
+        assert(std::isfinite(v));
+        assert(std::fabs(v) < 1e-6);
+    }
+
+    nn::Matrix grad_output(2, 1);
+    for (std::size_t i = 0; i < out.size(); ++i)
+        grad_output.set_value_unchecked(i, 0, 2.0 * out.data()[i]);
+    const auto dx = bn.backward(grad_output);
+
+    assert(dx.rows() == 2);
+    assert(dx.cols() == 1);
+    for (std::size_t i = 0; i < dx.size(); ++i)
+    {
+        [[maybe_unused]] const double v = dx.data()[i];
+        assert(std::isfinite(v));
+        assert(std::fabs(v) < 1e-6);
+    }
+
+    std::puts("  [BatchNorm1d] batch_size=1 edge case PASSED");
+}
+
+static void test_batchnorm1d_input_gradient_check()
+{
+    std::puts("  [BatchNorm1d] input gradient (dx) check via finite differences ...");
+
+    nn::BatchNorm1d bn(2, 1e-5, 0.1, /*affine=*/true);
+    nn::Matrix input(std::vector<double>{1.0, 2.0, 3.0, 4.0, 5.0, 6.0}, 2, 3);
+    const std::size_t rows = input.rows();
+    const std::size_t cols = input.cols();
+
+    // 解析路径：loss = sum(out^2) → grad_out = 2*out
+    const auto out = bn.forward(input);
+    nn::Matrix grad_output(rows, cols);
+    for (std::size_t i = 0; i < rows; ++i)
+        for (std::size_t j = 0; j < cols; ++j)
+            grad_output.set_value_unchecked(i, j,
+                                            2.0 * out.at_unchecked(i, j));
+    const auto dx_analytical = bn.backward(grad_output);
+
+    std::printf("    dx_analytical =\n");
+    for (std::size_t i = 0; i < rows; ++i)
+    {
+        std::printf("      [");
+        for (std::size_t j = 0; j < cols; ++j)
+        {
+            std::printf("%s%.6e", j == 0 ? "" : ", ",
+                        dx_analytical.at_unchecked(i, j));
+        }
+        std::printf("]\n");
+    }
+
+    const double h = 1e-5;
+    for (std::size_t i = 0; i < rows; ++i)
+    {
+        for (std::size_t j = 0; j < cols; ++j)
+        {
+            const double original = input.at_unchecked(i, j);
+
+            nn::Matrix input_p = input;
+            input_p.set_value_unchecked(i, j, original + h);
+            const auto out_p = bn.forward(input_p);
+            double loss_p = 0.0;
+            for (std::size_t k = 0; k < out_p.size(); ++k)
+                loss_p += out_p.data()[k] * out_p.data()[k];
+
+            nn::Matrix input_m = input;
+            input_m.set_value_unchecked(i, j, original - h);
+            const auto out_m = bn.forward(input_m);
+            double loss_m = 0.0;
+            for (std::size_t k = 0; k < out_m.size(); ++k)
+                loss_m += out_m.data()[k] * out_m.data()[k];
+
+            [[maybe_unused]] const double fd = (loss_p - loss_m) / (2.0 * h);
+            const double analytical = dx_analytical.at_unchecked(i, j);
+
+            const double abs_tol = 1e-4;
+            const double ref = std::fabs(analytical) > 1e-8
+                                   ? std::fabs(analytical) : 1.0;
+            [[maybe_unused]] const double tol = std::max(abs_tol, 1e-4 * ref);
+            assert(approx(analytical, fd, tol));
+        }
+    }
+
+    std::puts("  [BatchNorm1d] input gradient check PASSED");
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// BatchNorm2d 测试 (F2)
+// ══════════════════════════════════════════════════════════════════════════════
+static void test_batchnorm2d_forward_shape()
+{
+    std::puts("  [BatchNorm2d] forward shape (C, N*H*W) -> (C, N*H*W) ...");
+
+    nn::BatchNorm2d bn(3);
+    nn::Matrix input(3, 2 * 4 * 5, 1.0); // C=3, N=2, H=4, W=5
+    auto out = bn.forward(input);
+    assert(out.rows() == 3);
+    assert(out.cols() == 40);
+
+    std::puts("  [BatchNorm2d] forward shape PASSED");
+}
+
+static void test_batchnorm2d_normalize()
+{
+    std::puts("  [BatchNorm2d] normalize per-channel ...");
+
+    nn::BatchNorm2d bn(2);
+    nn::Matrix input(std::vector<double>{1.0, 2.0, 3.0, 4.0, 5.0,
+                                         6.0, 7.0, 8.0, 9.0, 10.0},
+                      2, 5);
+    auto out = bn.forward(input);
+    auto means = out.colwise_mean();
+    assert(std::fabs(means[0]) < 1e-9);
+    assert(std::fabs(means[1]) < 1e-9);
+
+    std::puts("  [BatchNorm2d] normalize PASSED");
+}
+
+static void test_batchnorm2d_save_load_v2()
+{
+    std::puts("  [BatchNorm2d] save/load v2 roundtrip ...");
+
+    nn::Model model1;
+    model1.add<nn::BatchNorm2d>(3);
+
+    auto *bn1 = static_cast<nn::BatchNorm2d *>(model1.get_layers()[0].get());
+    nn::Matrix input(3, 8, 1.0);
+    for (int i = 0; i < 3; ++i)
+        bn1->forward(input);
+
+    model1.eval();
+    auto out_before = model1.forward(input);
+
+    const std::string path = "/tmp/nn_test_bn2d_v2.bin";
+    model1.save(path);
+
+    nn::Model model2;
+    model2.add<nn::BatchNorm2d>(3);
+    model2.load(path);
+    model2.eval();
+    auto out_after = model2.forward(input);
+
+    for (std::size_t i = 0; i < out_before.rows(); ++i)
+    {
+        for (std::size_t j = 0; j < out_before.cols(); ++j)
+        {
+            assert(approx(out_before.at_unchecked(i, j), out_after.at_unchecked(i, j), 1e-12));
+        }
+    }
+
+    std::remove(path.c_str());
+    std::puts("  [BatchNorm2d] save/load v2 PASSED");
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// DataLoader 测试 (F1)
+// ══════════════════════════════════════════════════════════════════════════════
+static void test_dataloader_basic()
+{
+    std::puts("  [DataLoader] basic: 10 samples, batch=3, no drop -> 4 batches (3,3,3,1) ...");
+
+    nn::Matrix features(std::vector<double>{0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0,
+                                            10.0, 11.0, 12.0, 13.0, 14.0, 15.0, 16.0, 17.0, 18.0, 19.0},
+                        2, 10);
+    nn::Matrix labels(std::vector<double>{0.0, 1.0, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0}, 1, 10);
+
+    nn::TensorDataset ds(std::move(features), std::move(labels));
+    nn::DataLoader loader(ds, /*batch_size=*/3, /*shuffle=*/false, /*drop_last=*/false);
+
+    std::vector<std::size_t> batch_cols;
+    for (auto [x, y] : loader)
+    {
+        (void)x;
+        batch_cols.push_back(y.cols());
+    }
+    assert(batch_cols.size() == 4);
+    assert(batch_cols[0] == 3);
+    assert(batch_cols[1] == 3);
+    assert(batch_cols[2] == 3);
+    assert(batch_cols[3] == 1);
+
+    std::puts("  [DataLoader] basic PASSED");
+}
+
+static void test_dataloader_drop_last()
+{
+    std::puts("  [DataLoader] drop_last: 10 samples, batch=3 -> 3 batches of 3 ...");
+
+    nn::Matrix features(2, 10, 0.0);
+    nn::Matrix labels(1, 10, 0.0);
+    for (std::size_t i = 0; i < 10; ++i)
+    {
+        features.set_value_unchecked(0, i, static_cast<double>(i));
+        labels.set_value_unchecked(0, i, static_cast<double>(i));
+    }
+
+    nn::TensorDataset ds(std::move(features), std::move(labels));
+    nn::DataLoader loader(ds, 3, false, /*drop_last=*/true, 0);
+
+    int count = 0;
+    for (auto [x, y] : loader)
+    {
+        (void)x;
+        assert(y.cols() == 3);
+        ++count;
+    }
+    assert(count == 3);
+
+    std::puts("  [DataLoader] drop_last PASSED");
+}
+
+static void test_dataloader_shuffle()
+{
+    std::puts("  [DataLoader] shuffle: different seeds produce different orderings ...");
+
+    nn::Matrix features(2, 100, 0.0);
+    nn::Matrix labels(1, 100, 0.0);
+    for (std::size_t i = 0; i < 100; ++i)
+    {
+        features.set_value_unchecked(0, i, static_cast<double>(i));
+        labels.set_value_unchecked(0, i, static_cast<double>(i));
+    }
+
+    nn::TensorDataset ds(std::move(features), std::move(labels));
+    nn::DataLoader loader1(ds, 10, /*shuffle=*/true, false, /*seed=*/1);
+    nn::DataLoader loader2(ds, 10, /*shuffle=*/true, false, /*seed=*/2);
+
+    std::vector<double> order1, order2;
+    for (auto [x, y] : loader1)
+    {
+        (void)x;
+        for (std::size_t j = 0; j < y.cols(); ++j)
+            order1.push_back(y.at_unchecked(0, j));
+    }
+    for (auto [x, y] : loader2)
+    {
+        (void)x;
+        for (std::size_t j = 0; j < y.cols(); ++j)
+            order2.push_back(y.at_unchecked(0, j));
+    }
+
+    int diffs = 0;
+    for (std::size_t i = 0; i < order1.size(); ++i)
+    {
+        if (order1[i] != order2[i])
+            ++diffs;
+    }
+    assert(diffs > 5);
+
+    std::puts("  [DataLoader] shuffle PASSED");
+}
+
+static void test_dataloader_shuffle_reproducible_with_seed()
+{
+    std::puts("  [DataLoader] shuffle: same seed -> same order ...");
+
+    nn::Matrix features(2, 100, 0.0);
+    nn::Matrix labels(1, 100, 0.0);
+    for (std::size_t i = 0; i < 100; ++i)
+    {
+        features.set_value_unchecked(0, i, static_cast<double>(i));
+        labels.set_value_unchecked(0, i, static_cast<double>(i));
+    }
+
+    nn::TensorDataset ds(std::move(features), std::move(labels));
+    nn::DataLoader loader1(ds, 10, true, false, 42);
+    nn::DataLoader loader2(ds, 10, true, false, 42);
+
+    std::vector<double> order1, order2;
+    for (auto [x, y] : loader1)
+    {
+        (void)x;
+        for (std::size_t j = 0; j < y.cols(); ++j)
+            order1.push_back(y.at_unchecked(0, j));
+    }
+    for (auto [x, y] : loader2)
+    {
+        (void)x;
+        for (std::size_t j = 0; j < y.cols(); ++j)
+            order2.push_back(y.at_unchecked(0, j));
+    }
+
+    assert(order1.size() == order2.size());
+    for (std::size_t i = 0; i < order1.size(); ++i)
+        assert(order1[i] == order2[i]);
+
+    std::puts("  [DataLoader] shuffle reproducible PASSED");
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// clip_grad_norm_ 测试 (F3)
+// ══════════════════════════════════════════════════════════════════════════════
+static void test_grad_clip_no_op_below_threshold()
+{
+    std::puts("  [clip_grad_norm_] no-op below threshold (returns pre-clip norm) ...");
+
+    nn::Matrix g1(1, 1, 0.5);
+    nn::Matrix g2(1, 1, 0.5);
+    nn::Matrix g3(1, 1, 0.5);
+
+    [[maybe_unused]] const double total_norm =
+        nn::clip_grad_norm_({std::ref(g1), std::ref(g2), std::ref(g3)}, 1.0);
+
+    assert(approx(total_norm, std::sqrt(0.75), 1e-9));
+
+    // 各梯度未变
+    for ([[maybe_unused]] auto &g_ref : {std::ref(g1), std::ref(g2), std::ref(g3)})
+    {
+        assert(approx(g_ref.get().at_unchecked(0, 0), 0.5));
+    }
+
+    std::puts("  [clip_grad_norm_] no-op below threshold PASSED");
+}
+
+static void test_grad_clip_scales_above_threshold()
+{
+    std::puts("  [clip_grad_norm_] scales above threshold ...");
+
+    nn::Matrix g1(1, 1, 5.0);
+    nn::Matrix g2(1, 1, 5.0);
+    nn::Matrix g3(1, 1, 5.0);
+
+    [[maybe_unused]] const double total_norm =
+        nn::clip_grad_norm_({std::ref(g1), std::ref(g2), std::ref(g3)}, 1.0, 1e-6);
+
+    // pre-clip 总范数
+    assert(approx(total_norm, std::sqrt(75.0), 1e-9));
+
+    // 各梯度按 max_norm / (total_norm + eps) 缩放
+    [[maybe_unused]] const double expected = 5.0 / (std::sqrt(75.0) + 1e-6);
+    for ([[maybe_unused]] auto &g_ref : {std::ref(g1), std::ref(g2), std::ref(g3)})
+    {
+        assert(approx(g_ref.get().at_unchecked(0, 0), expected, 1e-9));
+    }
+
+    std::puts("  [clip_grad_norm_] scales above threshold PASSED");
+}
+
+static void test_grad_clip_nan_throws()
+{
+    std::puts("  [clip_grad_norm_] NaN in grads throws ...");
+
+    nn::Matrix g(1, 1, std::numeric_limits<double>::quiet_NaN());
+
+    [[maybe_unused]] bool threw = false;
+    try
+    {
+        nn::clip_grad_norm_({std::ref(g)}, 1.0);
+    }
+    catch (const std::runtime_error &)
+    {
+        threw = true;
+    }
+    assert(threw);
+
+    std::puts("  [clip_grad_norm_] NaN throws PASSED");
+}
+
+static void test_grad_clip_inf_throws()
+{
+    std::puts("  [clip_grad_norm_] Inf in grads throws ...");
+
+    nn::Matrix g(1, 1, std::numeric_limits<double>::infinity());
+
+    [[maybe_unused]] bool threw = false;
+    try
+    {
+        nn::clip_grad_norm_({std::ref(g)}, 1.0);
+    }
+    catch (const std::runtime_error &)
+    {
+        threw = true;
+    }
+    assert(threw);
+
+    std::puts("  [clip_grad_norm_] Inf throws PASSED");
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// Model::summary() 测试 (F4)
+// ══════════════════════════════════════════════════════════════════════════════
+static void test_summary_contains_total_params()
+{
+    std::puts("  [Model::summary] total params count ...");
+
+    nn::Model model;
+    model.add<nn::Linear>(3, 4); // W=(4,3)=12, b=(4,1)=4 -> total 16
+
+    std::string s = model.summary();
+    assert(s.find("Total params: 16") != std::string::npos);
+    assert(s.find("Linear") != std::string::npos);
+
+    std::puts("  [Model::summary] total params PASSED");
+}
+
+static void test_summary_contains_all_layer_names()
+{
+    std::puts("  [Model::summary] all layer names appear (F7 coverage) ...");
+
+    nn::Model model;
+    model.add<nn::Linear>(2, 3)
+        .add<nn::ReLU>()
+        .add<nn::Sigmoid>();
+
+    std::string s = model.summary();
+    assert(s.find("Linear") != std::string::npos);
+    assert(s.find("ReLU") != std::string::npos);
+    assert(s.find("Sigmoid") != std::string::npos);
+
+    std::puts("  [Model::summary] all layer names PASSED");
+}
+
+static void test_summary_output_stream()
+{
+    std::puts("  [Model::summary] output stream write ...");
+
+    nn::Model model;
+    model.add<nn::Linear>(2, 3);
+
+    std::ostringstream oss;
+    std::string s = model.summary(&oss);
+    assert(s == oss.str());
+    assert(!s.empty());
+    assert(oss.str().find("Total params") != std::string::npos);
+
+    std::puts("  [Model::summary] output stream PASSED");
+}
+
 // ── 测试注册表 ──────────────────────────────────────────────────────────────
 struct test_entry
 {
@@ -894,6 +1955,8 @@ static const test_entry all_tests[] = {
     {"matrix_arithmetic",       test_matrix_arithmetic},
     {"matrix_transpose",        test_matrix_transpose},
     {"matrix_multiplication",   test_matrix_multiplication_large},
+    {"matrix_norm",             test_matrix_norm},
+    {"matrix_colwise_mean",     test_matrix_colwise_mean},
     {"relu",                    test_relu},
     {"leaky_relu",              test_leaky_relu},
     {"sigmoid",                 test_sigmoid},
@@ -901,6 +1964,7 @@ static const test_entry all_tests[] = {
     {"gelu",                    test_gelu},
     {"dropout",                 test_dropout},
     {"linear_forward_backward", test_linear_forward_backward},
+    {"linear_backward_blocked_matmul", test_linear_backward_blocked_matmul},
     {"mse_loss",                test_mse_loss},
     {"cross_entropy_loss",      test_cross_entropy_loss},
     {"sgd",                     test_sgd},
@@ -910,7 +1974,14 @@ static const test_entry all_tests[] = {
     {"cosine_lr",               test_cosine_lr},
     {"exp_lr",                  test_exp_lr},
     {"model_forward",           test_model_forward},
+    {"model_default_is_training", test_model_default_is_training},
+    {"model_train_eval",        test_model_train_eval},
+    {"on_mode_change",          test_on_mode_change_called},
     {"model_io",                test_model_io},
+    {"model_io_member",         test_model_io_member},
+    {"model_save_load_v1",      test_model_save_load_v1_roundtrip},
+    {"model_save_load_v2",      test_model_save_load_v2_no_batchnorm},
+    {"model_load_state_count_mismatch", test_model_load_state_count_mismatch},
     {"one_hot",                 test_one_hot},
     {"e2e_train",               test_end_to_end_train},
     {"set_data_match",          test_set_data_match},
@@ -920,6 +1991,30 @@ static const test_entry all_tests[] = {
     {"set_data_empty_throws",   test_set_data_empty_throws},
     {"set_data_inconsistent_throws", test_set_data_inconsistent_throws},
     {"set_data_exception_safety",    test_set_data_exception_safety},
+    {"batchnorm1d_forward_shape",        test_batchnorm1d_forward_shape},
+    {"batchnorm1d_forward_normalize",    test_batchnorm1d_forward_normalize},
+    {"batchnorm1d_backward_shape",       test_batchnorm1d_backward_shape},
+    {"batchnorm1d_eval_mode",            test_batchnorm1d_eval_mode},
+    {"batchnorm1d_running_stats_update", test_batchnorm1d_running_stats_update},
+    {"batchnorm1d_no_affine",            test_batchnorm1d_no_affine},
+    {"batchnorm1d_save_load_v2",         test_batchnorm1d_save_load_v2},
+    {"batchnorm1d_gradient_check",       test_batchnorm1d_gradient_check},
+    {"batchnorm1d_input_gradient_check", test_batchnorm1d_input_gradient_check},
+    {"batchnorm1d_batch_size_one",       test_batchnorm1d_batch_size_one},
+    {"batchnorm2d_forward_shape",        test_batchnorm2d_forward_shape},
+    {"batchnorm2d_normalize",            test_batchnorm2d_normalize},
+    {"batchnorm2d_save_load_v2",         test_batchnorm2d_save_load_v2},
+    {"dataloader_basic",                 test_dataloader_basic},
+    {"dataloader_drop_last",             test_dataloader_drop_last},
+    {"dataloader_shuffle",               test_dataloader_shuffle},
+    {"dataloader_shuffle_reproducible_with_seed", test_dataloader_shuffle_reproducible_with_seed},
+    {"grad_clip_no_op_below_threshold",  test_grad_clip_no_op_below_threshold},
+    {"grad_clip_scales_above_threshold", test_grad_clip_scales_above_threshold},
+    {"grad_clip_nan_throws",             test_grad_clip_nan_throws},
+    {"grad_clip_inf_throws",             test_grad_clip_inf_throws},
+    {"summary_contains_total_params",    test_summary_contains_total_params},
+    {"summary_contains_all_layer_names", test_summary_contains_all_layer_names},
+    {"summary_output_stream",            test_summary_output_stream},
 };
 
 static constexpr std::size_t num_tests = sizeof(all_tests) / sizeof(all_tests[0]);

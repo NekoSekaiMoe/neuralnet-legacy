@@ -63,23 +63,28 @@ int main(int argc, char *argv[])
     // 构建网络 — 使用 nn::Model（与训练时结构一致）
     nn::Model model;
     model.add<nn::Linear>(784, 64)
+         .add<nn::BatchNorm1d>(64)
          .add<nn::ReLU>()
          .add<nn::Linear>(64, 64)
+         .add<nn::BatchNorm1d>(64)
          .add<nn::ReLU>()
          .add<nn::Linear>(64, 64)
+         .add<nn::BatchNorm1d>(64)
          .add<nn::ReLU>()
          .add<nn::Linear>(64, 10);
 
-    // 加载模型参数（Model 版本）
+    // 加载模型参数
     try
     {
-        nn::load_model(model_path, model);
+        model.load(model_path);
     }
     catch (const std::exception &e)
     {
         std::cerr << "Error loading model: " << e.what() << std::endl;
         return 1;
     }
+
+    model.eval();
 
     // 读取图片
     nn::Matrix img;

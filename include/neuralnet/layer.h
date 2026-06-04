@@ -6,6 +6,7 @@
 #include <cstddef>
 #include <execution>
 #include <functional>
+#include <iostream>
 #include <numeric>
 #include <random>
 #include <stdexcept>
@@ -29,6 +30,28 @@ namespace nn
         // 添加参数更新辅助方法，避免虚函数调用开销
         virtual void update_params(double /*lr*/) noexcept {}
         virtual void zero_grad() noexcept {}
+
+        // ── 名称 (F7) ──────────────────────────────────────────────────────────
+        // 用于日志/调试/汇总。默认 "Layer"；各具体层覆盖为各自名字。
+        virtual const char *name() const { return "Layer"; }
+
+        // ── 模式切换 (F6) ──────────────────────────────────────────────────────
+        // 由 Model::train()/eval() 调用以向下传播模式。默认空操作；
+        // 含状态/概率行为的层（如 Dropout、BatchNorm）可覆盖以同步内部状态。
+        virtual void on_mode_change(bool /*training*/) {}
+
+        // ── 持久化 (F5) ────────────────────────────────────────────────────────
+        // 写入/读取非 Matrix 状态（运行均值/方差、batch 计数等）。
+        // 默认空操作：基类与无状态层（如 ReLU）不写任何东西。
+        // 配合 has_state() 让 Model 知道该层是否参与 v2 状态段。
+        virtual void save_state(std::ostream & /*os*/) const {}
+        virtual void load_state(std::istream & /*is*/) {}
+        virtual bool has_state() const { return false; }
+
+        // ── 参数计数 (F4) ──────────────────────────────────────────────────────
+        // 返回本层可训练参数的元素总数（不含 running stats 等非可训练状态）。
+        // 用于 Model::summary() 的 "Params" 列。默认 0；各具体层覆盖。
+        [[nodiscard]] virtual std::size_t param_count() const noexcept { return 0; }
     };
 
     class Linear final : public Layer
@@ -68,6 +91,13 @@ namespace nn
             return {std::ref(grad_W_), std::ref(grad_b_)};
         }
 
+        [[nodiscard]] std::size_t param_count() const noexcept override
+        {
+            return W_.size() + b_.size();
+        }
+
+        const char *name() const override { return "Linear"; }
+
         Matrix forward(const Matrix &input) override
         {
             if (input.rows() != W_.cols())
@@ -76,17 +106,24 @@ namespace nn
             }
 
             input_cache_ = input;
-            const Matrix product = W_ * input;
-            Matrix result(product.rows(), product.cols());
 
-            // 并行 bias 加法：使用 counting_iterator 生成索引
+            // Single allocation: matmul result is the output; bias is added in-place.
+            Matrix result = W_ * input;
+
+            // Row-strided bias add. Outer loop over rows (parallel); inner loop walks
+            // the row contiguously in memory, with `bias_val` hoisted out of the
+            // inner loop (one load per row instead of one per element).
+            const std::size_t cols = result.cols();
             std::for_each(NN_EXEC_POLICY,
                           counting_iterator<std::size_t>(0),
-                          counting_iterator<std::size_t>(product.size()),
-                          [&](std::size_t idx) noexcept
+                          counting_iterator<std::size_t>(result.rows()),
+                          [&](std::size_t row) noexcept
                           {
-                              const std::size_t row = idx / product.cols();
-                              result.data()[idx] = product.data()[idx] + b_.at_unchecked(row, 0);
+                              const double bias_val = b_.at_unchecked(row, 0);
+                              for (std::size_t col = 0; col < cols; ++col)
+                              {
+                                  result.data()[row * cols + col] += bias_val;
+                              }
                           });
 
             return result;
@@ -103,59 +140,26 @@ namespace nn
                 throw std::invalid_argument("linear backward cache/input shape mismatch");
             }
 
-            const std::size_t in_feat = W_.cols();
             const std::size_t out_feat = W_.rows();
-            const std::size_t batch = grad_output.cols();
 
-            // 计算 grad_input: dL/dx = W^T * dL/dy
-            Matrix grad_input(in_feat, batch);
-            std::for_each(NN_EXEC_POLICY,
-                          counting_iterator<std::size_t>(0),
-                          counting_iterator<std::size_t>(in_feat * batch),
-                          [&, this](std::size_t idx) noexcept
-                          {
-                              const std::size_t input_feature = idx / batch;
-                              const std::size_t batch_index = idx % batch;
-                              double sum = 0.0;
-                              for (std::size_t out_feature = 0; out_feature < out_feat; ++out_feature)
-                              {
-                                  sum += W_.at_unchecked(out_feature, input_feature) *
-                                         grad_output.at_unchecked(out_feature, batch_index);
-                              }
-                              grad_input.set_value_unchecked(input_feature, batch_index, sum);
-                          });
+            // grad_input = W^T * grad_output       (in_feat × batch)
+            // grad_W     = grad_output * input^T   (out_feat × in_feat) — REPLACE not +=
+            // grad_b     = colwise_sum(grad_output) along batch dim → (out_feat × 1)
+            // The `=` on grad_W_ is a replace, not accumulate. The optimizer is
+            // responsible for zeroing gradients before each backward pass.
 
-            // 计算 grad_W: dL/dW = dL/dy * x^T
-            std::for_each(NN_EXEC_POLICY,
-                          counting_iterator<std::size_t>(0),
-                          counting_iterator<std::size_t>(out_feat * in_feat),
-                          [&, this](std::size_t idx) noexcept
-                          {
-                              const std::size_t out_feature = idx / in_feat;
-                              const std::size_t input_feature = idx % in_feat;
-                              double sum = 0.0;
-                              for (std::size_t batch_index = 0; batch_index < batch; ++batch_index)
-                              {
-                                  sum += grad_output.at_unchecked(out_feature, batch_index) *
-                                         input_cache_.at_unchecked(input_feature, batch_index);
-                              }
-                              grad_W_.set_value_unchecked(out_feature, input_feature, 
-                                                          grad_W_.at_unchecked(out_feature, input_feature) + sum);
-                          });
+            Matrix W_T = W_.transpose();
+            Matrix grad_input = W_T * grad_output;
 
-            // 计算 grad_b: dL/db = sum(dL/dy, dim=batch)
-            std::for_each(NN_EXEC_POLICY,
-                          counting_iterator<std::size_t>(0),
-                          counting_iterator<std::size_t>(out_feat),
-                          [&, this](std::size_t out_feature) noexcept
-                          {
-                              double sum = 0.0;
-                              for (std::size_t batch_index = 0; batch_index < batch; ++batch_index)
-                              {
-                                  sum += grad_output.at_unchecked(out_feature, batch_index);
-                              }
-                              grad_b_.set_value_unchecked(out_feature, 0, sum);
-                          });
+            Matrix input_T = input_cache_.transpose();
+            grad_W_ = grad_output * input_T;
+
+            std::vector<double> b_vec = grad_output.colwise_sum();
+            grad_b_ = Matrix(out_feat, 1);
+            for (std::size_t i = 0; i < out_feat; ++i)
+            {
+                grad_b_.set_value_unchecked(i, 0, b_vec[i]);
+            }
 
             return grad_input;
         }
@@ -167,6 +171,8 @@ namespace nn
         Matrix input_cache_;
 
     public:
+        const char *name() const override { return "ReLU"; }
+
         Matrix forward(const Matrix &input) override
         {
             input_cache_ = input;
@@ -208,6 +214,8 @@ namespace nn
         explicit LeakyReLU(double negative_slope = 0.01)
             : negative_slope_(negative_slope) {}
 
+        const char *name() const override { return "LeakyReLU"; }
+
         Matrix forward(const Matrix &input) override
         {
             input_cache_ = input;
@@ -246,6 +254,8 @@ namespace nn
         Matrix output_cache_;
 
     public:
+        const char *name() const override { return "Sigmoid"; }
+
         Matrix forward(const Matrix &input) override
         {
             Matrix result(input.rows(), input.cols());
@@ -282,6 +292,8 @@ namespace nn
         Matrix output_cache_;
 
     public:
+        const char *name() const override { return "Tanh"; }
+
         Matrix forward(const Matrix &input) override
         {
             Matrix result(input.rows(), input.cols());
@@ -382,6 +394,8 @@ namespace nn
             }
         }
 
+        const char *name() const override { return "Dropout"; }
+
         void set_training(bool training) noexcept { training_ = training; }
 
         Matrix forward(const Matrix &input) override
@@ -431,6 +445,358 @@ namespace nn
                            { return grad * m; });
             return grad_input;
         }
+    };
+
+    // ── BatchNorm1d ──────────────────────────────────────────────────────────
+    // 批归一化 1D：输入 (num_features, batch_size)；按特征维（行）统计。
+    // 训练：用 batch mean/var 归一化 + 动量更新 running stats。
+    // 推理：用 running mean/var 归一化。
+    // 可选 affine：归一化后再做 gamma*x_hat + beta 仿射。
+    // BN2d 复用本类：把 (C, N*H*W) 视为 (C, batch)，forward 完全相同。
+    class BatchNorm1d : public Layer
+    {
+    private:
+        std::size_t num_features_;
+        double eps_;
+        double momentum_;
+        bool affine_;
+
+        Matrix gamma_;        // (num_features, 1)
+        Matrix beta_;         // (num_features, 1)
+        Matrix dgamma_;       // (num_features, 1)
+        Matrix dbeta_;        // (num_features, 1)
+        Matrix running_mean_; // (num_features, 1), init=0
+        Matrix running_var_;  // (num_features, 1), init=1
+        int64_t num_batches_tracked_{0};
+        bool is_training_{true};
+
+        Matrix input_cache_;
+        Matrix batch_mean_;   // (num_features, 1)
+        Matrix batch_var_;    // (num_features, 1)
+        Matrix normalized_;   // (num_features, batch_size)
+
+        // 行主序下，按行求和 = 按特征聚合（每个 i 一行 = 一个特征的 batch 内值）
+        static std::vector<double> rowwise_sum(const Matrix &m)
+        {
+            std::vector<double> result(m.rows(), 0.0);
+            std::for_each(NN_EXEC_POLICY,
+                          counting_iterator<std::size_t>(0),
+                          counting_iterator<std::size_t>(m.rows()),
+                          [&](std::size_t i) noexcept
+                          {
+                              double s = 0.0;
+                              for (std::size_t j = 0; j < m.cols(); ++j)
+                                  s += m.at_unchecked(i, j);
+                              result[i] = s;
+                          });
+            return result;
+        }
+
+        // 行主序下，按行求均值
+        static std::vector<double> rowwise_mean(const Matrix &m)
+        {
+            std::vector<double> result = rowwise_sum(m);
+            if (m.cols() == 0) return result;
+            const double denom = static_cast<double>(m.cols());
+            std::for_each(NN_EXEC_POLICY,
+                          counting_iterator<std::size_t>(0),
+                          counting_iterator<std::size_t>(m.rows()),
+                          [&](std::size_t i) noexcept { result[i] /= denom; });
+            return result;
+        }
+
+        // 行主序下，按行求总体方差（分母 = cols_，PyTorch BatchNorm 约定）
+        static std::vector<double> rowwise_var(const Matrix &m, const std::vector<double> &mean)
+        {
+            std::vector<double> result(m.rows(), 0.0);
+            if (m.cols() == 0) return result;
+            std::for_each(NN_EXEC_POLICY,
+                          counting_iterator<std::size_t>(0),
+                          counting_iterator<std::size_t>(m.rows()),
+                          [&](std::size_t i)
+                          {
+                              const double m_i = mean[i];
+                              double s = 0.0;
+                              for (std::size_t j = 0; j < m.cols(); ++j)
+                              {
+                                  const double d = m.at_unchecked(i, j) - m_i;
+                                  s += d * d;
+                              }
+                              result[i] = s / static_cast<double>(m.cols());
+                          });
+            return result;
+        }
+
+    public:
+        BatchNorm1d(std::size_t num_features, double eps = 1e-5,
+                    double momentum = 0.1, bool affine = true)
+            : num_features_(num_features), eps_(eps), momentum_(momentum), affine_(affine),
+              gamma_(affine ? num_features : 0, 1, affine ? 1.0 : 0.0),
+              beta_(affine ? num_features : 0, 1, 0.0),
+              dgamma_(num_features, 1, 0.0),
+              dbeta_(num_features, 1, 0.0),
+              running_mean_(num_features, 1, 0.0),
+              running_var_(num_features, 1, 1.0),
+              batch_mean_(num_features, 1, 0.0),
+              batch_var_(num_features, 1, 0.0)
+        {
+            if (num_features_ == 0)
+            {
+                throw std::invalid_argument("BatchNorm1d: num_features must be > 0");
+            }
+        }
+
+        // ── 公开访问器（测试 / 调试） ──
+        [[nodiscard]] const Matrix &running_mean() const noexcept { return running_mean_; }
+        [[nodiscard]] const Matrix &running_var() const noexcept { return running_var_; }
+        [[nodiscard]] int64_t num_batches_tracked() const noexcept { return num_batches_tracked_; }
+        [[nodiscard]] bool is_training() const noexcept { return is_training_; }
+
+        std::vector<std::reference_wrapper<Matrix>> parameters() override
+        {
+            if (!affine_) return {};
+            return {std::ref(gamma_), std::ref(beta_)};
+        }
+
+        std::vector<std::reference_wrapper<Matrix>> param_gradients() override
+        {
+            if (!affine_) return {};
+            return {std::ref(dgamma_), std::ref(dbeta_)};
+        }
+
+        void zero_grad() noexcept override
+        {
+            if (!affine_) return;
+            dgamma_.zero();
+            dbeta_.zero();
+        }
+
+        [[nodiscard]] std::size_t param_count() const noexcept override
+        {
+            return affine_ ? 2 * num_features_ : 0;
+        }
+
+        void on_mode_change(bool training) noexcept override { is_training_ = training; }
+
+        bool has_state() const override { return true; }
+
+        const char *name() const override { return "BatchNorm1d"; }
+
+        Matrix forward(const Matrix &input) override
+        {
+            if (input.rows() != num_features_)
+            {
+                throw std::invalid_argument("BatchNorm1d forward: input rows != num_features");
+            }
+
+            const std::size_t batch_size = input.cols();
+            input_cache_ = input;
+
+            if (batch_size == 0)
+            {
+                normalized_ = Matrix(num_features_, 0);
+                return Matrix(num_features_, 0);
+            }
+
+            if (is_training_)
+            {
+                const std::vector<double> mu_vec = rowwise_mean(input);
+                const std::vector<double> var_vec = rowwise_var(input, mu_vec);
+
+                for (std::size_t i = 0; i < num_features_; ++i)
+                {
+                    batch_mean_.set_value_unchecked(i, 0, mu_vec[i]);
+                    batch_var_.set_value_unchecked(i, 0, var_vec[i]);
+                }
+
+                // running_mean = (1 - momentum) * running_mean + momentum * batch_mean
+                std::transform(NN_EXEC_POLICY,
+                               running_mean_.data().begin(), running_mean_.data().end(),
+                               batch_mean_.data().begin(),
+                               running_mean_.data().begin(),
+                               [this](double rm, double bm) noexcept
+                               { return (1.0 - momentum_) * rm + momentum_ * bm; });
+                std::transform(NN_EXEC_POLICY,
+                               running_var_.data().begin(), running_var_.data().end(),
+                               batch_var_.data().begin(),
+                               running_var_.data().begin(),
+                               [this](double rv, double bv) noexcept
+                               { return (1.0 - momentum_) * rv + momentum_ * bv; });
+                ++num_batches_tracked_;
+            }
+
+            // normalized_ = (input - mean) / sqrt(var + eps)
+            const Matrix &mean_src = is_training_ ? batch_mean_ : running_mean_;
+            const Matrix &var_src = is_training_ ? batch_var_ : running_var_;
+            normalized_ = Matrix(num_features_, batch_size);
+            std::for_each(NN_EXEC_POLICY,
+                          counting_iterator<std::size_t>(0),
+                          counting_iterator<std::size_t>(input.size()),
+                          [&](std::size_t idx)
+                          {
+                              const std::size_t i = idx / batch_size;
+                              const double mu = mean_src.at_unchecked(i, 0);
+                              const double std_inv = 1.0 / std::sqrt(var_src.at_unchecked(i, 0) + eps_);
+                              normalized_.data()[idx] = (input.data()[idx] - mu) * std_inv;
+                          });
+
+            if (!affine_)
+            {
+                return normalized_;
+            }
+
+            Matrix output(num_features_, batch_size);
+            std::for_each(NN_EXEC_POLICY,
+                          counting_iterator<std::size_t>(0),
+                          counting_iterator<std::size_t>(input.size()),
+                          [&](std::size_t idx)
+                          {
+                              const std::size_t i = idx / batch_size;
+                              output.data()[idx] = normalized_.data()[idx] * gamma_.at_unchecked(i, 0)
+                                                  + beta_.at_unchecked(i, 0);
+                          });
+            return output;
+        }
+
+        Matrix backward(const Matrix &grad_output) override
+        {
+            if (grad_output.rows() != num_features_)
+            {
+                throw std::invalid_argument("BatchNorm1d backward: grad_output rows != num_features");
+            }
+            if (input_cache_.rows() != num_features_ || input_cache_.cols() != grad_output.cols())
+            {
+                throw std::invalid_argument("BatchNorm1d backward: cache shape mismatch");
+            }
+
+            const std::size_t batch_size = grad_output.cols();
+            if (batch_size == 0)
+            {
+                return Matrix(num_features_, 0);
+            }
+
+            if (affine_)
+            {
+                // dgamma: 行主序下对每行求和 = 每特征 (grad_output * normalized) 的 batch 内和
+                for (std::size_t i = 0; i < num_features_; ++i)
+                {
+                    double s = 0.0;
+                    for (std::size_t j = 0; j < batch_size; ++j)
+                        s += grad_output.at_unchecked(i, j) * normalized_.at_unchecked(i, j);
+                    dgamma_.set_value_unchecked(i, 0, s);
+                }
+                // dbeta: 每特征 grad_output 的 batch 内和
+                for (std::size_t i = 0; i < num_features_; ++i)
+                {
+                    double s = 0.0;
+                    for (std::size_t j = 0; j < batch_size; ++j)
+                        s += grad_output.at_unchecked(i, j);
+                    dbeta_.set_value_unchecked(i, 0, s);
+                }
+            }
+
+            // dx_hat = grad_output * gamma (broadcast)
+            Matrix dx_hat(num_features_, batch_size);
+            if (affine_)
+            {
+                std::for_each(NN_EXEC_POLICY,
+                              counting_iterator<std::size_t>(0),
+                              counting_iterator<std::size_t>(grad_output.size()),
+                              [&](std::size_t idx)
+                              {
+                                  const std::size_t i = idx / batch_size;
+                                  dx_hat.data()[idx] = grad_output.data()[idx]
+                                                      * gamma_.at_unchecked(i, 0);
+                              });
+            }
+            else
+            {
+                dx_hat = grad_output;
+            }
+
+            // 各项按行（每特征）的聚合
+            std::vector<double> sum_dxhat(num_features_, 0.0);
+            std::vector<double> sum_dxhat_xhat(num_features_, 0.0);
+            std::vector<double> std_inv(num_features_, 0.0);
+            for (std::size_t i = 0; i < num_features_; ++i)
+            {
+                double sd = 0.0;
+                double sdx = 0.0;
+                for (std::size_t j = 0; j < batch_size; ++j)
+                {
+                    sd += dx_hat.at_unchecked(i, j);
+                    sdx += dx_hat.at_unchecked(i, j) * normalized_.at_unchecked(i, j);
+                }
+                sum_dxhat[i] = sd;
+                sum_dxhat_xhat[i] = sdx;
+                std_inv[i] = 1.0 / std::sqrt(batch_var_.at_unchecked(i, 0) + eps_);
+            }
+
+            // dx = (1/N) * (N*dx_hat - sum_dxhat - normalized_*sum_dxhat_xhat) * std_inv
+            const double scale = 1.0 / static_cast<double>(batch_size);
+            const double N = static_cast<double>(batch_size);
+            Matrix dx(num_features_, batch_size);
+            std::for_each(NN_EXEC_POLICY,
+                          counting_iterator<std::size_t>(0),
+                          counting_iterator<std::size_t>(dx.size()),
+                          [&](std::size_t idx)
+                          {
+                              const std::size_t i = idx / batch_size;
+                              dx.data()[idx] = scale
+                                  * (N * dx_hat.data()[idx] - sum_dxhat[i]
+                                     - normalized_.data()[idx] * sum_dxhat_xhat[i])
+                                  * std_inv[i];
+                          });
+
+            return dx;
+        }
+
+        void save_state(std::ostream &os) const override
+        {
+            auto write_mat = [&](const Matrix &m)
+            {
+                const std::size_t rows = m.rows();
+                const std::size_t cols = m.cols();
+                os.write(reinterpret_cast<const char *>(&rows), sizeof(rows));
+                os.write(reinterpret_cast<const char *>(&cols), sizeof(cols));
+                os.write(reinterpret_cast<const char *>(m.data().data()),
+                         m.size() * sizeof(double));
+            };
+            write_mat(running_mean_);
+            write_mat(running_var_);
+            os.write(reinterpret_cast<const char *>(&num_batches_tracked_),
+                     sizeof(num_batches_tracked_));
+        }
+
+        void load_state(std::istream &is) override
+        {
+            auto read_mat = [&](Matrix &m)
+            {
+                std::size_t rows = 0, cols = 0;
+                is.read(reinterpret_cast<char *>(&rows), sizeof(rows));
+                is.read(reinterpret_cast<char *>(&cols), sizeof(cols));
+                if (rows != m.rows() || cols != m.cols())
+                {
+                    throw std::runtime_error("BatchNorm1d: state matrix shape mismatch");
+                }
+                is.read(reinterpret_cast<char *>(m.data().data()),
+                        m.size() * sizeof(double));
+            };
+            read_mat(running_mean_);
+            read_mat(running_var_);
+            is.read(reinterpret_cast<char *>(&num_batches_tracked_),
+                    sizeof(num_batches_tracked_));
+        }
+    };
+
+    // ── BatchNorm2d ──────────────────────────────────────────────────────────
+    // 把 (C, N*H*W) 视为 (C, batch) —— BN1d::forward 已接受该形状。
+    // 因此无需 override forward/backward；只重写 name() 用于日志/汇总。
+    class BatchNorm2d : public BatchNorm1d
+    {
+    public:
+        using BatchNorm1d::BatchNorm1d;
+        const char *name() const override { return "BatchNorm2d"; }
     };
 }
 

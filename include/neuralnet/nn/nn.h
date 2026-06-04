@@ -11,6 +11,11 @@
 #include <neuralnet/model/model.h>
 #include <neuralnet/optimizer.h>
 
+// ── Wave 2 新增模块（必须在 model.h 之后以提供 Model::summary 实现） ──
+#include <neuralnet/dataloader.h>
+#include <neuralnet/grad_clip.h>
+#include <neuralnet/summary.h>
+
 namespace nn
 {
     [[nodiscard]] inline Matrix one_hot(const std::vector<std::size_t> &true_i, std::size_t mat_size)

@@ -35,6 +35,8 @@ venv/
 .idea/
 *.swp
 *.swo
+.clangd
+.clangd-*
 
 # OS generated files
 .DS_Store
@@ -55,3 +57,6 @@ target/
 obj/
 bin/
 ```
+# Session / plan tracking (internal to Sisyphus workflow)
+.omo/
+.sisyphus/
