@@ -38,20 +38,21 @@
 
 **实现建议**：
 ```cpp
-// 复用已有的 MultiHeadAttention，仅在 forward 中 scores 计算后、softmax 之前
-// 加上 causal mask：
+// 独立实现 CausalSelfAttention，不要通过继承 MultiHeadAttention 复用其私有状态。
+// 可以采用组合方式，或提取可复用的 attention 核心函数。
+// 在 scores 计算后、softmax 之前加上 causal mask：
 for (std::size_t i = 0; i < sl; ++i)
     for (std::size_t j = i + 1; j < sl; ++j)
         scores.set_value_unchecked(i, j, -1e9);
 ```
 
-可以直接继承 MultiHeadAttention 或新建类，推荐新建类以保持关注点分离。
+推荐新建独立类以保持关注点分离，避免依赖 MultiHeadAttention 的内部状态。
 
 ### 步骤 2：GPTBlock
 
 Pre-norm decoder block，结构类似 TransformerEncoderLayer：
 
-```
+```text
 input → LayerNorm → CausalSelfAttention → + residual
       → LayerNorm → FeedForward → + residual → output
 ```
@@ -62,7 +63,7 @@ input → LayerNorm → CausalSelfAttention → + residual
 
 完整的 decoder-only Transformer：
 
-```
+```text
 token IDs → Token Embedding (lookup table) → + Positional Encoding
           → N × GPTBlock
           → LayerNorm
@@ -122,7 +123,7 @@ const std::vector<std::size_t> &ids  // 或 const std::size_t*, std::size_t
 - 上游 V2：`[magic][version=2][model_type][spec_data...][matrices...]`
 
 **建议方案**：引入 V3 格式，合并两种设计：
-```
+```text
 [magic][version=3][model_type][spec_data...][n_params][matrices...][n_state_layers][states...]
 ```
 保留 V1/V2 读取兼容，新文件统一用 V3。
@@ -141,9 +142,9 @@ const std::vector<std::size_t> &ids  // 或 const std::size_t*, std::size_t
 
 ## 三、C++26 → C++17 通用替换表
 
-| C++26 / C++20 特性 | C++17 替代方案 |
+| C++20 / C++23 / C++26 特性 | C++17 替代方案 |
 |--------------------|---------------|
-| `std::expected<T, E>` | 抛异常 / 返回裸值 |
+| `std::expected<T, E>` (C++23) | 抛异常 / 返回裸值 |
 | `Result<T>` 返回值 | `T` + `throw std::runtime_error(...)` |
 | `std::views::iota(0, n)` | `counting_iterator<size_t>(0), counting_iterator<size_t>(n)` |
 | `std::views::zip(a, b, c)` | 索引循环 `for (size_t i = 0; ...)` |
@@ -163,7 +164,7 @@ const std::vector<std::size_t> &ids  // 或 const std::size_t*, std::size_t
 1. **形状测试**：forward/backward 输入输出维度验证
 2. **数值测试**：已知输入 → 已知输出 的确定性验证
 3. **梯度校验**：有限差分 vs 解析梯度（参见 `test_nn.cpp` 中的 `finite_diff_grad`）
-4. **端到端测试**：GPTModel + 分词器 + 训练循环跑几步，验证 loss 下降
+4. **端到端 smoke test**：GPTModel + 分词器 + 训练循环跑几步，固定随机种子和优化配置，验证 loss 有限、梯度非零、且在明确容差内有改善。确定性的数值/梯度测试应与训练 smoke test 分开
 
 **测试文件建议**：
 - `tests/test_gpt.cpp` — CausalSelfAttention, GPTBlock, GPTModel
@@ -173,7 +174,7 @@ const std::vector<std::size_t> &ids  // 或 const std::size_t*, std::size_t
 
 ## 五、移植顺序建议
 
-```
+```text
 Phase 1 (基础):
   1. CausalSelfAttention  ← 在 MHA 基础上加 causal mask
   2. GPTBlock              ← 组合已有组件

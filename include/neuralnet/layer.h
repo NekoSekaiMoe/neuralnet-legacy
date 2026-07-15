@@ -885,6 +885,12 @@ namespace nn
 
         Matrix backward(const Matrix &grad_output) override
         {
+            if (grad_output.rows() != normalized_shape_)
+                throw std::invalid_argument("LayerNorm backward: grad_output rows != normalized_shape");
+            if (normalized_cache_.rows() != normalized_shape_
+                || normalized_cache_.cols() != grad_output.cols())
+                throw std::invalid_argument("LayerNorm backward: forward cache shape mismatch");
+
             const std::size_t feat = grad_output.rows();
             const std::size_t batch = grad_output.cols();
             const double N = static_cast<double>(feat);
@@ -940,6 +946,8 @@ namespace nn
         {
             const std::size_t rows = input.rows();
             const std::size_t cols = input.cols();
+            if (rows == 0)
+                throw std::invalid_argument("Softmax forward: input must have at least one row");
             output_cache_ = Matrix(rows, cols);
 
             for (std::size_t j = 0; j < cols; ++j)
@@ -965,6 +973,10 @@ namespace nn
 
         Matrix backward(const Matrix &grad_output) override
         {
+            if (output_cache_.rows() != grad_output.rows()
+                || output_cache_.cols() != grad_output.cols())
+                throw std::invalid_argument("Softmax backward: output cache shape mismatch with grad_output");
+
             const std::size_t rows = grad_output.rows();
             const std::size_t cols = grad_output.cols();
             Matrix grad_input(rows, cols);
@@ -1010,9 +1022,13 @@ namespace nn
 
         Matrix forward(const Matrix &input) override
         {
+            if (input.rows() != d_model_)
+                throw std::invalid_argument("PositionalEncoding forward: input rows != d_model");
+            if (input.cols() > max_seq_len_)
+                throw std::invalid_argument("PositionalEncoding forward: sequence length exceeds max_seq_len");
+
             Matrix output = input;
-            const std::size_t cols = std::min(input.cols(), max_seq_len_);
-            for (std::size_t j = 0; j < cols; ++j)
+            for (std::size_t j = 0; j < input.cols(); ++j)
                 for (std::size_t i = 0; i < d_model_; ++i)
                     output.data()[i * input.cols() + j] += pe_.at_unchecked(i, j);
             return output;
@@ -1090,21 +1106,29 @@ namespace nn
             return result;
         }
 
+        static std::size_t validated_head_dim(std::size_t d_model, std::size_t num_heads)
+        {
+            if (d_model == 0)
+                throw std::invalid_argument("d_model must be > 0");
+            if (num_heads == 0)
+                throw std::invalid_argument("num_heads must be > 0");
+            if (d_model % num_heads != 0)
+                throw std::invalid_argument("d_model must be divisible by num_heads");
+            return d_model / num_heads;
+        }
+
     public:
         MultiHeadAttention(std::size_t d_model, std::size_t num_heads)
             : d_model_(d_model), num_heads_(num_heads),
-              head_dim_(d_model / num_heads),
-              scale_(1.0 / std::sqrt(static_cast<double>(d_model / num_heads))),
+              head_dim_(validated_head_dim(d_model, num_heads)),
+              scale_(1.0 / std::sqrt(static_cast<double>(head_dim_))),
               W_q_(xavier_init(d_model, d_model)),
               W_k_(xavier_init(d_model, d_model)),
               W_v_(xavier_init(d_model, d_model)),
               W_o_(xavier_init(d_model, d_model)),
               dW_q_(d_model, d_model), dW_k_(d_model, d_model),
               dW_v_(d_model, d_model), dW_o_(d_model, d_model)
-        {
-            if (d_model % num_heads != 0)
-                throw std::invalid_argument("d_model must be divisible by num_heads");
-        }
+        {}
 
         const char *name() const override { return "MultiHeadAttention"; }
         [[nodiscard]] std::size_t param_count() const noexcept override
@@ -1304,10 +1328,8 @@ namespace nn
 
         Matrix backward(const Matrix &grad_output) override
         {
-            Matrix grad_ffn = ffn_.backward(norm2_.backward(grad_output));
-            Matrix grad_residual1 = grad_output + grad_ffn;
-            Matrix grad_attn = mha_.backward(norm1_.backward(grad_residual1));
-            return grad_residual1 + grad_attn;
+            Matrix grad_residual1 = grad_output + norm2_.backward(ffn_.backward(grad_output));
+            return grad_residual1 + norm1_.backward(mha_.backward(grad_residual1));
         }
     };
 
@@ -1320,6 +1342,7 @@ namespace nn
         std::size_t num_patches_;
         std::size_t cached_batch_size_{0};
         std::vector<Matrix> per_sample_cache_;
+        Matrix forward_input_cache_;
 
     public:
         TransformerEncoder(std::size_t d_model, std::size_t num_heads,
@@ -1364,6 +1387,7 @@ namespace nn
                 throw std::invalid_argument(
                     "TransformerEncoder: input cols must be a multiple of num_patches");
 
+            forward_input_cache_ = input;
             per_sample_cache_.clear();
             per_sample_cache_.reserve(cached_batch_size_);
 
@@ -1398,8 +1422,23 @@ namespace nn
             const double inv_patches = 1.0 / static_cast<double>(num_patches_);
             Matrix grad_input(d_model_, cached_batch_size_ * num_patches_);
 
+            auto pg = param_gradients();
+            std::vector<Matrix> grad_accum;
+            grad_accum.reserve(pg.size());
+            for (auto &g : pg)
+                grad_accum.emplace_back(g.get().rows(), g.get().cols(), 0.0);
+
             for (std::size_t b = 0; b < cached_batch_size_; ++b)
             {
+                Matrix sample(d_model_, num_patches_);
+                for (std::size_t i = 0; i < d_model_; ++i)
+                    for (std::size_t j = 0; j < num_patches_; ++j)
+                        sample.set_value_unchecked(i, j,
+                            forward_input_cache_.at_unchecked(i, b * num_patches_ + j));
+
+                for (auto &layer : layers_)
+                    sample = layer.forward(sample);
+
                 Matrix grad_sample(d_model_, num_patches_);
                 for (std::size_t i = 0; i < d_model_; ++i)
                 {
@@ -1411,11 +1450,19 @@ namespace nn
                 for (auto it = layers_.rbegin(); it != layers_.rend(); ++it)
                     grad_sample = it->backward(grad_sample);
 
+                auto current_pg = param_gradients();
+                for (std::size_t k = 0; k < grad_accum.size(); ++k)
+                    grad_accum[k].add_inplace(current_pg[k].get());
+
                 for (std::size_t i = 0; i < d_model_; ++i)
                     for (std::size_t j = 0; j < num_patches_; ++j)
                         grad_input.set_value_unchecked(i, b * num_patches_ + j,
                             grad_sample.at_unchecked(i, j));
             }
+
+            for (std::size_t k = 0; k < grad_accum.size(); ++k)
+                pg[k].get() = grad_accum[k];
+
             return grad_input;
         }
     };
@@ -1433,10 +1480,22 @@ namespace nn
         Matrix patches_cache_;
         std::size_t cached_batch_size_{0};
 
+        static std::size_t validated_num_patches(std::size_t img_size, std::size_t patch_size)
+        {
+            if (patch_size == 0)
+                throw std::invalid_argument("PatchEmbedding: patch_size must be > 0");
+            if (img_size == 0)
+                throw std::invalid_argument("PatchEmbedding: img_size must be > 0");
+            if (img_size % patch_size != 0)
+                throw std::invalid_argument("PatchEmbedding: img_size must be divisible by patch_size");
+            const std::size_t grid = img_size / patch_size;
+            return grid * grid;
+        }
+
     public:
         PatchEmbedding(std::size_t img_size, std::size_t patch_size, std::size_t d_model)
             : img_size_(img_size), patch_size_(patch_size), d_model_(d_model),
-              num_patches_((img_size / patch_size) * (img_size / patch_size)),
+              num_patches_(validated_num_patches(img_size, patch_size)),
               patch_dim_(patch_size * patch_size),
               proj_(patch_dim_, d_model) {}
 
@@ -1448,6 +1507,9 @@ namespace nn
 
         Matrix forward(const Matrix &input) override
         {
+            if (input.rows() != img_size_ * img_size_)
+                throw std::invalid_argument("PatchEmbedding forward: input rows must equal img_size^2");
+
             cached_batch_size_ = input.cols();
             const std::size_t grid = img_size_ / patch_size_;
 

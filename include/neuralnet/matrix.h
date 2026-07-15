@@ -9,6 +9,7 @@
 #include <execution>
 #include <functional>
 #include <iostream>
+#include <limits>
 #include <numeric>
 #include <random>
 #include <stdexcept>
@@ -422,13 +423,17 @@ namespace nn
         void resize(std::size_t rows, std::size_t cols)
         {
             if (rows_ == rows && cols_ == cols) return;
+            if (rows != 0 && cols > std::numeric_limits<std::size_t>::max() / rows)
+                throw std::overflow_error("Matrix::resize: rows * cols overflow");
+            data_.resize(rows * cols);
             rows_ = rows;
             cols_ = cols;
-            data_.resize(rows * cols);
         }
 
         [[nodiscard]] Matrix row_slice(std::size_t start_row, std::size_t num_rows) const
         {
+            if (start_row > rows_ || num_rows > rows_ - start_row)
+                throw std::out_of_range("row_slice: slice exceeds matrix bounds");
             Matrix result(num_rows, cols_);
             for (std::size_t i = 0; i < num_rows; ++i)
                 std::copy_n(data_.data() + (start_row + i) * cols_, cols_,
@@ -438,6 +443,10 @@ namespace nn
 
         void set_row_slice(std::size_t start_row, const Matrix &slice)
         {
+            if (start_row > rows_ || slice.rows_ > rows_ - start_row)
+                throw std::out_of_range("set_row_slice: slice exceeds matrix bounds");
+            if (slice.cols_ != cols_)
+                throw std::invalid_argument("set_row_slice: column count mismatch");
             for (std::size_t i = 0; i < slice.rows_; ++i)
                 std::copy_n(slice.data_.data() + i * slice.cols_, cols_,
                             data_.data() + (start_row + i) * cols_);
