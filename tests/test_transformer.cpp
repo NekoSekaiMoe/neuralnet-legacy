@@ -1,0 +1,486 @@
+#include <neuralnet/nn/nn.h>
+#include <neuralnet/layer.h>
+#include <neuralnet/loss.h>
+#include <neuralnet/optimizer.h>
+#include <neuralnet/model/model.h>
+
+#include <cassert>
+#include <cmath>
+#include <cstring>
+#include <iostream>
+#include <random>
+#include <string>
+#include <vector>
+
+static bool approx(double a, double b, double tol = 1e-6)
+{
+    return std::fabs(a - b) < tol;
+}
+
+// ── Matrix helpers ──────────────────────────────────────────────────────────
+
+static void test_matrix_resize()
+{
+    nn::Matrix m(3, 4);
+    assert(m.rows() == 3 && m.cols() == 4);
+    m.resize(5, 6);
+    assert(m.rows() == 5 && m.cols() == 6);
+    assert(m.size() == 30);
+}
+
+static void test_matrix_row_slice()
+{
+    nn::Matrix m(4, 3);
+    for (std::size_t i = 0; i < 4; ++i)
+        for (std::size_t j = 0; j < 3; ++j)
+            m.set_value_unchecked(i, j, static_cast<double>(i * 10 + j));
+
+    nn::Matrix s = m.row_slice(1, 2);
+    assert(s.rows() == 2 && s.cols() == 3);
+    assert(approx(s.at(0, 0), 10.0));
+    assert(approx(s.at(0, 2), 12.0));
+    assert(approx(s.at(1, 0), 20.0));
+    assert(approx(s.at(1, 2), 22.0));
+}
+
+static void test_matrix_set_row_slice()
+{
+    nn::Matrix m(4, 3);
+    nn::Matrix s(2, 3, 99.0);
+    m.set_row_slice(1, s);
+    assert(approx(m.at(1, 0), 99.0));
+    assert(approx(m.at(2, 2), 99.0));
+    assert(approx(m.at(0, 0), 0.0));
+    assert(approx(m.at(3, 0), 0.0));
+}
+
+// ── LayerNorm ───────────────────────────────────────────────────────────────
+
+static void test_layernorm_forward_shape()
+{
+    nn::LayerNorm ln(8);
+    nn::Matrix input(8, 4);
+    std::mt19937_64 rng(42);
+    std::normal_distribution<double> dist(0.0, 1.0);
+    for (auto &v : input.data()) v = dist(rng);
+
+    nn::Matrix out = ln.forward(input);
+    assert(out.rows() == 8);
+    assert(out.cols() == 4);
+}
+
+static void test_layernorm_normalize()
+{
+    nn::LayerNorm ln(4);
+    nn::Matrix input(4, 2);
+    input.set_value(0, 0, 1.0); input.set_value(1, 0, 2.0);
+    input.set_value(2, 0, 3.0); input.set_value(3, 0, 4.0);
+    input.set_value(0, 1, 10.0); input.set_value(1, 1, 20.0);
+    input.set_value(2, 1, 30.0); input.set_value(3, 1, 40.0);
+
+    nn::Matrix out = ln.forward(input);
+    for (std::size_t j = 0; j < 2; ++j)
+    {
+        double sum = 0.0;
+        for (std::size_t i = 0; i < 4; ++i)
+            sum += out.at(i, j);
+        assert(approx(sum, 0.0, 1e-5));
+    }
+}
+
+static void test_layernorm_backward_shape()
+{
+    nn::LayerNorm ln(8);
+    nn::Matrix input(8, 4);
+    std::mt19937_64 rng(42);
+    std::normal_distribution<double> dist(0.0, 1.0);
+    for (auto &v : input.data()) v = dist(rng);
+
+    ln.forward(input);
+    nn::Matrix grad(8, 4, 1.0);
+    nn::Matrix grad_input = ln.backward(grad);
+    assert(grad_input.rows() == 8);
+    assert(grad_input.cols() == 4);
+}
+
+static void test_layernorm_gradient_check()
+{
+    nn::LayerNorm ln(4);
+    nn::Matrix input(4, 3);
+    std::mt19937_64 rng(123);
+    std::normal_distribution<double> dist(0.0, 1.0);
+    for (auto &v : input.data()) v = dist(rng);
+
+    auto sum_sq = [](const nn::Matrix &m) {
+        double s = 0.0;
+        for (std::size_t k = 0; k < m.size(); ++k)
+            s += m.data()[k] * m.data()[k];
+        return s;
+    };
+
+    nn::Matrix out = ln.forward(input);
+    nn::Matrix grad_out(out.rows(), out.cols());
+    for (std::size_t k = 0; k < out.size(); ++k)
+        grad_out.data()[k] = 2.0 * out.data()[k];
+    ln.backward(grad_out);
+
+    auto params = ln.parameters();
+    auto grads = ln.param_gradients();
+
+    for (std::size_t pi = 0; pi < params.size(); ++pi)
+    {
+        nn::Matrix &p = params[pi].get();
+        nn::Matrix &g = grads[pi].get();
+        for (std::size_t r = 0; r < p.rows(); ++r)
+            for (std::size_t c = 0; c < p.cols(); ++c)
+            {
+                double orig = p.at_unchecked(r, c);
+                double eps = 1e-5;
+                p.set_value_unchecked(r, c, orig + eps);
+                double loss_plus = sum_sq(ln.forward(input));
+                p.set_value_unchecked(r, c, orig - eps);
+                double loss_minus = sum_sq(ln.forward(input));
+                p.set_value_unchecked(r, c, orig);
+                double fd = (loss_plus - loss_minus) / (2.0 * eps);
+                double analytical = g.at_unchecked(r, c);
+                assert(approx(fd, analytical, 1e-3));
+            }
+    }
+}
+
+// ── Softmax ─────────────────────────────────────────────────────────────────
+
+static void test_softmax_forward()
+{
+    nn::Softmax sm;
+    nn::Matrix input(3, 2);
+    input.set_value(0, 0, 1.0); input.set_value(1, 0, 2.0); input.set_value(2, 0, 3.0);
+    input.set_value(0, 1, 0.0); input.set_value(1, 1, 0.0); input.set_value(2, 1, 0.0);
+
+    nn::Matrix out = sm.forward(input);
+    assert(out.rows() == 3 && out.cols() == 2);
+
+    for (std::size_t j = 0; j < 2; ++j)
+    {
+        double sum = 0.0;
+        for (std::size_t i = 0; i < 3; ++i)
+        {
+            assert(out.at(i, j) > 0.0);
+            sum += out.at(i, j);
+        }
+        assert(approx(sum, 1.0, 1e-10));
+    }
+
+    assert(out.at(2, 0) > out.at(1, 0));
+    assert(out.at(1, 0) > out.at(0, 0));
+    assert(approx(out.at(0, 1), 1.0 / 3.0, 1e-10));
+}
+
+static void test_softmax_backward_shape()
+{
+    nn::Softmax sm;
+    nn::Matrix input(5, 3);
+    std::mt19937_64 rng(42);
+    std::normal_distribution<double> dist(0.0, 1.0);
+    for (auto &v : input.data()) v = dist(rng);
+
+    sm.forward(input);
+    nn::Matrix grad(5, 3, 1.0);
+    nn::Matrix gi = sm.backward(grad);
+    assert(gi.rows() == 5 && gi.cols() == 3);
+}
+
+// ── PositionalEncoding ──────────────────────────────────────────────────────
+
+static void test_positional_encoding_shape()
+{
+    nn::PositionalEncoding pe(16, 64);
+    nn::Matrix input(16, 10);
+    nn::Matrix out = pe.forward(input);
+    assert(out.rows() == 16 && out.cols() == 10);
+}
+
+static void test_positional_encoding_adds_values()
+{
+    nn::PositionalEncoding pe(8, 32);
+    nn::Matrix input(8, 4, 0.0);
+    nn::Matrix out = pe.forward(input);
+
+    bool has_nonzero = false;
+    for (std::size_t k = 0; k < out.size(); ++k)
+        if (std::fabs(out.data()[k]) > 1e-10) { has_nonzero = true; break; }
+    assert(has_nonzero);
+}
+
+static void test_positional_encoding_backward_passthrough()
+{
+    nn::PositionalEncoding pe(8, 32);
+    nn::Matrix input(8, 4, 1.0);
+    pe.forward(input);
+    nn::Matrix grad(8, 4, 3.14);
+    nn::Matrix gi = pe.backward(grad);
+    for (std::size_t k = 0; k < gi.size(); ++k)
+        assert(approx(gi.data()[k], 3.14));
+}
+
+// ── MultiHeadAttention ──────────────────────────────────────────────────────
+
+static void test_mha_forward_shape()
+{
+    nn::MultiHeadAttention mha(16, 4);
+    nn::Matrix input(16, 8);
+    std::mt19937_64 rng(42);
+    std::normal_distribution<double> dist(0.0, 0.1);
+    for (auto &v : input.data()) v = dist(rng);
+
+    nn::Matrix out = mha.forward(input);
+    assert(out.rows() == 16);
+    assert(out.cols() == 8);
+}
+
+static void test_mha_backward_shape()
+{
+    nn::MultiHeadAttention mha(16, 4);
+    nn::Matrix input(16, 8);
+    std::mt19937_64 rng(42);
+    std::normal_distribution<double> dist(0.0, 0.1);
+    for (auto &v : input.data()) v = dist(rng);
+
+    mha.forward(input);
+    nn::Matrix grad(16, 8, 0.01);
+    nn::Matrix gi = mha.backward(grad);
+    assert(gi.rows() == 16 && gi.cols() == 8);
+}
+
+static void test_mha_params_count()
+{
+    nn::MultiHeadAttention mha(16, 4);
+    assert(mha.param_count() == 4 * 16 * 16);
+    assert(mha.parameters().size() == 4);
+    assert(mha.param_gradients().size() == 4);
+}
+
+// ── FeedForward ─────────────────────────────────────────────────────────────
+
+static void test_feedforward_shape()
+{
+    nn::FeedForward ff(16, 64);
+    nn::Matrix input(16, 4);
+    std::mt19937_64 rng(42);
+    std::normal_distribution<double> dist(0.0, 0.1);
+    for (auto &v : input.data()) v = dist(rng);
+
+    nn::Matrix out = ff.forward(input);
+    assert(out.rows() == 16 && out.cols() == 4);
+
+    nn::Matrix grad(16, 4, 0.01);
+    nn::Matrix gi = ff.backward(grad);
+    assert(gi.rows() == 16 && gi.cols() == 4);
+}
+
+static void test_feedforward_params()
+{
+    nn::FeedForward ff(8, 32);
+    assert(ff.param_count() == (8 * 32 + 32) + (32 * 8 + 8));
+    assert(ff.parameters().size() == 4);
+}
+
+// ── TransformerEncoderLayer ─────────────────────────────────────────────────
+
+static void test_encoder_layer_shape()
+{
+    nn::TransformerEncoderLayer layer(16, 4, 64);
+    nn::Matrix input(16, 8);
+    std::mt19937_64 rng(42);
+    std::normal_distribution<double> dist(0.0, 0.1);
+    for (auto &v : input.data()) v = dist(rng);
+
+    nn::Matrix out = layer.forward(input);
+    assert(out.rows() == 16 && out.cols() == 8);
+
+    nn::Matrix grad(16, 8, 0.01);
+    nn::Matrix gi = layer.backward(grad);
+    assert(gi.rows() == 16 && gi.cols() == 8);
+}
+
+// ── TransformerEncoder ──────────────────────────────────────────────────────
+
+static void test_encoder_forward_shape()
+{
+    const std::size_t d_model = 16, num_patches = 4, batch = 2;
+    nn::TransformerEncoder enc(d_model, 4, 64, 2, num_patches);
+    nn::Matrix input(d_model, num_patches * batch);
+    std::mt19937_64 rng(42);
+    std::normal_distribution<double> dist(0.0, 0.1);
+    for (auto &v : input.data()) v = dist(rng);
+
+    nn::Matrix out = enc.forward(input);
+    assert(out.rows() == d_model);
+    assert(out.cols() == batch);
+}
+
+static void test_encoder_backward_shape()
+{
+    const std::size_t d_model = 16, num_patches = 4, batch = 2;
+    nn::TransformerEncoder enc(d_model, 4, 64, 2, num_patches);
+    nn::Matrix input(d_model, num_patches * batch);
+    std::mt19937_64 rng(42);
+    std::normal_distribution<double> dist(0.0, 0.1);
+    for (auto &v : input.data()) v = dist(rng);
+
+    enc.forward(input);
+    nn::Matrix grad(d_model, batch, 0.01);
+    nn::Matrix gi = enc.backward(grad);
+    assert(gi.rows() == d_model);
+    assert(gi.cols() == num_patches * batch);
+}
+
+// ── PatchEmbedding ──────────────────────────────────────────────────────────
+
+static void test_patch_embedding_shape()
+{
+    const std::size_t img = 28, patch = 7, d_model = 16, batch = 3;
+    const std::size_t num_patches = (img / patch) * (img / patch);
+    nn::PatchEmbedding pe(img, patch, d_model);
+
+    nn::Matrix input(img * img, batch);
+    std::mt19937_64 rng(42);
+    std::normal_distribution<double> dist(0.0, 1.0);
+    for (auto &v : input.data()) v = dist(rng);
+
+    nn::Matrix out = pe.forward(input);
+    assert(out.rows() == d_model);
+    assert(out.cols() == num_patches * batch);
+}
+
+static void test_patch_embedding_backward_shape()
+{
+    const std::size_t img = 28, patch = 7, d_model = 16, batch = 2;
+    const std::size_t num_patches = (img / patch) * (img / patch);
+    nn::PatchEmbedding pe(img, patch, d_model);
+
+    nn::Matrix input(img * img, batch);
+    std::mt19937_64 rng(42);
+    std::normal_distribution<double> dist(0.0, 1.0);
+    for (auto &v : input.data()) v = dist(rng);
+
+    pe.forward(input);
+    nn::Matrix grad(d_model, num_patches * batch, 0.01);
+    nn::Matrix gi = pe.backward(grad);
+    assert(gi.rows() == img * img);
+    assert(gi.cols() == batch);
+}
+
+// ── MNIST ViT end-to-end ────────────────────────────────────────────────────
+
+static void test_vit_e2e_forward()
+{
+    const std::size_t img = 28, patch = 7, d_model = 16;
+    const std::size_t num_patches = (img / patch) * (img / patch);
+    const std::size_t batch = 2;
+
+    nn::Model model;
+    model.add<nn::PatchEmbedding>(img, patch, d_model)
+         .add<nn::TransformerEncoder>(d_model, 4, 64, 1, num_patches)
+         .add<nn::Linear>(d_model, std::size_t{10});
+
+    nn::Matrix input(img * img, batch);
+    std::mt19937_64 rng(42);
+    std::normal_distribution<double> dist(0.0, 0.1);
+    for (auto &v : input.data()) v = dist(rng);
+
+    nn::Matrix out = model.forward(input);
+    assert(out.rows() == 10);
+    assert(out.cols() == batch);
+}
+
+static void test_vit_e2e_backward()
+{
+    const std::size_t img = 28, patch = 7, d_model = 16;
+    const std::size_t num_patches = (img / patch) * (img / patch);
+    const std::size_t batch = 2;
+
+    nn::Model model;
+    model.add<nn::PatchEmbedding>(img, patch, d_model)
+         .add<nn::TransformerEncoder>(d_model, 4, 64, 1, num_patches)
+         .add<nn::Linear>(d_model, std::size_t{10});
+
+    nn::Matrix input(img * img, batch);
+    std::mt19937_64 rng(42);
+    std::normal_distribution<double> dist(0.0, 0.1);
+    for (auto &v : input.data()) v = dist(rng);
+
+    nn::Matrix out = model.forward(input);
+
+    nn::CrossEntropyLoss loss;
+    nn::Matrix target(10, batch);
+    target.set_value(3, 0, 1.0);
+    target.set_value(7, 1, 1.0);
+    double lv = loss.forward(out, target);
+    (void)lv;
+
+    nn::Matrix grad = loss.backward();
+    nn::Matrix gi = model.backward(grad);
+    assert(gi.rows() == img * img);
+    assert(gi.cols() == batch);
+}
+
+// ── Dispatch ────────────────────────────────────────────────────────────────
+
+using TestFn = void (*)();
+struct TestEntry { const char *name; TestFn fn; };
+
+static const TestEntry tests[] = {
+    {"matrix_resize",                      test_matrix_resize},
+    {"matrix_row_slice",                   test_matrix_row_slice},
+    {"matrix_set_row_slice",               test_matrix_set_row_slice},
+    {"layernorm_forward_shape",            test_layernorm_forward_shape},
+    {"layernorm_normalize",                test_layernorm_normalize},
+    {"layernorm_backward_shape",           test_layernorm_backward_shape},
+    {"layernorm_gradient_check",           test_layernorm_gradient_check},
+    {"softmax_forward",                    test_softmax_forward},
+    {"softmax_backward_shape",             test_softmax_backward_shape},
+    {"positional_encoding_shape",          test_positional_encoding_shape},
+    {"positional_encoding_adds_values",    test_positional_encoding_adds_values},
+    {"positional_encoding_backward_passthrough", test_positional_encoding_backward_passthrough},
+    {"mha_forward_shape",                  test_mha_forward_shape},
+    {"mha_backward_shape",                 test_mha_backward_shape},
+    {"mha_params_count",                   test_mha_params_count},
+    {"feedforward_shape",                  test_feedforward_shape},
+    {"feedforward_params",                 test_feedforward_params},
+    {"encoder_layer_shape",                test_encoder_layer_shape},
+    {"encoder_forward_shape",              test_encoder_forward_shape},
+    {"encoder_backward_shape",             test_encoder_backward_shape},
+    {"patch_embedding_shape",              test_patch_embedding_shape},
+    {"patch_embedding_backward_shape",     test_patch_embedding_backward_shape},
+    {"vit_e2e_forward",                    test_vit_e2e_forward},
+    {"vit_e2e_backward",                   test_vit_e2e_backward},
+};
+
+int main(int argc, char *argv[])
+{
+    if (argc < 2)
+    {
+        std::size_t passed = 0;
+        for (const auto &t : tests)
+        {
+            try { t.fn(); ++passed; std::cout << "  PASSED  " << t.name << "\n"; }
+            catch (const std::exception &e)
+            { std::cout << "  FAILED  " << t.name << " : " << e.what() << "\n"; }
+        }
+        std::cout << passed << "/" << (sizeof(tests) / sizeof(tests[0])) << " passed\n";
+        return passed == sizeof(tests) / sizeof(tests[0]) ? 0 : 1;
+    }
+
+    for (const auto &t : tests)
+    {
+        if (std::string(argv[1]) == t.name)
+        {
+            try { t.fn(); std::cout << "  PASSED  " << t.name << "\n"; return 0; }
+            catch (const std::exception &e)
+            { std::cout << "  FAILED  " << t.name << " : " << e.what() << "\n"; return 1; }
+        }
+    }
+    std::cerr << "Unknown test: " << argv[1] << "\n";
+    return 1;
+}

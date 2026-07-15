@@ -419,6 +419,30 @@ namespace nn
             std::fill(data_.begin(), data_.end(), 0.0);
         }
 
+        void resize(std::size_t rows, std::size_t cols)
+        {
+            if (rows_ == rows && cols_ == cols) return;
+            rows_ = rows;
+            cols_ = cols;
+            data_.resize(rows * cols);
+        }
+
+        [[nodiscard]] Matrix row_slice(std::size_t start_row, std::size_t num_rows) const
+        {
+            Matrix result(num_rows, cols_);
+            for (std::size_t i = 0; i < num_rows; ++i)
+                std::copy_n(data_.data() + (start_row + i) * cols_, cols_,
+                            result.data_.data() + i * cols_);
+            return result;
+        }
+
+        void set_row_slice(std::size_t start_row, const Matrix &slice)
+        {
+            for (std::size_t i = 0; i < slice.rows_; ++i)
+                std::copy_n(slice.data_.data() + i * slice.cols_, cols_,
+                            data_.data() + (start_row + i) * cols_);
+        }
+
         // ── Reduction 规约操作 (F8) ──────────────────────────────────────────────
         // 全部基于 NN_EXEC_POLICY 并行；空矩阵返回值由各方法文档说明。
         // 存储布局：行主序（data_[row * cols_ + col]）。

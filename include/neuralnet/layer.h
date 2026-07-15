@@ -800,6 +800,711 @@ namespace nn
         using BatchNorm1d::BatchNorm1d;
         const char *name() const override { return "BatchNorm2d"; }
     };
+
+    // ── LayerNorm ────────────────────────────────────────────────────────────
+    class LayerNorm final : public Layer
+    {
+    private:
+        std::size_t normalized_shape_;
+        double eps_;
+        Matrix gamma_;
+        Matrix beta_;
+        Matrix dgamma_;
+        Matrix dbeta_;
+        Matrix normalized_cache_;
+        std::vector<double> mean_cache_;
+        std::vector<double> inv_std_cache_;
+
+    public:
+        explicit LayerNorm(std::size_t normalized_shape, double eps = 1e-5)
+            : normalized_shape_(normalized_shape), eps_(eps),
+              gamma_(normalized_shape, 1, 1.0),
+              beta_(normalized_shape, 1, 0.0),
+              dgamma_(normalized_shape, 1, 0.0),
+              dbeta_(normalized_shape, 1, 0.0) {}
+
+        const char *name() const override { return "LayerNorm"; }
+        [[nodiscard]] std::size_t param_count() const noexcept override { return 2 * normalized_shape_; }
+
+        std::vector<std::reference_wrapper<Matrix>> parameters() override
+        {
+            return {std::ref(gamma_), std::ref(beta_)};
+        }
+
+        std::vector<std::reference_wrapper<Matrix>> param_gradients() override
+        {
+            return {std::ref(dgamma_), std::ref(dbeta_)};
+        }
+
+        Matrix forward(const Matrix &input) override
+        {
+            if (input.rows() != normalized_shape_)
+                throw std::invalid_argument("LayerNorm forward: input rows != normalized_shape");
+
+            const std::size_t feat = input.rows();
+            const std::size_t batch = input.cols();
+            const double N = static_cast<double>(feat);
+
+            mean_cache_.resize(batch);
+            inv_std_cache_.resize(batch);
+            normalized_cache_ = Matrix(feat, batch);
+
+            for (std::size_t j = 0; j < batch; ++j)
+            {
+                double sum = 0.0;
+                for (std::size_t i = 0; i < feat; ++i)
+                    sum += input.at_unchecked(i, j);
+                double mu = sum / N;
+                mean_cache_[j] = mu;
+
+                double var_sum = 0.0;
+                for (std::size_t i = 0; i < feat; ++i)
+                {
+                    double d = input.at_unchecked(i, j) - mu;
+                    var_sum += d * d;
+                }
+                double inv_std = 1.0 / std::sqrt(var_sum / N + eps_);
+                inv_std_cache_[j] = inv_std;
+
+                for (std::size_t i = 0; i < feat; ++i)
+                    normalized_cache_.set_value_unchecked(i, j,
+                        (input.at_unchecked(i, j) - mu) * inv_std);
+            }
+
+            Matrix output(feat, batch);
+            std::for_each(NN_EXEC_POLICY,
+                          counting_iterator<std::size_t>(0),
+                          counting_iterator<std::size_t>(feat * batch),
+                          [&](std::size_t idx) {
+                              std::size_t i = idx / batch;
+                              output.data()[idx] = normalized_cache_.data()[idx]
+                                  * gamma_.at_unchecked(i, 0) + beta_.at_unchecked(i, 0);
+                          });
+            return output;
+        }
+
+        Matrix backward(const Matrix &grad_output) override
+        {
+            const std::size_t feat = grad_output.rows();
+            const std::size_t batch = grad_output.cols();
+            const double N = static_cast<double>(feat);
+
+            dgamma_.zero();
+            dbeta_.zero();
+            for (std::size_t i = 0; i < feat; ++i)
+            {
+                double dg = 0.0, db = 0.0;
+                for (std::size_t j = 0; j < batch; ++j)
+                {
+                    dg += grad_output.at_unchecked(i, j)
+                          * normalized_cache_.at_unchecked(i, j);
+                    db += grad_output.at_unchecked(i, j);
+                }
+                dgamma_.set_value_unchecked(i, 0, dg);
+                dbeta_.set_value_unchecked(i, 0, db);
+            }
+
+            Matrix grad_input(feat, batch);
+            for (std::size_t j = 0; j < batch; ++j)
+            {
+                double inv_std = inv_std_cache_[j];
+                double sum_dxhat = 0.0, sum_dxhat_xhat = 0.0;
+                for (std::size_t i = 0; i < feat; ++i)
+                {
+                    double dxhat = grad_output.at_unchecked(i, j) * gamma_.at_unchecked(i, 0);
+                    sum_dxhat += dxhat;
+                    sum_dxhat_xhat += dxhat * normalized_cache_.at_unchecked(i, j);
+                }
+                for (std::size_t i = 0; i < feat; ++i)
+                {
+                    double dxhat = grad_output.at_unchecked(i, j) * gamma_.at_unchecked(i, 0);
+                    grad_input.set_value_unchecked(i, j,
+                        inv_std / N * (N * dxhat - sum_dxhat
+                            - normalized_cache_.at_unchecked(i, j) * sum_dxhat_xhat));
+                }
+            }
+            return grad_input;
+        }
+    };
+
+    // ── Softmax ──────────────────────────────────────────────────────────────
+    class Softmax final : public Layer
+    {
+    private:
+        Matrix output_cache_;
+
+    public:
+        const char *name() const override { return "Softmax"; }
+
+        Matrix forward(const Matrix &input) override
+        {
+            const std::size_t rows = input.rows();
+            const std::size_t cols = input.cols();
+            output_cache_ = Matrix(rows, cols);
+
+            for (std::size_t j = 0; j < cols; ++j)
+            {
+                double max_val = input.at_unchecked(0, j);
+                for (std::size_t i = 1; i < rows; ++i)
+                    if (input.at_unchecked(i, j) > max_val)
+                        max_val = input.at_unchecked(i, j);
+
+                double sum_exp = 0.0;
+                for (std::size_t i = 0; i < rows; ++i)
+                {
+                    double e = std::exp(input.at_unchecked(i, j) - max_val);
+                    output_cache_.set_value_unchecked(i, j, e);
+                    sum_exp += e;
+                }
+                for (std::size_t i = 0; i < rows; ++i)
+                    output_cache_.set_value_unchecked(i, j,
+                        output_cache_.at_unchecked(i, j) / sum_exp);
+            }
+            return output_cache_;
+        }
+
+        Matrix backward(const Matrix &grad_output) override
+        {
+            const std::size_t rows = grad_output.rows();
+            const std::size_t cols = grad_output.cols();
+            Matrix grad_input(rows, cols);
+
+            for (std::size_t j = 0; j < cols; ++j)
+            {
+                double dot = 0.0;
+                for (std::size_t i = 0; i < rows; ++i)
+                    dot += grad_output.at_unchecked(i, j) * output_cache_.at_unchecked(i, j);
+                for (std::size_t i = 0; i < rows; ++i)
+                    grad_input.set_value_unchecked(i, j,
+                        output_cache_.at_unchecked(i, j)
+                        * (grad_output.at_unchecked(i, j) - dot));
+            }
+            return grad_input;
+        }
+    };
+
+    // ── PositionalEncoding ───────────────────────────────────────────────────
+    class PositionalEncoding final : public Layer
+    {
+    private:
+        Matrix pe_;
+        std::size_t d_model_;
+        std::size_t max_seq_len_;
+
+    public:
+        PositionalEncoding(std::size_t d_model, std::size_t max_seq_len)
+            : pe_(d_model, max_seq_len), d_model_(d_model), max_seq_len_(max_seq_len)
+        {
+            for (std::size_t pos = 0; pos < max_seq_len; ++pos)
+                for (std::size_t i = 0; i < d_model; ++i)
+                {
+                    double angle = static_cast<double>(pos)
+                        / std::pow(10000.0, 2.0 * static_cast<double>(i / 2)
+                                            / static_cast<double>(d_model));
+                    pe_.set_value_unchecked(i, pos,
+                        (i % 2 == 0) ? std::sin(angle) : std::cos(angle));
+                }
+        }
+
+        const char *name() const override { return "PositionalEncoding"; }
+
+        Matrix forward(const Matrix &input) override
+        {
+            Matrix output = input;
+            const std::size_t cols = std::min(input.cols(), max_seq_len_);
+            for (std::size_t j = 0; j < cols; ++j)
+                for (std::size_t i = 0; i < d_model_; ++i)
+                    output.data()[i * input.cols() + j] += pe_.at_unchecked(i, j);
+            return output;
+        }
+
+        Matrix backward(const Matrix &grad_output) override { return grad_output; }
+    };
+
+    // ── MultiHeadAttention ───────────────────────────────────────────────────
+    class MultiHeadAttention final : public Layer
+    {
+    private:
+        std::size_t d_model_;
+        std::size_t num_heads_;
+        std::size_t head_dim_;
+        double scale_;
+
+        Matrix W_q_, W_k_, W_v_, W_o_;
+        Matrix dW_q_, dW_k_, dW_v_, dW_o_;
+
+        Matrix input_cache_;
+        Matrix Q_cache_, K_cache_, V_cache_, concat_cache_;
+        std::vector<Matrix> attn_cache_;
+
+        inline static thread_local std::mt19937_64 rng_{std::random_device{}()};
+
+        static Matrix xavier_init(std::size_t rows, std::size_t cols)
+        {
+            Matrix m(rows, cols);
+            double limit = std::sqrt(6.0 / static_cast<double>(rows + cols));
+            std::uniform_real_distribution<double> dist(-limit, limit);
+            std::generate(m.data().begin(), m.data().end(), [&] { return dist(rng_); });
+            return m;
+        }
+
+        static Matrix add_bias_broadcast(const Matrix &m, std::size_t rows)
+        {
+            (void)rows;
+            return m;
+        }
+
+        static void softmax_rows_inplace(Matrix &m)
+        {
+            const std::size_t rows = m.rows(), cols = m.cols();
+            for (std::size_t i = 0; i < rows; ++i)
+            {
+                double mx = m.at_unchecked(i, 0);
+                for (std::size_t j = 1; j < cols; ++j)
+                    if (m.at_unchecked(i, j) > mx) mx = m.at_unchecked(i, j);
+                double s = 0.0;
+                for (std::size_t j = 0; j < cols; ++j)
+                {
+                    double e = std::exp(m.at_unchecked(i, j) - mx);
+                    m.set_value_unchecked(i, j, e);
+                    s += e;
+                }
+                for (std::size_t j = 0; j < cols; ++j)
+                    m.set_value_unchecked(i, j, m.at_unchecked(i, j) / s);
+            }
+        }
+
+        static Matrix softmax_backward_rows(const Matrix &grad, const Matrix &attn)
+        {
+            const std::size_t rows = grad.rows(), cols = grad.cols();
+            Matrix result(rows, cols);
+            for (std::size_t i = 0; i < rows; ++i)
+            {
+                double dot = 0.0;
+                for (std::size_t j = 0; j < cols; ++j)
+                    dot += grad.at_unchecked(i, j) * attn.at_unchecked(i, j);
+                for (std::size_t j = 0; j < cols; ++j)
+                    result.set_value_unchecked(i, j,
+                        attn.at_unchecked(i, j) * (grad.at_unchecked(i, j) - dot));
+            }
+            return result;
+        }
+
+    public:
+        MultiHeadAttention(std::size_t d_model, std::size_t num_heads)
+            : d_model_(d_model), num_heads_(num_heads),
+              head_dim_(d_model / num_heads),
+              scale_(1.0 / std::sqrt(static_cast<double>(d_model / num_heads))),
+              W_q_(xavier_init(d_model, d_model)),
+              W_k_(xavier_init(d_model, d_model)),
+              W_v_(xavier_init(d_model, d_model)),
+              W_o_(xavier_init(d_model, d_model)),
+              dW_q_(d_model, d_model), dW_k_(d_model, d_model),
+              dW_v_(d_model, d_model), dW_o_(d_model, d_model)
+        {
+            if (d_model % num_heads != 0)
+                throw std::invalid_argument("d_model must be divisible by num_heads");
+        }
+
+        const char *name() const override { return "MultiHeadAttention"; }
+        [[nodiscard]] std::size_t param_count() const noexcept override
+        {
+            return 4 * d_model_ * d_model_;
+        }
+
+        std::vector<std::reference_wrapper<Matrix>> parameters() override
+        {
+            return {std::ref(W_q_), std::ref(W_k_), std::ref(W_v_), std::ref(W_o_)};
+        }
+
+        std::vector<std::reference_wrapper<Matrix>> param_gradients() override
+        {
+            return {std::ref(dW_q_), std::ref(dW_k_), std::ref(dW_v_), std::ref(dW_o_)};
+        }
+
+        Matrix forward(const Matrix &input) override
+        {
+            const std::size_t sl = input.cols();
+            input_cache_ = input;
+
+            Q_cache_ = W_q_ * input;
+            K_cache_ = W_k_ * input;
+            V_cache_ = W_v_ * input;
+
+            concat_cache_ = Matrix(d_model_, sl);
+            attn_cache_.resize(num_heads_);
+
+            for (std::size_t h = 0; h < num_heads_; ++h)
+            {
+                const std::size_t off = h * head_dim_;
+                Matrix Q_h = Q_cache_.row_slice(off, head_dim_);
+                Matrix K_h = K_cache_.row_slice(off, head_dim_);
+                Matrix V_h = V_cache_.row_slice(off, head_dim_);
+
+                Matrix scores = Q_h.matmul_TN(K_h);
+                scores.scale_inplace(scale_);
+                softmax_rows_inplace(scores);
+                attn_cache_[h] = scores;
+
+                Matrix head_out = V_h.matmul_NT(scores);
+                concat_cache_.set_row_slice(off, head_out);
+            }
+
+            return W_o_ * concat_cache_;
+        }
+
+        Matrix backward(const Matrix &grad_output) override
+        {
+            const std::size_t sl = grad_output.cols();
+
+            dW_o_ = grad_output.matmul_NT(concat_cache_);
+            Matrix grad_concat = W_o_.matmul_TN(grad_output);
+
+            Matrix grad_Q(d_model_, sl), grad_K(d_model_, sl), grad_V(d_model_, sl);
+
+            for (std::size_t h = 0; h < num_heads_; ++h)
+            {
+                const std::size_t off = h * head_dim_;
+                Matrix Q_h = Q_cache_.row_slice(off, head_dim_);
+                Matrix K_h = K_cache_.row_slice(off, head_dim_);
+                Matrix V_h = V_cache_.row_slice(off, head_dim_);
+                const Matrix &attn_h = attn_cache_[h];
+
+                Matrix grad_head = grad_concat.row_slice(off, head_dim_);
+
+                Matrix grad_V_h = grad_head * attn_h;
+                Matrix grad_attn = grad_head.matmul_TN(V_h);
+
+                Matrix grad_scores = softmax_backward_rows(grad_attn, attn_h);
+                grad_scores.scale_inplace(scale_);
+
+                Matrix grad_Q_h = K_h.matmul_NT(grad_scores);
+                Matrix grad_K_h = Q_h * grad_scores;
+
+                grad_Q.set_row_slice(off, grad_Q_h);
+                grad_K.set_row_slice(off, grad_K_h);
+                grad_V.set_row_slice(off, grad_V_h);
+            }
+
+            dW_q_ = grad_Q.matmul_NT(input_cache_);
+            dW_k_ = grad_K.matmul_NT(input_cache_);
+            dW_v_ = grad_V.matmul_NT(input_cache_);
+
+            Matrix grad_input = W_q_.matmul_TN(grad_Q);
+            grad_input.add_inplace(W_k_.matmul_TN(grad_K));
+            grad_input.add_inplace(W_v_.matmul_TN(grad_V));
+            return grad_input;
+        }
+    };
+
+    // ── FeedForward ──────────────────────────────────────────────────────────
+    class FeedForward final : public Layer
+    {
+    private:
+        Linear linear1_;
+        GELU gelu_;
+        Linear linear2_;
+
+    public:
+        FeedForward(std::size_t d_model, std::size_t d_ff)
+            : linear1_(d_model, d_ff), gelu_(), linear2_(d_ff, d_model) {}
+
+        const char *name() const override { return "FeedForward"; }
+        [[nodiscard]] std::size_t param_count() const noexcept override
+        {
+            return linear1_.param_count() + linear2_.param_count();
+        }
+
+        std::vector<std::reference_wrapper<Matrix>> parameters() override
+        {
+            auto p = linear1_.parameters();
+            auto p2 = linear2_.parameters();
+            p.insert(p.end(), p2.begin(), p2.end());
+            return p;
+        }
+
+        std::vector<std::reference_wrapper<Matrix>> param_gradients() override
+        {
+            auto g = linear1_.param_gradients();
+            auto g2 = linear2_.param_gradients();
+            g.insert(g.end(), g2.begin(), g2.end());
+            return g;
+        }
+
+        Matrix forward(const Matrix &input) override
+        {
+            return linear2_.forward(gelu_.forward(linear1_.forward(input)));
+        }
+
+        Matrix backward(const Matrix &grad_output) override
+        {
+            return linear1_.backward(gelu_.backward(linear2_.backward(grad_output)));
+        }
+    };
+
+    // ── TransformerEncoderLayer ──────────────────────────────────────────────
+    class TransformerEncoderLayer final : public Layer
+    {
+    private:
+        LayerNorm norm1_;
+        MultiHeadAttention mha_;
+        LayerNorm norm2_;
+        FeedForward ffn_;
+        Matrix normed1_cache_;
+        Matrix normed2_cache_;
+        Matrix attn_out_cache_;
+
+    public:
+        TransformerEncoderLayer(std::size_t d_model, std::size_t num_heads,
+                                std::size_t d_ff)
+            : norm1_(d_model), mha_(d_model, num_heads),
+              norm2_(d_model), ffn_(d_model, d_ff) {}
+
+        const char *name() const override { return "TransformerEncoderLayer"; }
+        [[nodiscard]] std::size_t param_count() const noexcept override
+        {
+            return norm1_.param_count() + mha_.param_count()
+                 + norm2_.param_count() + ffn_.param_count();
+        }
+
+        std::vector<std::reference_wrapper<Matrix>> parameters() override
+        {
+            auto p = norm1_.parameters();
+            auto p2 = mha_.parameters();
+            p.insert(p.end(), p2.begin(), p2.end());
+            auto p3 = norm2_.parameters();
+            p.insert(p.end(), p3.begin(), p3.end());
+            auto p4 = ffn_.parameters();
+            p.insert(p.end(), p4.begin(), p4.end());
+            return p;
+        }
+
+        std::vector<std::reference_wrapper<Matrix>> param_gradients() override
+        {
+            auto g = norm1_.param_gradients();
+            auto g2 = mha_.param_gradients();
+            g.insert(g.end(), g2.begin(), g2.end());
+            auto g3 = norm2_.param_gradients();
+            g.insert(g.end(), g3.begin(), g3.end());
+            auto g4 = ffn_.param_gradients();
+            g.insert(g.end(), g4.begin(), g4.end());
+            return g;
+        }
+
+        Matrix forward(const Matrix &input) override
+        {
+            normed1_cache_ = norm1_.forward(input);
+            attn_out_cache_ = mha_.forward(normed1_cache_);
+            Matrix residual1 = input + attn_out_cache_;
+
+            normed2_cache_ = norm2_.forward(residual1);
+            Matrix ffn_out = ffn_.forward(normed2_cache_);
+            return residual1 + ffn_out;
+        }
+
+        Matrix backward(const Matrix &grad_output) override
+        {
+            Matrix grad_ffn = ffn_.backward(norm2_.backward(grad_output));
+            Matrix grad_residual1 = grad_output + grad_ffn;
+            Matrix grad_attn = mha_.backward(norm1_.backward(grad_residual1));
+            return grad_residual1 + grad_attn;
+        }
+    };
+
+    // ── TransformerEncoder ───────────────────────────────────────────────────
+    class TransformerEncoder final : public Layer
+    {
+    private:
+        std::vector<TransformerEncoderLayer> layers_;
+        std::size_t d_model_;
+        std::size_t num_patches_;
+        std::size_t cached_batch_size_{0};
+        std::vector<Matrix> per_sample_cache_;
+
+    public:
+        TransformerEncoder(std::size_t d_model, std::size_t num_heads,
+                           std::size_t d_ff, std::size_t num_layers,
+                           std::size_t num_patches)
+            : d_model_(d_model), num_patches_(num_patches)
+        {
+            layers_.reserve(num_layers);
+            for (std::size_t i = 0; i < num_layers; ++i)
+                layers_.emplace_back(d_model, num_heads, d_ff);
+        }
+
+        const char *name() const override { return "TransformerEncoder"; }
+        [[nodiscard]] std::size_t param_count() const noexcept override
+        {
+            std::size_t total = 0;
+            for (const auto &l : layers_) total += l.param_count();
+            return total;
+        }
+
+        std::vector<std::reference_wrapper<Matrix>> parameters() override
+        {
+            std::vector<std::reference_wrapper<Matrix>> result;
+            for (auto &l : layers_)
+                for (auto &p : l.parameters()) result.push_back(p);
+            return result;
+        }
+
+        std::vector<std::reference_wrapper<Matrix>> param_gradients() override
+        {
+            std::vector<std::reference_wrapper<Matrix>> result;
+            for (auto &l : layers_)
+                for (auto &g : l.param_gradients()) result.push_back(g);
+            return result;
+        }
+
+        Matrix forward(const Matrix &input) override
+        {
+            const std::size_t total_cols = input.cols();
+            cached_batch_size_ = total_cols / num_patches_;
+            if (cached_batch_size_ == 0 || total_cols % num_patches_ != 0)
+                throw std::invalid_argument(
+                    "TransformerEncoder: input cols must be a multiple of num_patches");
+
+            per_sample_cache_.clear();
+            per_sample_cache_.reserve(cached_batch_size_);
+
+            Matrix output(d_model_, cached_batch_size_);
+
+            for (std::size_t b = 0; b < cached_batch_size_; ++b)
+            {
+                Matrix sample(d_model_, num_patches_);
+                for (std::size_t i = 0; i < d_model_; ++i)
+                    for (std::size_t j = 0; j < num_patches_; ++j)
+                        sample.set_value_unchecked(i, j,
+                            input.at_unchecked(i, b * num_patches_ + j));
+
+                for (auto &layer : layers_)
+                    sample = layer.forward(sample);
+
+                per_sample_cache_.push_back(sample);
+
+                for (std::size_t i = 0; i < d_model_; ++i)
+                {
+                    double avg = 0.0;
+                    for (std::size_t j = 0; j < num_patches_; ++j)
+                        avg += sample.at_unchecked(i, j);
+                    output.set_value_unchecked(i, b, avg / static_cast<double>(num_patches_));
+                }
+            }
+            return output;
+        }
+
+        Matrix backward(const Matrix &grad_output) override
+        {
+            const double inv_patches = 1.0 / static_cast<double>(num_patches_);
+            Matrix grad_input(d_model_, cached_batch_size_ * num_patches_);
+
+            for (std::size_t b = 0; b < cached_batch_size_; ++b)
+            {
+                Matrix grad_sample(d_model_, num_patches_);
+                for (std::size_t i = 0; i < d_model_; ++i)
+                {
+                    double g = grad_output.at_unchecked(i, b) * inv_patches;
+                    for (std::size_t j = 0; j < num_patches_; ++j)
+                        grad_sample.set_value_unchecked(i, j, g);
+                }
+
+                for (auto it = layers_.rbegin(); it != layers_.rend(); ++it)
+                    grad_sample = it->backward(grad_sample);
+
+                for (std::size_t i = 0; i < d_model_; ++i)
+                    for (std::size_t j = 0; j < num_patches_; ++j)
+                        grad_input.set_value_unchecked(i, b * num_patches_ + j,
+                            grad_sample.at_unchecked(i, j));
+            }
+            return grad_input;
+        }
+    };
+
+    // ── PatchEmbedding ───────────────────────────────────────────────────────
+    class PatchEmbedding final : public Layer
+    {
+    private:
+        std::size_t img_size_;
+        std::size_t patch_size_;
+        std::size_t d_model_;
+        std::size_t num_patches_;
+        std::size_t patch_dim_;
+        Linear proj_;
+        Matrix patches_cache_;
+        std::size_t cached_batch_size_{0};
+
+    public:
+        PatchEmbedding(std::size_t img_size, std::size_t patch_size, std::size_t d_model)
+            : img_size_(img_size), patch_size_(patch_size), d_model_(d_model),
+              num_patches_((img_size / patch_size) * (img_size / patch_size)),
+              patch_dim_(patch_size * patch_size),
+              proj_(patch_dim_, d_model) {}
+
+        const char *name() const override { return "PatchEmbedding"; }
+        [[nodiscard]] std::size_t param_count() const noexcept override { return proj_.param_count(); }
+
+        std::vector<std::reference_wrapper<Matrix>> parameters() override { return proj_.parameters(); }
+        std::vector<std::reference_wrapper<Matrix>> param_gradients() override { return proj_.param_gradients(); }
+
+        Matrix forward(const Matrix &input) override
+        {
+            cached_batch_size_ = input.cols();
+            const std::size_t grid = img_size_ / patch_size_;
+
+            patches_cache_ = Matrix(patch_dim_, num_patches_ * cached_batch_size_);
+
+            for (std::size_t b = 0; b < cached_batch_size_; ++b)
+            {
+                for (std::size_t py = 0; py < grid; ++py)
+                    for (std::size_t px = 0; px < grid; ++px)
+                    {
+                        std::size_t pid = py * grid + px;
+                        for (std::size_t dy = 0; dy < patch_size_; ++dy)
+                            for (std::size_t dx = 0; dx < patch_size_; ++dx)
+                            {
+                                std::size_t row = py * patch_size_ + dy;
+                                std::size_t col = px * patch_size_ + dx;
+                                std::size_t pixel_idx = row * img_size_ + col;
+                                std::size_t patch_feat = dy * patch_size_ + dx;
+                                patches_cache_.set_value_unchecked(
+                                    patch_feat, b * num_patches_ + pid,
+                                    input.at_unchecked(pixel_idx, b));
+                            }
+                    }
+            }
+
+            return proj_.forward(patches_cache_);
+        }
+
+        Matrix backward(const Matrix &grad_output) override
+        {
+            Matrix grad_patches = proj_.backward(grad_output);
+            const std::size_t grid = img_size_ / patch_size_;
+
+            Matrix grad_input(img_size_ * img_size_, cached_batch_size_);
+
+            for (std::size_t b = 0; b < cached_batch_size_; ++b)
+            {
+                for (std::size_t py = 0; py < grid; ++py)
+                    for (std::size_t px = 0; px < grid; ++px)
+                    {
+                        std::size_t pid = py * grid + px;
+                        for (std::size_t dy = 0; dy < patch_size_; ++dy)
+                            for (std::size_t dx = 0; dx < patch_size_; ++dx)
+                            {
+                                std::size_t row = py * patch_size_ + dy;
+                                std::size_t col = px * patch_size_ + dx;
+                                std::size_t pixel_idx = row * img_size_ + col;
+                                std::size_t patch_feat = dy * patch_size_ + dx;
+                                grad_input.set_value_unchecked(pixel_idx, b,
+                                    grad_patches.at_unchecked(
+                                        patch_feat, b * num_patches_ + pid));
+                            }
+                    }
+            }
+            return grad_input;
+        }
+    };
 }
 
 #endif
