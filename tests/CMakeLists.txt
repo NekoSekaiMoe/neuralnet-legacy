@@ -4,6 +4,10 @@ if(BUILD_TESTING)
     target_link_libraries(test_nn PRIVATE neuralnet::neuralnet)
     target_include_directories(test_nn PRIVATE ${PROJECT_SOURCE_DIR}/include)
 
+    add_executable(test_transformer test_transformer.cpp)
+    target_link_libraries(test_transformer PRIVATE neuralnet::neuralnet)
+    target_include_directories(test_transformer PRIVATE ${PROJECT_SOURCE_DIR}/include)
+
     # 测试断言基于 <cassert>。Release 构建（CMake 默认行为）会注入 -DNDEBUG，
     # 使 assert(...) 变为空表达式，整个用例无论真假都会打印 "PASSED" — 测试形同虚设。
     # 这里在编译标志末尾追加 -UNDEBUG，强制无视上游 NDEBUG，让 assert 始终生效。
@@ -11,8 +15,10 @@ if(BUILD_TESTING)
     # CI 跑 Release 也能保留断言。
     if(MSVC)
         target_compile_options(test_nn PRIVATE /UNDEBUG)
+        target_compile_options(test_transformer PRIVATE /UNDEBUG)
     else()
         target_compile_options(test_nn PRIVATE -UNDEBUG)
+        target_compile_options(test_transformer PRIVATE -UNDEBUG)
     endif()
 
     # 每个 test_entry 注册为独立 CTest，方便 ctest 单独运行/过滤
@@ -88,5 +94,36 @@ if(BUILD_TESTING)
 
     foreach(name ${nn_test_names})
         add_test(NAME ${name} COMMAND test_nn ${name})
+    endforeach()
+
+    set(transformer_test_names
+        matrix_resize
+        matrix_row_slice
+        matrix_set_row_slice
+        layernorm_forward_shape
+        layernorm_normalize
+        layernorm_backward_shape
+        layernorm_gradient_check
+        softmax_forward
+        softmax_backward_shape
+        positional_encoding_shape
+        positional_encoding_adds_values
+        positional_encoding_backward_passthrough
+        mha_forward_shape
+        mha_backward_shape
+        mha_params_count
+        feedforward_shape
+        feedforward_params
+        encoder_layer_shape
+        encoder_forward_shape
+        encoder_backward_shape
+        patch_embedding_shape
+        patch_embedding_backward_shape
+        vit_e2e_forward
+        vit_e2e_backward
+    )
+
+    foreach(name ${transformer_test_names})
+        add_test(NAME transformer_${name} COMMAND test_transformer ${name})
     endforeach()
 endif()
