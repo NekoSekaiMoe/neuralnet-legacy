@@ -26,6 +26,7 @@ void print_usage(const char *prog)
         << "  <text-file>        训练文本文件路径 (必需)\n\n"
         << "选项:\n"
         << "  --save <path>      模型保存路径 (默认: gpt_model.bin)\n"
+        << "  --vocab <path>     词表文件路径 (默认: data/gpt_bpe.json)\n"
         << "  --resume <path>    从已有模型恢复训练\n"
         << "  --epochs <n>       训练轮数 (默认: 10)\n"
         << "  --lr <lr>          学习率 (默认: 0.001)\n"
@@ -44,6 +45,7 @@ struct TrainConfig
 {
     std::string text_path;
     std::string save_path = "gpt_model.bin";
+    std::string vocab_path = "data/gpt_bpe.json";
     std::string resume_path;
     std::string optimizer_name = "adam";
     int epochs = 10;
@@ -70,6 +72,8 @@ TrainConfig parse_args(int argc, char *argv[])
         }
         else if (arg == "--save" && i + 1 < argc)
             cfg.save_path = argv[++i];
+        else if (arg == "--vocab" && i + 1 < argc)
+            cfg.vocab_path = argv[++i];
         else if (arg == "--resume" && i + 1 < argc)
         {
             cfg.resume_path = argv[++i];
@@ -117,6 +121,13 @@ TrainConfig parse_args(int argc, char *argv[])
         std::exit(1);
     }
 
+    if (cfg.epochs <= 0 || cfg.lr <= 0 || cfg.batch_size <= 0 || cfg.seq_len <= 0 ||
+        cfg.d_model <= 0 || cfg.num_heads <= 0 || cfg.num_layers <= 0 || cfg.d_ff <= 0)
+    {
+        std::cerr << "错误: epochs, lr, batch-size, seq-len, d-model, num-heads, num-layers, d-ff 必须大于 0\n";
+        std::exit(1);
+    }
+
     return cfg;
 }
 
@@ -156,7 +167,7 @@ int main(int argc, char *argv[])
 
         nn::BPETokenizer tokenizer;
         {
-            tokenizer.load_vocab("data/gpt_bpe.json");
+            tokenizer.load_vocab(cfg.vocab_path);
         }
         auto all_tokens = tokenizer.encode(text);
         std::cout << "文本长度: " << text.size() << " 字符, "
@@ -220,12 +231,12 @@ int main(int argc, char *argv[])
 
         // ── 训练循环 ─────────────────────────────────────────────
         // 可用的 token 数量（需要 seq_len + 1 作为 input + target）
-        const std::size_t max_start = all_tokens.size() - cfg.seq_len - 1;
-        if (max_start == 0)
+        if (all_tokens.size() <= cfg.seq_len + 1)
         {
             std::cerr << "文本太短，至少需要 " << (cfg.seq_len + 2) << " 个 token\n";
             return 1;
         }
+        const std::size_t max_start = all_tokens.size() - cfg.seq_len - 1;
 
         const std::size_t steps_per_epoch = std::min(max_start / cfg.batch_size,
                                                       std::size_t{1000});
@@ -244,10 +255,10 @@ int main(int argc, char *argv[])
                 // ── 采样 batch ───────────────────────────────────
                 nn::Matrix x_tokens(cfg.seq_len, cfg.batch_size);
                 nn::Matrix y_tokens(cfg.seq_len, cfg.batch_size);
+                std::uniform_int_distribution<std::size_t> dist(0, max_start);
 
                 for (std::size_t b = 0; b < cfg.batch_size; ++b)
                 {
-                    std::uniform_int_distribution<std::size_t> dist(0, max_start);
                     std::size_t start = dist(rng);
 
                     for (std::size_t t = 0; t < cfg.seq_len; ++t)

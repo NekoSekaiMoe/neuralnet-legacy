@@ -12,6 +12,7 @@
 
 #include <chrono>
 #include <cstdlib>
+#include <exception>
 #include <filesystem>
 #include <iomanip>
 #include <iostream>
@@ -125,76 +126,84 @@ std::string read_text_file(const std::string &path)
 // ── 主函数 ──────────────────────────────────────────────────────────────
 int main(int argc, char *argv[])
 {
-    auto args = parse_args(argc, argv);
-
-    // 读取文件
-    std::cout << "读取文件: " << args.text_file << "\n";
-    auto text = read_text_file(args.text_file);
-    std::cout << "文本字符数: " << text.size() << "\n";
-
-    // 训练
-    nn::ByteZipTokenizer tokenizer;
-    nn::ByteZipTokenizer::Config config;
-    config.vocab_size          = args.vocab_size;
-    config.v1_max_len          = args.v1_len;
-    config.v2_max_len          = args.v2_len;
-    config.v2_reserve          = args.v2_reserve;
-    config.skip_ratio          = args.skip_ratio;
-    config.affix_protect_ratio = args.affix_ratio;
-
-    auto t0 = std::chrono::steady_clock::now();
-    tokenizer.train(text, config);
-    auto t1 = std::chrono::steady_clock::now();
-
-    const auto elapsed = std::chrono::duration<double>(t1 - t0).count();
-    std::cout << "总耗时: " << std::fixed << std::setprecision(1)
-              << elapsed << " 秒\n";
-
-    // 展示前 20 个高频子词
-    std::cout << "\n✅ 高频子词展示（前 20 个）:\n";
-    std::size_t shown = 0;
-    const auto &vocab = tokenizer.vocab();
-    for (std::size_t tid = nn::ByteZipTokenizer::BYTE_OFFSET;
-         tid < vocab.size() && shown < 20; ++tid)
+    try
     {
-        const auto &bytes = vocab[tid];
-        if (bytes.size() >= 2)
+        auto args = parse_args(argc, argv);
+
+        // 读取文件
+        std::cout << "读取文件: " << args.text_file << "\n";
+        auto text = read_text_file(args.text_file);
+        std::cout << "文本字符数: " << text.size() << "\n";
+
+        // 训练
+        nn::ByteZipTokenizer tokenizer;
+        nn::ByteZipTokenizer::Config config;
+        config.vocab_size          = args.vocab_size;
+        config.v1_max_len          = args.v1_len;
+        config.v2_max_len          = args.v2_len;
+        config.v2_reserve          = args.v2_reserve;
+        config.skip_ratio          = args.skip_ratio;
+        config.affix_protect_ratio = args.affix_ratio;
+
+        auto t0 = std::chrono::steady_clock::now();
+        tokenizer.train(text, config);
+        auto t1 = std::chrono::steady_clock::now();
+
+        const auto elapsed = std::chrono::duration<double>(t1 - t0).count();
+        std::cout << "总耗时: " << std::fixed << std::setprecision(1)
+                  << elapsed << " 秒\n";
+
+        // 展示前 20 个高频子词
+        std::cout << "\n✅ 高频子词展示（前 20 个）:\n";
+        std::size_t shown = 0;
+        const auto &vocab = tokenizer.vocab();
+        for (std::size_t tid = nn::ByteZipTokenizer::BYTE_OFFSET;
+             tid < vocab.size() && shown < 20; ++tid)
         {
-            // 尝试作为 UTF-8 解码显示
-            bool printable = true;
-            for (unsigned char c : bytes)
+            const auto &bytes = vocab[tid];
+            if (bytes.size() >= 2)
             {
-                if (c < 32 && c != '\n' && c != '\t')
+                // 尝试作为 UTF-8 解码显示
+                bool printable = true;
+                for (unsigned char c : bytes)
                 {
-                    printable = false;
-                    break;
+                    if (c < 32 && c != '\n' && c != '\t')
+                    {
+                        printable = false;
+                        break;
+                    }
+                }
+
+                if (printable)
+                {
+                    std::cout << "  ID " << tid << ": \""
+                              << tokenizer.try_decode_token(tid) << "\"\n";
+                    ++shown;
                 }
             }
-
-            if (printable)
-            {
-                std::cout << "  ID " << tid << ": \""
-                          << tokenizer.try_decode_token(tid) << "\"\n";
-                ++shown;
-            }
         }
+
+        // 编码/解码冒烟测试
+        const std::string test_sent = "Alice was a very good girl, she said hello!";
+        auto ids = tokenizer.encode(test_sent);
+        auto decoded = tokenizer.decode(ids);
+
+        std::cout << "\n🧪 验证:\n";
+        std::cout << "  原文: " << test_sent << "\n";
+        std::cout << "  Token数: " << ids.size() << "\n";
+        std::cout << "  解码: " << decoded << "\n";
+        std::cout << "  完美还原: " << (decoded == test_sent ? "true" : "false") << "\n";
+
+        // 保存词表
+        tokenizer.save(args.output);
+        std::cout << "词表已保存至: " << args.output
+                  << " (" << tokenizer.vocab_size() << " tokens)\n";
+
+        return 0;
     }
-
-    // 编码/解码冒烟测试
-    const std::string test_sent = "Alice was a very good girl, she said hello!";
-    auto ids = tokenizer.encode(test_sent);
-    auto decoded = tokenizer.decode(ids);
-
-    std::cout << "\n🧪 验证:\n";
-    std::cout << "  原文: " << test_sent << "\n";
-    std::cout << "  Token数: " << ids.size() << "\n";
-    std::cout << "  解码: " << decoded << "\n";
-    std::cout << "  完美还原: " << (decoded == test_sent ? "true" : "false") << "\n";
-
-    // 保存词表
-    tokenizer.save(args.output);
-    std::cout << "词表已保存至: " << args.output
-              << " (" << tokenizer.vocab_size() << " tokens)\n";
-
-    return 0;
+    catch (const std::exception &e)
+    {
+        std::cerr << "错误: " << e.what() << "\n";
+        return 1;
+    }
 }

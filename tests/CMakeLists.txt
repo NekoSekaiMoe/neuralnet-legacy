@@ -159,6 +159,7 @@ if(BUILD_TESTING)
         causal_self_attention_masking
         gpt_block_shape
         gpt_model_shape
+        gpt_model_numeric_grad
         gpt_model_generate
     )
     foreach(name ${gpt_test_names})
@@ -166,6 +167,7 @@ if(BUILD_TESTING)
     endforeach()
 
     add_executable(test_tokenizer test_tokenizer.cpp)
+    target_link_libraries(test_tokenizer PRIVATE neuralnet::neuralnet)
     target_include_directories(test_tokenizer PRIVATE ${PROJECT_SOURCE_DIR}/include)
     if(MSVC)
         target_compile_options(test_tokenizer PRIVATE /UNDEBUG)
@@ -176,6 +178,7 @@ if(BUILD_TESTING)
     set(tokenizer_test_names
         char_tokenizer
         byte_zip_tokenizer_train
+        bpe_tokenizer_load_vocab
     )
     foreach(name ${tokenizer_test_names})
         add_test(NAME tokenizer_${name} COMMAND test_tokenizer ${name})

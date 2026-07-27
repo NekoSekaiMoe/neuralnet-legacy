@@ -17,7 +17,8 @@ void print_usage(const char *prog)
         << "  " << prog << " --interactive          交互模式\n\n"
         << "选项:\n"
         << "  --model <path>     模型文件路径 (默认: gpt_model.bin)\n"
-        << "                       V2 格式模型自动读取规格，无需指定架构参数\n"
+        << "                       V3 格式模型自动读取规格，无需指定架构参数\n"
+        << "  --vocab <path>     词表文件路径 (默认: data/gpt_bpe.json)\n"
         << "  --prompt <text>    输入提示文本\n"
         << "  --interactive      交互式生成模式\n"
         << "  --max-tokens <n>   最大生成 token 数 (默认: 200)\n"
@@ -35,6 +36,7 @@ void print_usage(const char *prog)
 struct InferConfig
 {
     std::string model_path = "gpt_model.bin";
+    std::string vocab_path = "data/gpt_bpe.json";
     std::string prompt = "Hello";
     int max_tokens = 200;
     double temperature = 1.0;
@@ -60,6 +62,8 @@ InferConfig parse_args(int argc, char *argv[])
         }
         else if (arg == "--model" && i + 1 < argc)
             cfg.model_path = argv[++i];
+        else if (arg == "--vocab" && i + 1 < argc)
+            cfg.vocab_path = argv[++i];
         else if (arg == "--prompt" && i + 1 < argc)
             cfg.prompt = argv[++i];
         else if (arg == "--interactive")
@@ -87,6 +91,11 @@ InferConfig parse_args(int argc, char *argv[])
             std::cerr << "未知参数: " << arg << "\n使用 --help 查看用法\n";
             std::exit(1);
         }
+    }
+    if (cfg.max_tokens <= 0)
+    {
+        std::cerr << "错误: max-tokens 必须大于 0\n";
+        std::exit(1);
     }
     return cfg;
 }
@@ -160,7 +169,7 @@ int main(int argc, char *argv[])
 
         // ── 加载分词器与模型 ─────────────────────────────────────
         nn::BPETokenizer tokenizer;
-        tokenizer.load_vocab("data/gpt_bpe.json");
+        tokenizer.load_vocab(cfg.vocab_path);
         std::cout << "词表: " << tokenizer.vocab_size() << " 词" << std::endl;
 
         // ── 从模型文件读取规格 ─────────────────────────────────
@@ -169,8 +178,8 @@ int main(int argc, char *argv[])
         nn::Model model;
         if (spec.type == nn::ModelType::GPT)
         {
-            // V2 格式：自动从规格构建模型
-            std::cout << "从模型文件读取 GPT 规格 (V2 格式)\n";
+            // V3 格式：自动从规格构建模型
+            std::cout << "从模型文件读取 GPT 规格 (V3 格式)\n";
             model = nn::build_gpt_model_from_spec(spec);
         }
         else

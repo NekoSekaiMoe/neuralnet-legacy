@@ -1046,6 +1046,7 @@ namespace nn
         std::size_t num_heads_;
         std::size_t head_dim_;
         double scale_;
+        bool causal_;
 
         Matrix W_q_, W_k_, W_v_, W_o_;
         Matrix dW_q_, dW_k_, dW_v_, dW_o_;
@@ -1119,10 +1120,11 @@ namespace nn
         }
 
     public:
-        MultiHeadAttention(std::size_t d_model, std::size_t num_heads)
+        MultiHeadAttention(std::size_t d_model, std::size_t num_heads, bool causal = false)
             : d_model_(d_model), num_heads_(num_heads),
               head_dim_(validated_head_dim(d_model, num_heads)),
               scale_(1.0 / std::sqrt(static_cast<double>(head_dim_))),
+              causal_(causal),
               W_q_(xavier_init(d_model, d_model)),
               W_k_(xavier_init(d_model, d_model)),
               W_v_(xavier_init(d_model, d_model)),
@@ -1168,190 +1170,12 @@ namespace nn
 
                 Matrix scores = Q_h.matmul_TN(K_h);
                 scores.scale_inplace(scale_);
-                softmax_rows_inplace(scores);
-                attn_cache_[h] = scores;
-
-                Matrix head_out = V_h.matmul_NT(scores);
-                concat_cache_.set_row_slice(off, head_out);
-            }
-
-            return W_o_ * concat_cache_;
-        }
-
-        Matrix backward(const Matrix &grad_output) override
-        {
-            const std::size_t sl = grad_output.cols();
-
-            dW_o_ = grad_output.matmul_NT(concat_cache_);
-            Matrix grad_concat = W_o_.matmul_TN(grad_output);
-
-            Matrix grad_Q(d_model_, sl), grad_K(d_model_, sl), grad_V(d_model_, sl);
-
-            for (std::size_t h = 0; h < num_heads_; ++h)
-            {
-                const std::size_t off = h * head_dim_;
-                Matrix Q_h = Q_cache_.row_slice(off, head_dim_);
-                Matrix K_h = K_cache_.row_slice(off, head_dim_);
-                Matrix V_h = V_cache_.row_slice(off, head_dim_);
-                const Matrix &attn_h = attn_cache_[h];
-
-                Matrix grad_head = grad_concat.row_slice(off, head_dim_);
-
-                Matrix grad_V_h = grad_head * attn_h;
-                Matrix grad_attn = grad_head.matmul_TN(V_h);
-
-                Matrix grad_scores = softmax_backward_rows(grad_attn, attn_h);
-                grad_scores.scale_inplace(scale_);
-
-                Matrix grad_Q_h = K_h.matmul_NT(grad_scores);
-                Matrix grad_K_h = Q_h * grad_scores;
-
-                grad_Q.set_row_slice(off, grad_Q_h);
-                grad_K.set_row_slice(off, grad_K_h);
-                grad_V.set_row_slice(off, grad_V_h);
-            }
-
-            dW_q_ = grad_Q.matmul_NT(input_cache_);
-            dW_k_ = grad_K.matmul_NT(input_cache_);
-            dW_v_ = grad_V.matmul_NT(input_cache_);
-
-            Matrix grad_input = W_q_.matmul_TN(grad_Q);
-            grad_input.add_inplace(W_k_.matmul_TN(grad_K));
-            grad_input.add_inplace(W_v_.matmul_TN(grad_V));
-            return grad_input;
-        }
-    };
-
-    // ── CausalSelfAttention ──────────────────────────────────────────────────
-    class CausalSelfAttention final : public Layer
-    {
-    private:
-        std::size_t d_model_;
-        std::size_t num_heads_;
-        std::size_t head_dim_;
-        double scale_;
-
-        Matrix W_q_, W_k_, W_v_, W_o_;
-        Matrix dW_q_, dW_k_, dW_v_, dW_o_;
-
-        Matrix input_cache_;
-        Matrix Q_cache_, K_cache_, V_cache_, concat_cache_;
-        std::vector<Matrix> attn_cache_;
-
-        inline static thread_local std::mt19937_64 rng_{std::random_device{}()};
-
-        static Matrix xavier_init(std::size_t rows, std::size_t cols)
-        {
-            Matrix m(rows, cols);
-            double limit = std::sqrt(6.0 / static_cast<double>(rows + cols));
-            std::uniform_real_distribution<double> dist(-limit, limit);
-            std::generate(m.data().begin(), m.data().end(), [&] { return dist(rng_); });
-            return m;
-        }
-
-        static void softmax_rows_inplace(Matrix &m)
-        {
-            const std::size_t rows = m.rows(), cols = m.cols();
-            for (std::size_t i = 0; i < rows; ++i)
-            {
-                double mx = m.at_unchecked(i, 0);
-                for (std::size_t j = 1; j < cols; ++j)
-                    if (m.at_unchecked(i, j) > mx) mx = m.at_unchecked(i, j);
-                double s = 0.0;
-                for (std::size_t j = 0; j < cols; ++j)
+                if (causal_)
                 {
-                    double e = std::exp(m.at_unchecked(i, j) - mx);
-                    m.set_value_unchecked(i, j, e);
-                    s += e;
+                    for (std::size_t i = 0; i < sl; ++i)
+                        for (std::size_t j = i + 1; j < sl; ++j)
+                            scores.set_value_unchecked(i, j, -1e9);
                 }
-                for (std::size_t j = 0; j < cols; ++j)
-                    m.set_value_unchecked(i, j, m.at_unchecked(i, j) / s);
-            }
-        }
-
-        static Matrix softmax_backward_rows(const Matrix &grad, const Matrix &attn)
-        {
-            const std::size_t rows = grad.rows(), cols = grad.cols();
-            Matrix result(rows, cols);
-            for (std::size_t i = 0; i < rows; ++i)
-            {
-                double dot = 0.0;
-                for (std::size_t j = 0; j < cols; ++j)
-                    dot += grad.at_unchecked(i, j) * attn.at_unchecked(i, j);
-                for (std::size_t j = 0; j < cols; ++j)
-                    result.set_value_unchecked(i, j,
-                        attn.at_unchecked(i, j) * (grad.at_unchecked(i, j) - dot));
-            }
-            return result;
-        }
-
-        static std::size_t validated_head_dim(std::size_t d_model, std::size_t num_heads)
-        {
-            if (d_model == 0)
-                throw std::invalid_argument("d_model must be > 0");
-            if (num_heads == 0)
-                throw std::invalid_argument("num_heads must be > 0");
-            if (d_model % num_heads != 0)
-                throw std::invalid_argument("d_model must be divisible by num_heads");
-            return d_model / num_heads;
-        }
-
-    public:
-        CausalSelfAttention(std::size_t d_model, std::size_t num_heads)
-            : d_model_(d_model), num_heads_(num_heads),
-              head_dim_(validated_head_dim(d_model, num_heads)),
-              scale_(1.0 / std::sqrt(static_cast<double>(head_dim_))),
-              W_q_(xavier_init(d_model, d_model)),
-              W_k_(xavier_init(d_model, d_model)),
-              W_v_(xavier_init(d_model, d_model)),
-              W_o_(xavier_init(d_model, d_model)),
-              dW_q_(d_model, d_model), dW_k_(d_model, d_model),
-              dW_v_(d_model, d_model), dW_o_(d_model, d_model)
-        {}
-
-        const char *name() const override { return "CausalSelfAttention"; }
-        [[nodiscard]] std::size_t param_count() const noexcept override
-        {
-            return 4 * d_model_ * d_model_;
-        }
-
-        std::vector<std::reference_wrapper<Matrix>> parameters() override
-        {
-            return {std::ref(W_q_), std::ref(W_k_), std::ref(W_v_), std::ref(W_o_)};
-        }
-
-        std::vector<std::reference_wrapper<Matrix>> param_gradients() override
-        {
-            return {std::ref(dW_q_), std::ref(dW_k_), std::ref(dW_v_), std::ref(dW_o_)};
-        }
-
-        Matrix forward(const Matrix &input) override
-        {
-            const std::size_t sl = input.cols();
-            input_cache_ = input;
-
-            Q_cache_ = W_q_ * input;
-            K_cache_ = W_k_ * input;
-            V_cache_ = W_v_ * input;
-
-            concat_cache_ = Matrix(d_model_, sl);
-            attn_cache_.resize(num_heads_);
-
-            for (std::size_t h = 0; h < num_heads_; ++h)
-            {
-                const std::size_t off = h * head_dim_;
-                Matrix Q_h = Q_cache_.row_slice(off, head_dim_);
-                Matrix K_h = K_cache_.row_slice(off, head_dim_);
-                Matrix V_h = V_cache_.row_slice(off, head_dim_);
-
-                Matrix scores = Q_h.matmul_TN(K_h);
-                scores.scale_inplace(scale_);
-
-                // Causal mask
-                for (std::size_t i = 0; i < sl; ++i)
-                    for (std::size_t j = i + 1; j < sl; ++j)
-                        scores.set_value_unchecked(i, j, -1e9);
-
                 softmax_rows_inplace(scores);
                 attn_cache_[h] = scores;
 
@@ -1386,6 +1210,13 @@ namespace nn
 
                 Matrix grad_scores = softmax_backward_rows(grad_attn, attn_h);
                 grad_scores.scale_inplace(scale_);
+
+                if (causal_)
+                {
+                    for (std::size_t i = 0; i < sl; ++i)
+                        for (std::size_t j = i + 1; j < sl; ++j)
+                            grad_scores.set_value_unchecked(i, j, 0.0);
+                }
 
                 Matrix grad_Q_h = K_h.matmul_NT(grad_scores);
                 Matrix grad_K_h = Q_h * grad_scores;
@@ -1656,17 +1487,15 @@ namespace nn
     class GPTBlock final : public Layer
     {
     private:
-        CausalSelfAttention self_attn_;
+        MultiHeadAttention self_attn_;
         LayerNorm norm1_;
         FeedForward ff_;
         LayerNorm norm2_;
 
-        Matrix residual1_cache_;
-        Matrix residual2_cache_;
 
     public:
         GPTBlock(std::size_t d_model, std::size_t num_heads, std::size_t d_ff)
-            : self_attn_(d_model, num_heads),
+            : self_attn_(d_model, num_heads, true),
               norm1_(d_model),
               ff_(d_model, d_ff),
               norm2_(d_model)
@@ -1706,13 +1535,12 @@ namespace nn
         Matrix forward(const Matrix &input) override
         {
             // 子层1: CausalSelfAttention + 残差 (Pre-Norm)
-            residual1_cache_ = input;
             Matrix sa_out = self_attn_.forward(norm1_.forward(input));
-            residual2_cache_ = input + sa_out;
+            Matrix residual2 = input + sa_out;
 
             // 子层2: FFN + 残差 (Pre-Norm)
-            Matrix ff_out = ff_.forward(norm2_.forward(residual2_cache_));
-            return residual2_cache_ + ff_out;
+            Matrix ff_out = ff_.forward(norm2_.forward(residual2));
+            return residual2 + ff_out;
         }
 
         Matrix backward(const Matrix &grad_output) override
@@ -1852,9 +1680,9 @@ namespace nn
 
                     for (std::size_t d = 0; d < d_model_; ++d)
                     {
+                        double pe = (t < seq_len_) ? pos_emb_.at_unchecked(t, d) : 0.0;
                         x.set_value_unchecked(d, t,
-                            token_emb_.at_unchecked(token_id, d) +
-                            pos_emb_.at_unchecked(t, d));
+                            token_emb_.at_unchecked(token_id, d) + pe);
                     }
                 }
 
@@ -1884,6 +1712,10 @@ namespace nn
             Matrix grad_input(sl, batch_size_);
             grad_input.zero();
 
+            auto all_grads = param_gradients();
+            std::vector<Matrix> accum_grads;
+            for (auto& g : all_grads) accum_grads.push_back(Matrix(g.get().rows(), g.get().cols(), 0.0));
+
             for (std::size_t b = 0; b < batch_size_; ++b)
             {
                 Matrix grad_logits(vocab_size_, sl);
@@ -1897,6 +1729,9 @@ namespace nn
                 for (std::size_t l = 0; l < blocks_.size(); ++l)
                     x = blocks_[l].forward(x);
                 x = ln_f_.forward(x);
+                lm_head_.forward(x); // rebuild lm_head_ cache
+
+                for (auto& g : all_grads) g.get().zero();
 
                 Matrix grad_ln = lm_head_.backward(grad_logits);
                 grad_ln = ln_f_.backward(grad_ln);
@@ -1911,10 +1746,22 @@ namespace nn
                     for (std::size_t d = 0; d < d_model_; ++d)
                     {
                         double g = grad_ln.at_unchecked(d, t);
-                        grad_token_emb_.data()[d * vocab_size_ + tid] += g;
-                        grad_pos_emb_.data()[d * seq_len_ + t] += g;
+                        grad_token_emb_.data()[tid * d_model_ + d] += g;
+                        grad_pos_emb_.data()[t * d_model_ + d] += g;
                     }
                 }
+                
+                for (std::size_t i = 0; i < all_grads.size(); ++i) {
+                    auto& ag = accum_grads[i];
+                    auto& cg = all_grads[i].get();
+                    for (std::size_t j = 0; j < ag.size(); ++j) ag.data()[j] += cg.data()[j];
+                }
+            }
+            
+            for (std::size_t i = 0; i < all_grads.size(); ++i) {
+                auto& ag = accum_grads[i];
+                auto& cg = all_grads[i].get();
+                for (std::size_t j = 0; j < ag.size(); ++j) cg.data()[j] = ag.data()[j];
             }
 
             return grad_input;
@@ -1928,6 +1775,10 @@ namespace nn
             std::vector<std::size_t> generated;
             std::mt19937_64 rng{std::random_device{}()};
             std::uniform_real_distribution<double> dist(0.0, 1.0);
+            
+            auto saved_inputs = stored_inputs_;
+            auto saved_tokens = stored_tokens_;
+            auto saved_bs = batch_size_;
 
             for (std::size_t step = 0; step < max_new_tokens; ++step)
             {
@@ -1995,9 +1846,13 @@ namespace nn
                     }
                 }
 
-                context.push_back(next_token);
                 generated.push_back(next_token);
+                context.push_back(next_token);
             }
+            
+            stored_inputs_ = saved_inputs;
+            stored_tokens_ = saved_tokens;
+            batch_size_ = saved_bs;
 
             return generated;
         }

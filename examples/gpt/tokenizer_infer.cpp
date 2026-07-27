@@ -13,6 +13,7 @@
 
 #include <chrono>
 #include <cstdlib>
+#include <exception>
 #include <iomanip>
 #include <iostream>
 #include <sstream>
@@ -336,32 +337,40 @@ void mode_interactive(const nn::ByteZipTokenizer &tokenizer, bool show_detail)
 // ── 主函数 ──────────────────────────────────────────────────────────────
 int main(int argc, char *argv[])
 {
-    auto args = parse_args(argc, argv);
-
-    // 加载词表
-    nn::ByteZipTokenizer tokenizer;
-    std::cout << "加载词表: " << args.model_path << "\n";
-    tokenizer.load(args.model_path);
-    std::cout << "词表大小: " << tokenizer.vocab_size() << " tokens\n\n";
-
-    switch (args.mode)
+    try
     {
-        case Mode::Text:
-            mode_text(tokenizer, args.input, args.show_tokens);
-            break;
-        case Mode::Encode:
-            mode_encode(tokenizer, args.input, args.show_tokens);
-            break;
-        case Mode::Decode:
-            mode_decode(tokenizer, args.input, args.show_tokens);
-            break;
-        case Mode::Benchmark:
-            mode_benchmark(tokenizer, args.input, args.show_tokens);
-            break;
-        case Mode::Interactive:
-            mode_interactive(tokenizer, args.show_tokens);
-            break;
-    }
+        auto args = parse_args(argc, argv);
 
-    return 0;
+        // 加载词表
+        nn::ByteZipTokenizer tokenizer;
+        std::cout << "加载词表: " << args.model_path << "\n";
+        tokenizer.load(args.model_path);
+        std::cout << "词表大小: " << tokenizer.vocab_size() << " tokens\n\n";
+
+        switch (args.mode)
+        {
+            case Mode::Text:
+                mode_text(tokenizer, args.input, args.show_tokens);
+                break;
+            case Mode::Encode:
+                mode_encode(tokenizer, args.input, args.show_tokens);
+                break;
+            case Mode::Decode:
+                mode_decode(tokenizer, args.input, args.show_tokens);
+                break;
+            case Mode::Benchmark:
+                mode_benchmark(tokenizer, args.input, args.show_tokens);
+                break;
+            case Mode::Interactive:
+                mode_interactive(tokenizer, args.show_tokens);
+                break;
+        }
+
+        return 0;
+    }
+    catch (const std::exception &e)
+    {
+        std::cerr << "错误: " << e.what() << "\n";
+        return 1;
+    }
 }

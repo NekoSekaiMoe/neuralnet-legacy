@@ -270,15 +270,14 @@ namespace nn
 
             if (version == 3)
             {
-                ModelType type;
-                std::size_t dummy;
-                is.read(reinterpret_cast<char *>(&type), sizeof(type));
-                is.read(reinterpret_cast<char *>(&dummy), sizeof(dummy));
-                is.read(reinterpret_cast<char *>(&dummy), sizeof(dummy));
-                is.read(reinterpret_cast<char *>(&dummy), sizeof(dummy));
-                is.read(reinterpret_cast<char *>(&dummy), sizeof(dummy));
-                is.read(reinterpret_cast<char *>(&dummy), sizeof(dummy));
-                is.read(reinterpret_cast<char *>(&dummy), sizeof(dummy));
+                ModelSpec spec;
+                is.read(reinterpret_cast<char *>(&spec.type), sizeof(spec.type));
+                is.read(reinterpret_cast<char *>(&spec.vocab_size), sizeof(std::size_t));
+                is.read(reinterpret_cast<char *>(&spec.d_model), sizeof(std::size_t));
+                is.read(reinterpret_cast<char *>(&spec.seq_len), sizeof(std::size_t));
+                is.read(reinterpret_cast<char *>(&spec.num_heads), sizeof(std::size_t));
+                is.read(reinterpret_cast<char *>(&spec.d_ff), sizeof(std::size_t));
+                is.read(reinterpret_cast<char *>(&spec.num_layers), sizeof(std::size_t));
             }
 
             auto read_matrix = [&](Matrix &m)

@@ -28,6 +28,61 @@ inline constexpr std::size_t GPT_D_FF          = 512;
 inline constexpr std::size_t GPT_NUM_LAYERS    = 4;
 inline constexpr std::size_t GPT_SEQ_LEN       = 256;
 
+namespace internal {
+
+inline std::string parse_json_string(const std::string& content, std::size_t& pos)
+{
+    std::string key;
+    if (pos >= content.size() || content[pos] != '"') return key;
+    ++pos;
+    while (pos < content.size() && content[pos] != '"')
+    {
+        if (content[pos] == '\\' && pos + 1 < content.size())
+        {
+            ++pos;
+            switch (content[pos])
+            {
+                case 'n': key += '\n'; break;
+                case 't': key += '\t'; break;
+                case 'r': key += '\r'; break;
+                case '\\': key += '\\'; break;
+                case '"': key += '"'; break;
+                case 'u':
+                {
+                    if (pos + 4 < content.size())
+                    {
+                        std::string hex = content.substr(pos + 1, 4);
+                        unsigned long cp = std::stoul(hex, nullptr, 16);
+                        if (cp < 0x80) key += static_cast<char>(cp);
+                        else if (cp < 0x800) {
+                            key += static_cast<char>(0xC0 | (cp >> 6));
+                            key += static_cast<char>(0x80 | (cp & 0x3F));
+                        } else {
+                            key += static_cast<char>(0xE0 | (cp >> 12));
+                            key += static_cast<char>(0x80 | ((cp >> 6) & 0x3F));
+                            key += static_cast<char>(0x80 | (cp & 0x3F));
+                        }
+                        pos += 4;
+                    }
+                    break;
+                }
+                default: key += content[pos]; break;
+            }
+        }
+        else
+        {
+            key += content[pos];
+        }
+        ++pos;
+    }
+    if (pos < content.size() && content[pos] == '"') {
+        ++pos;
+    }
+    return key;
+}
+
+} // namespace internal
+
 // ── 字符级词表 ────────────────────────────────────────────────────────────
 class CharTokenizer
 {
@@ -41,7 +96,7 @@ public:
 
     [[nodiscard]] std::string decode_one(std::size_t id) const
     {
-        if (id < GPT_VOCAB_SIZE)
+        if (id < 256)
             return std::string(1, static_cast<char>(id));
         return "?";
     }
@@ -125,60 +180,14 @@ public:
             if (pos >= content.size() || content[pos] == '}') break;
 
             if (content[pos] != '"') { ++pos; continue; }
-            std::string key;
-            ++pos;
-            while (pos < content.size() && content[pos] != '"')
-            {
-                if (content[pos] == '\\' && pos + 1 < content.size())
-                {
-                    ++pos;
-                    switch (content[pos])
-                    {
-                        case 'n': key += '\n'; break;
-                        case 't': key += '\t'; break;
-                        case 'r': key += '\r'; break;
-                        case '\\': key += '\\'; break;
-                        case '"': key += '"'; break;
-                        case 'u':
-                        {
-                            if (pos + 4 < content.size())
-                            {
-                                std::string hex = content.substr(pos + 1, 4);
-                                unsigned long cp = std::stoul(hex, nullptr, 16);
-                                if (cp < 0x80) key += static_cast<char>(cp);
-                                else if (cp < 0x800) {
-                                    key += static_cast<char>(0xC0 | (cp >> 6));
-                                    key += static_cast<char>(0x80 | (cp & 0x3F));
-                                } else {
-                                    key += static_cast<char>(0xE0 | (cp >> 12));
-                                    key += static_cast<char>(0x80 | ((cp >> 6) & 0x3F));
-                                    key += static_cast<char>(0x80 | (cp & 0x3F));
-                                }
-                                pos += 4;
-                            }
-                            break;
-                        }
-                        default: key += content[pos]; break;
-                    }
-                }
-                else
-                {
-                    key += content[pos];
-                }
-                ++pos;
-            }
-            ++pos; // 跳过结束引号
+            std::string key = internal::parse_json_string(content, pos);
 
             while (pos < content.size() && (content[pos] == ' ' || content[pos] == ':'))
                 ++pos;
 
             if (pos < content.size() && content[pos] == '"')
             {
-                std::string hex_val;
-                ++pos;
-                while (pos < content.size() && content[pos] != '"')
-                    hex_val += content[pos++];
-                ++pos;
+                std::string hex_val = internal::parse_json_string(content, pos);
 
                 std::size_t id = static_cast<std::size_t>(std::stoul(key));
 
@@ -557,17 +566,11 @@ public:
                    content[pos]=='\r'||content[pos]=='\t'||content[pos]==',')) ++pos;
             if (pos >= content.size() || content[pos] == '}') break;
             if (content[pos] != '"') { ++pos; continue; }
-            ++pos;
-            std::string key;
-            while (pos < content.size() && content[pos] != '"') key += content[pos++];
-            ++pos;
+            std::string key = internal::parse_json_string(content, pos);
             while (pos < content.size() && (content[pos]==' '||content[pos]==':')) ++pos;
             if (pos < content.size() && content[pos] == '"')
             {
-                ++pos;
-                std::string hex;
-                while (pos < content.size() && content[pos] != '"') hex += content[pos++];
-                ++pos;
+                std::string hex = internal::parse_json_string(content, pos);
                 std::size_t id = 0;
                 std::from_chars(key.data(), key.data()+key.size(), id);
                 std::string tok;
