@@ -4,6 +4,25 @@ if(BUILD_TESTING)
     target_link_libraries(test_nn PRIVATE neuralnet::neuralnet)
     target_include_directories(test_nn PRIVATE ${PROJECT_SOURCE_DIR}/include)
 
+    add_executable(test_tensor test_tensor.cpp)
+    target_link_libraries(test_tensor PRIVATE neuralnet::neuralnet)
+    target_include_directories(test_tensor PRIVATE ${PROJECT_SOURCE_DIR}/include)
+    if(MSVC)
+        target_compile_options(test_tensor PRIVATE /UNDEBUG)
+    else()
+        target_compile_options(test_tensor PRIVATE -UNDEBUG)
+    endif()
+
+    set(tensor_test_names
+        tensor_add
+        tensor_matmul
+        tensor_relu
+        tensor_linear
+    )
+    foreach(name ${tensor_test_names})
+        add_test(NAME ${name} COMMAND test_tensor ${name})
+    endforeach()
+
     add_executable(test_transformer test_transformer.cpp)
     target_link_libraries(test_transformer PRIVATE neuralnet::neuralnet)
     target_include_directories(test_transformer PRIVATE ${PROJECT_SOURCE_DIR}/include)

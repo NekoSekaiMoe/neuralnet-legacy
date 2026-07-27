@@ -10,6 +10,8 @@
 #include <neuralnet/loss.h>
 #include <neuralnet/model/model.h>
 #include <neuralnet/optimizer.h>
+#include <neuralnet/tensor.h>
+#include <neuralnet/module.h>
 
 // ── Wave 2 新增模块（必须在 model.h 之后以提供 Model::summary 实现） ──
 #include <neuralnet/dataloader.h>
