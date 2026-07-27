@@ -6,6 +6,7 @@
 
 import argparse
 import json
+import os
 import tempfile
 from pathlib import Path
 from tokenizers import Tokenizer
@@ -28,7 +29,7 @@ def train_bpe(text_file: str, vocab_size: int) -> Tokenizer:
     return tokenizer
 
 
-def extract_vocab_hex(tokenizer: Tokenizer) -> dict:
+def extract_vocab_hex(tokenizer: Tokenizer) -> tuple[dict[str, str], int]:
     """
     从 tokenizer 提取词表，转换为 {id: hex_string} 格式。
     注意：BPE 的 ID 从 0 开始，我们直接使用这些 ID。
@@ -37,9 +38,22 @@ def extract_vocab_hex(tokenizer: Tokenizer) -> dict:
     # 按 ID 排序得到列表
     max_id = max(vocab_str_to_id.values())
     vocab = [b""] * (max_id + 1)
+    # 构建 char_to_byte 映射
+    bs = list(range(ord("!"), ord("~")+1))+list(range(ord("¡"), ord("¬")+1))+list(range(ord("®"), ord("ÿ")+1))
+    cs = bs[:]
+    n = 0
+    for b in range(256):
+        if b not in bs:
+            bs.append(b)
+            cs.append(256+n)
+            n += 1
+    char_to_byte = {chr(c): b for b, c in zip(bs, cs)}
+
     for token_str, tid in vocab_str_to_id.items():
-        # 将 token 字符串转回字节（ByteLevel 的 token 已经是可打印字符串，但需要正确编码）
-        token_bytes = token_str.encode("utf-8")
+        if token_str in SPECIAL_TOKENS:
+            token_bytes = token_str.encode("utf-8")
+        else:
+            token_bytes = bytes([char_to_byte.get(c, ord(c)) for c in token_str])
         vocab[tid] = token_bytes
     # 构建 {id: hex}
     hex_dict = {}
@@ -56,33 +70,33 @@ def extract_merges(tokenizer: Tokenizer) -> list[list[int]]:
     """
     # 保存 tokenizer 到临时 JSON 文件
     with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as f:
-        tokenizer.save(f.name)
         temp_path = f.name
 
-    # 读取临时文件
-    with open(temp_path, 'r', encoding='utf-8') as f:
-        data = json.load(f)
+    try:
+        tokenizer.save(temp_path)
+        # 读取临时文件
+        with open(temp_path, 'r', encoding='utf-8') as f:
+            data = json.load(f)
 
-    # 提取 merges 原始数据
-    merges_raw = data.get('model', {}).get('merges', [])
-    
-    # 转换为统一的二元组列表 (token1, token2)
-    merges = []
-    for item in merges_raw:
-        if isinstance(item, str):
-            # 如果格式是 "Ġ t" 这样的字符串，按空格拆分为两个 token
-            parts = item.split()
-            if len(parts) == 2:
-                merges.append(tuple(parts))
-        elif isinstance(item, list) and len(item) == 2:
-            # 如果格式是 ["Ġ", "t"] 这样的列表
-            merges.append(tuple(item))
-        else:
-            # 未知格式，跳过
-            continue
-
-    # 删除临时文件
-    Path(temp_path).unlink(missing_ok=True)
+        # 提取 merges 原始数据
+        merges_raw = data.get('model', {}).get('merges', [])
+        
+        # 转换为统一的二元组列表 (token1, token2)
+        merges = []
+        for item in merges_raw:
+            if isinstance(item, str):
+                # 如果格式是 "Ġ t" 这样的字符串，按空格拆分为两个 token
+                parts = item.split()
+                if len(parts) == 2:
+                    merges.append(tuple(parts))
+            elif isinstance(item, list) and len(item) == 2:
+                # 如果格式是 ["Ġ", "t"] 这样的列表
+                merges.append(tuple(item))
+            else:
+                # 未知格式，跳过
+                continue
+    finally:
+        os.unlink(temp_path)
 
     # 构建 token 字符串到 ID 的映射
     vocab_str_to_id = tokenizer.get_vocab()

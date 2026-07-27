@@ -14,12 +14,12 @@ from tkinter import ttk, filedialog, messagebox
 from pathlib import Path
 
 # ── 常量 ──────────────────────────────────────────────
-BUILD_DIR = Path(__file__).parent / "build"
+BUILD_DIR = Path(__file__).parent.parent / "build"
 _EXE_SUFFIX = ".exe" if sys.platform == "win32" else ""
-TRAIN_EXE = BUILD_DIR / f"mnist_train{_EXE_SUFFIX}"
-INFER_EXE = BUILD_DIR / f"mnist_infer{_EXE_SUFFIX}"
-TEXT_TRAIN_EXE = BUILD_DIR / f"text_train{_EXE_SUFFIX}"
-TEXT_INFER_EXE = BUILD_DIR / f"text_infer{_EXE_SUFFIX}"
+TRAIN_EXE = BUILD_DIR / "examples" / "mnist" / f"mnist_train{_EXE_SUFFIX}"
+INFER_EXE = BUILD_DIR / "examples" / "mnist" / f"mnist_infer{_EXE_SUFFIX}"
+TEXT_TRAIN_EXE = BUILD_DIR / "examples" / "gpt" / f"gpt_train{_EXE_SUFFIX}"
+TEXT_INFER_EXE = BUILD_DIR / "examples" / "gpt" / f"gpt_infer{_EXE_SUFFIX}"
 DEFAULT_MODEL = Path(__file__).parent / "pretrained" / "model.bin"
 DEFAULT_GPT_MODEL = Path(__file__).parent / "gpt_model.bin"
 DEFAULT_DATASET = Path(__file__).parent / "datasets" / "mnist_data"
@@ -384,6 +384,8 @@ class NeuralNetGUI(tk.Tk):
     def _paint_at(self, cx, cy):
         """在画板 (cx, cy) 处绘制笔触"""
         r = self._brush_radius
+        sigma = r / 2.0
+        two_sigma_sq = 2 * sigma * sigma
         for dy in range(-r, r + 1):
             for dx in range(-r, r + 1):
                 dist_sq = dx * dx + dy * dy
@@ -391,9 +393,7 @@ class NeuralNetGUI(tk.Tk):
                     continue
                 px, py = cx + dx, cy + dy
                 if 0 <= px < self._draw_size and 0 <= py < self._draw_size:
-                    dist = math.sqrt(dist_sq)
-                    sigma = r / 2.0
-                    intensity = math.exp(-dist_sq / (2 * sigma * sigma))
+                    intensity = math.exp(-dist_sq / two_sigma_sq)
                     idx = py * self._draw_size + px
                     self._draw_pixels[idx] = max(self._draw_pixels[idx], intensity)
         self._draw_canvas.create_oval(cx - r, cy - r, cx + r, cy + r,
@@ -908,7 +908,7 @@ class NeuralNetGUI(tk.Tk):
             except subprocess.TimeoutExpired:
                 self.after(0, lambda: self._log_text_infer("错误: 生成超时\n"))
             except Exception as e:
-                self.after(0, lambda: self._log_text_infer(f"错误: {e}\n"))
+                self.after(0, lambda err=e: self._log_text_infer(f"错误: {err}\n"))
             finally:
                 self.after(0, lambda: self.text_infer_start_btn.config(state="normal"))
 
@@ -1053,7 +1053,7 @@ class NeuralNetGUI(tk.Tk):
         except FileNotFoundError:
             self.after(0, lambda: log_fn("错误: 可执行文件未找到\n"))
         except Exception as e:
-            self.after(0, lambda: log_fn(f"错误: {e}\n"))
+            self.after(0, lambda err=e: log_fn(f"错误: {err}\n"))
         finally:
             self._process = None
             self.after(0, done_fn)

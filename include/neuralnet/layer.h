@@ -1673,6 +1673,9 @@ namespace nn
                 Matrix x(d_model_, sl);
                 for (std::size_t t = 0; t < sl; ++t)
                 {
+                    if (t >= seq_len_)
+                        throw std::invalid_argument("GPTModel forward: sequence length exceeds seq_len_");
+
                     auto token_id = static_cast<std::size_t>(input.at_unchecked(t, b));
                     if (token_id >= vocab_size_)
                         token_id = 0;
@@ -1680,7 +1683,7 @@ namespace nn
 
                     for (std::size_t d = 0; d < d_model_; ++d)
                     {
-                        double pe = (t < seq_len_) ? pos_emb_.at_unchecked(t, d) : 0.0;
+                        double pe = pos_emb_.at_unchecked(t, d);
                         x.set_value_unchecked(d, t,
                             token_emb_.at_unchecked(token_id, d) + pe);
                     }

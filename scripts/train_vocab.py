@@ -3,12 +3,12 @@
 
 词表构成:
   ID 0-2:    <unk> <pad> <num>
-  ID 3-130:  128 个 ASCII 字符
-  ID 131+:   高频词（按词频降序）
+  ID 3-N:    高频词（按词频降序）
+  ID N+1...: 128 个 ASCII 字符
 
 用法:
-  python train_vocab.py dataset.txt --vocab-size 10000
-  python train_vocab.py dataset.txt --vocab-size 5000 --output my_vocab.json
+  python train_vocab.py dataset.txt
+  python train_vocab.py dataset.txt --output my_vocab.json
 """
 
 import argparse
@@ -44,11 +44,11 @@ def main():
         if chr(i) not in vocab:
             vocab[chr(i)] = len(vocab)
 
-    word_count = len(freq)
-    ascii_count = len(vocab) - 3 - word_count
+    word_count = ascii_start - 3
+    ascii_count = len(vocab) - ascii_start
     print(f"词表大小: {len(vocab):,} (特殊3 + 词{word_count:,} + ASCII补缺{ascii_count})")
     print(f"ASCII 起始 ID: {ascii_start}")
-    print(f"覆盖语料中 100% 的词，不会产生 <unk>")
+    print("覆盖语料中 100% 的词，不会产生 <unk>")
 
     # 保存
     output = {

@@ -45,7 +45,7 @@ neuralnet.cpp/
 │   ├── CMakeLists.txt
 │   ├── test_gpt.cpp                  # GPT 模型组件测试
 │   ├── test_tokenizer.cpp            # 分词器组件测试
-│   └── test_nn.cpp                   # 基础网络 CTest 用例
+│   └── test_tensor.cpp               # 基础网络 CTest 用例
 ├── scripts/
 │   └── *.py                          # 数据下载、词表训练等辅助工具
 └── data/
@@ -66,7 +66,7 @@ build/
 │       ├── gpt_tokenizer_train # 词表训练工具
 │       └── gpt_tokenizer_infer # 分词器调试工具
 └── tests/
-    ├── test_nn                # 基础测试
+    ├── test_tensor                # 基础测试
     ├── test_gpt               # GPT 测试
     └── test_tokenizer         # 分词器测试
 ```
@@ -122,7 +122,7 @@ python save_dataset.py
 ### 验证安装
 
 ```bash
-ctest --test-dir build --output-on-failure       # 跑全部 67 个测试
+ctest --test-dir build --output-on-failure       # 跑全部测试
 cmake --install build --prefix /tmp/nn-test      # 装到临时目录验证 install 流程
 ls /tmp/nn-test/bin 2>&1                         # 应当 "No such file or directory"（demos 不安装）
 ```
@@ -206,7 +206,7 @@ int main() {
 
 | 选项 | 默认 | 说明 |
 |------|------|------|
-| `BUILD_TESTING` | `${PROJECT_IS_TOP_LEVEL}` | 关闭后不构建 `test_nn` 也不注册 CTest |
+| `BUILD_TESTING` | `${PROJECT_IS_TOP_LEVEL}` | 关闭后不构建测试程序也不注册 CTest |
 | `BUILD_EXAMPLES` | ON | 关闭后不构建 `examples/mnist/` 下的 demo 程序（不影响库本身） |
 | `ENABLE_ASAN` | OFF | 启用 AddressSanitizer（必须搭配 Debug 或 RelWithDebInfo，不能与 Release 同用） |
 | `ENABLE_UBSAN` | OFF | 启用 UndefinedBehaviorSanitizer（同上） |
@@ -251,10 +251,10 @@ Linear(784, 64) → BatchNorm1d(64) → ReLU
 
 ### 测试覆盖
 
-**67 个 CTest**（矩阵与基础层 18 + BatchNorm 13 + DataLoader 4 + grad_clip 4 + summary 3 + 其余 25）：
+**CTest 用例**：
 
 ```bash
-ctest --test-dir build --output-on-failure       # 跑全部 67 个测试
+ctest --test-dir build --output-on-failure       # 跑全部测试
 ```
 
 ## 提供的组件
@@ -282,7 +282,7 @@ ctest --test-dir build --output-on-failure       # 跑全部 67 个测试
 | `nn::BatchNorm1d` | 输入 `(num_features, batch)`；可选 affine；持久化 running stats（v2） |
 | `nn::BatchNorm2d` | 复用 `BatchNorm1d`（视 `(C, N*H*W)` 为 `(C, batch)`）；仅 `name()` 差异 |
 | `nn::LayerNorm` | 层归一化，支持 `(features, batch_size)` 输入 |
-| `nn::CausalSelfAttention`| 带因果掩码的多头自注意力机制（Q, K, V 映射） |
+| `nn::MultiHeadAttention`| 带因果掩码的多头自注意力机制（Q, K, V 映射） |
 | `nn::GPTBlock` | 前置归一化架构的 GPT 解码器块 |
 | `nn::GPTModel` | 完整的 GPT 语言模型实现，内置 `generate()` 生成接口 |
 

@@ -13,7 +13,7 @@ cmake --build build
 cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Debug -DENABLE_ASAN=ON -DENABLE_UBSAN=ON
 cmake --build build
 
-# Run all tests (67 nn + 23 transformer)
+# Run all tests
 ctest --test-dir build --output-on-failure
 
 # Run a single test by name
@@ -54,7 +54,7 @@ This is a header-only C++17 neural network library. All code lives in `include/n
 - `model/io.h` — Binary serialization (v1/v2 format, v1 backward-compatible)
 - `nn/nn.h` — Aggregate header that includes everything
 
-**Transformer components** (partially ported from upstream): LayerNorm, Softmax, PositionalEncoding, MultiHeadAttention, FeedForward, TransformerEncoderLayer, TransformerEncoder, PatchEmbedding. GPT/decoder components are documented in `GPT_MIGRATION.md` but not yet implemented.
+**Transformer components**: LayerNorm, Softmax, PositionalEncoding, MultiHeadAttention, FeedForward, GPTBlock, GPTModel, PatchEmbedding.
 
 **Test structure**: Tests use `<cassert>` (not a framework). Each test is a named function in `test_nn.cpp` or `test_transformer.cpp`, dispatched by name via command-line argument. The CMake config forces `-UNDEBUG` so assertions remain active even in Release builds.
 

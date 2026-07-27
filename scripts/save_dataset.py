@@ -9,7 +9,7 @@ def export_to_csv(dataset, filename):
         writer = csv.writer(f)
         for img, label in dataset:
             # 将图像展平为列表，像素值已是 float 0~1
-            pixels = img.view(-1).tolist()
+            pixels = [round(p, 4) for p in img.view(-1).tolist()]
             writer.writerow([label] + pixels)
 
 def main():

@@ -50,8 +50,15 @@ def download_book(url: str, filename: str) -> str | None:
         with urllib.request.urlopen(req, timeout=30) as resp:
             raw = resp.read().decode("utf-8", errors="replace")
         cleaned = strip_gutenberg(raw)
-        with open(filepath, "w", encoding="utf-8") as f:
-            f.write(cleaned)
+        tmp_filepath = filepath + ".tmp"
+        try:
+            with open(tmp_filepath, "w", encoding="utf-8") as f:
+                f.write(cleaned)
+            os.replace(tmp_filepath, filepath)
+        except Exception:
+            if os.path.exists(tmp_filepath):
+                os.remove(tmp_filepath)
+            raise
         return cleaned
     except Exception as e:
         print(f"  [失败] {filename}: {e}")

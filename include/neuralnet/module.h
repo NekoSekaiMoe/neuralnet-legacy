@@ -5,6 +5,8 @@
 #include <memory>
 #include <string>
 #include <stdexcept>
+#include <cmath>
+#include <random>
 #include <neuralnet/tensor.h>
 
 namespace nn
@@ -92,17 +94,17 @@ namespace nn
         bool bias_;
         Tensor weight_;
         Tensor b_;
+        inline static thread_local std::mt19937_64 rng_{std::random_device{}()};
 
     public:
         LinearModule(std::size_t in_features, std::size_t out_features, bool bias = true)
             : in_features_(in_features), out_features_(out_features), bias_(bias)
         {
             double limit = std::sqrt(6.0 / static_cast<double>(in_features + out_features));
-            std::mt19937_64 rng(42);
             std::uniform_real_distribution<double> dist(-limit, limit);
             
             Matrix w_mat(out_features, in_features);
-            for(auto& val : w_mat.data()) val = dist(rng);
+            for(auto& val : w_mat.data()) val = dist(rng_);
             weight_ = Tensor(w_mat, true);
 
             if (bias_) {
@@ -294,38 +296,67 @@ namespace nn
             }
 
             Tensor normalized_tensor(normalized, input.requires_grad());
-            if (input.requires_grad() && is_training_) {
+            if (input.requires_grad()) {
                 normalized_tensor.node()->children.push_back(input.node());
                 auto in_node = input.node();
-                normalized_tensor.node()->backward_op = [out_w = std::weak_ptr<TensorNode>(normalized_tensor.node()),
-                                                         in_w = std::weak_ptr<TensorNode>(in_node),
-                                                         batch_var, eps = eps_, num_features = num_features_, batch_size,
-                                                         normalized]() {
-                    auto out = out_w.lock();
-                    auto in = in_w.lock();
-                    if (!out || !out->grad || !in || !in->requires_grad) return;
-                    Matrix a_grad = *(out->grad);
-                    Matrix dx(num_features, batch_size);
-                    double scale = 1.0 / batch_size;
-                    
-                    for (std::size_t i = 0; i < num_features; ++i) {
-                        double sd = 0.0;
-                        double sdx = 0.0;
-                        for (std::size_t j = 0; j < batch_size; ++j) {
-                            double g = a_grad.at_unchecked(i, j);
-                            double nx = normalized.at_unchecked(i, j);
-                            sd += g;
-                            sdx += g * nx;
+                if (is_training_) {
+                    normalized_tensor.node()->backward_op = [out_w = std::weak_ptr<TensorNode>(normalized_tensor.node()),
+                                                             in_w = std::weak_ptr<TensorNode>(in_node),
+                                                             batch_var, eps = eps_, num_features = num_features_, batch_size,
+                                                             normalized]() {
+                        auto out = out_w.lock();
+                        auto in = in_w.lock();
+                        if (!out || !out->grad || !in || !in->requires_grad) return;
+                        Matrix a_grad = *(out->grad);
+                        Matrix dx_hat(num_features, batch_size);
+                        for (std::size_t i = 0; i < num_features; ++i) {
+                            for (std::size_t j = 0; j < batch_size; ++j) {
+                                dx_hat.set_value_unchecked(i, j, a_grad.at_unchecked(i, j));
+                            }
                         }
-                        double std_inv = 1.0 / std::sqrt(batch_var.at_unchecked(i, 0) + eps);
-                        for (std::size_t j = 0; j < batch_size; ++j) {
-                            double g = a_grad.at_unchecked(i, j);
-                            double nx = normalized.at_unchecked(i, j);
-                            dx.set_value_unchecked(i, j, scale * (batch_size * g - sd - nx * sdx) * std_inv);
+                        std::vector<double> sum_dxhat(num_features, 0.0);
+                        std::vector<double> sum_dxhat_xhat(num_features, 0.0);
+                        std::vector<double> std_inv(num_features, 0.0);
+                        for (std::size_t i = 0; i < num_features; ++i) {
+                            double sd = 0.0;
+                            double sdx = 0.0;
+                            for (std::size_t j = 0; j < batch_size; ++j) {
+                                sd += dx_hat.at_unchecked(i, j);
+                                sdx += dx_hat.at_unchecked(i, j) * normalized.at_unchecked(i, j);
+                            }
+                            sum_dxhat[i] = sd;
+                            sum_dxhat_xhat[i] = sdx;
+                            std_inv[i] = 1.0 / std::sqrt(batch_var.at_unchecked(i, 0) + eps);
                         }
-                    }
-                    in->accumulate_grad(dx);
-                };
+                        const double scale = 1.0 / static_cast<double>(batch_size);
+                        const double N = static_cast<double>(batch_size);
+                        Matrix dx(num_features, batch_size);
+                        for (std::size_t i = 0; i < num_features; ++i) {
+                            for (std::size_t j = 0; j < batch_size; ++j) {
+                                dx.set_value_unchecked(i, j, scale * (N * dx_hat.at_unchecked(i, j) - sum_dxhat[i] - normalized.at_unchecked(i, j) * sum_dxhat_xhat[i]) * std_inv[i]);
+                            }
+                        }
+                        in->accumulate_grad(dx);
+                    };
+                } else {
+                    normalized_tensor.node()->backward_op = [out_w = std::weak_ptr<TensorNode>(normalized_tensor.node()),
+                                                             in_w = std::weak_ptr<TensorNode>(in_node),
+                                                             running_var = running_var_, eps = eps_, num_features = num_features_, batch_size]() {
+                        auto out = out_w.lock();
+                        auto in = in_w.lock();
+                        if (!out || !out->grad || !in || !in->requires_grad) return;
+                        Matrix a_grad = *(out->grad);
+                        Matrix dx(num_features, batch_size);
+                        for (std::size_t i = 0; i < num_features; ++i) {
+                            double std_inv = 1.0 / std::sqrt(running_var.at_unchecked(i, 0) + eps);
+                            for (std::size_t j = 0; j < batch_size; ++j) {
+                                double g = a_grad.at_unchecked(i, j);
+                                dx.set_value_unchecked(i, j, g * std_inv);
+                            }
+                        }
+                        in->accumulate_grad(dx);
+                    };
+                }
             }
 
             if (!affine_) return normalized_tensor;

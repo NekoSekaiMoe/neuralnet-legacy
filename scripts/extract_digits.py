@@ -13,12 +13,16 @@ def extract_digits(test_csv_path, output_dir):
     # 按标签统计，用于文件命名
     label_counts = {}
 
-    with open(test_csv_path, 'r') as f:
+    with open(test_csv_path, 'r', newline='', encoding='utf-8') as f:
         reader = csv.reader(f)
         for row in reader:
             if not row:
                 continue
-            label = row[0]
+            try:
+                label_val = int(row[0])
+            except ValueError:
+                continue
+            label = str(label_val)
             pixels = row[1:]  # 784 个像素值
 
             # 为每个标签创建子文件夹
@@ -32,7 +36,7 @@ def extract_digits(test_csv_path, output_dir):
 
             # 写入 digit CSV
             digit_path = os.path.join(label_dir, f"digit_{label_counts[label]:04d}.csv")
-            with open(digit_path, 'w', newline='') as out:
+            with open(digit_path, 'w', newline='', encoding='utf-8') as out:
                 writer = csv.writer(out)
                 writer.writerow(pixels)
 

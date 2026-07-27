@@ -18,7 +18,7 @@ V2_MAX_LEN = 24              # 缩小范围，减少循环
 MIN_FREQ = 2
 SKIP_RATIO = 1.2
 AFFIX_PROTECT_RATIO = 0.4
-MAX_V2_SCAN_BYTES = 50_000_000  # 从 2MB 降至 300KB
+MAX_V2_SCAN_BYTES = 300_000  # 从 2MB 降至 300KB
 
 PAT_EN = re.compile(
     r"""'s|'t|'re|'ve|'m|'ll|'d| ?[a-zA-Z]+| ?[0-9]+|[^\s\w]+|\s+""",
@@ -31,10 +31,31 @@ def pre_tokenize_chunks(text: str) -> list[bytes]:
 # ── V1 扫描 ──────────────────────────────────────────────
 def scan_v1(text: str, max_len: int):
     chunks = pre_tokenize_chunks(text)
+    # 限制处理的 chunk 数量，以降低内存占用
+    MAX_CHUNKS = 10_000_000
+    if len(chunks) > MAX_CHUNKS:
+        chunks = chunks[:MAX_CHUNKS]
+
     freq = Counter()
+    # 先只统计频次
+    for chunk in chunks:
+        L = len(chunk)
+        if L < 2:
+            continue
+        for start in range(L):
+            max_end = min(start + max_len, L)
+            if start + 2 > max_end:
+                break
+            for end in range(start + 2, max_end + 1):
+                freq[bytes(chunk[start:end])] += 1
+
+    # 修剪低频子串
+    freq = Counter({sub: count for sub, count in freq.items() if count >= MIN_FREQ})
+    
     left_ctx = defaultdict(set)
     right_ctx = defaultdict(set)
-
+    
+    # 再次遍历，仅保留剩余子串的上下文
     for chunk in chunks:
         L = len(chunk)
         if L < 2:
@@ -45,15 +66,16 @@ def scan_v1(text: str, max_len: int):
                 break
             for end in range(start + 2, max_end + 1):
                 sub = bytes(chunk[start:end])
-                freq[sub] += 1
-                if start > 0:
-                    left_ctx[sub].add(chunk[start-1])
-                else:
-                    left_ctx[sub].add(None)
-                if end < L:
-                    right_ctx[sub].add(chunk[end])
-                else:
-                    right_ctx[sub].add(None)
+                if sub in freq:
+                    if start > 0:
+                        left_ctx[sub].add(chunk[start-1])
+                    else:
+                        left_ctx[sub].add(None)
+                    if end < L:
+                        right_ctx[sub].add(chunk[end])
+                    else:
+                        right_ctx[sub].add(None)
+
     return freq, left_ctx, right_ctx
 
 def is_affix(sub: bytes, left_ctx: dict, right_ctx: dict):
@@ -157,8 +179,9 @@ def build_v2_from_spans(spans, max_len, max_items):
     # 采样
     if total_bytes > MAX_V2_SCAN_BYTES:
         sampled = bytearray()
-        random.shuffle(spans)
-        for span in spans:
+        spans_copy = list(spans)
+        random.shuffle(spans_copy)
+        for span in spans_copy:
             if len(sampled) >= MAX_V2_SCAN_BYTES:
                 break
             remaining = MAX_V2_SCAN_BYTES - len(sampled)
@@ -265,7 +288,7 @@ def main():
         "byte_offset": BYTE_OFFSET,
         "special_tokens": SPECIAL_TOKENS,
     }
-    Path(args.output).write_text(json.dumps(data, indent=2))
+    Path(args.output).write_text(json.dumps(data, indent=2), encoding="utf-8")
     print(f"保存至: {args.output}")
 
 if __name__ == "__main__":

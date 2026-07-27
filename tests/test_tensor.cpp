@@ -17,9 +17,6 @@ void test_tensor_add() {
 
     assert(t3.data().at(0, 0) == 4);
     assert(t3.data().at(1, 1) == 6);
-
-    std::cout << "t3(0,0): " << t3.data().at(0, 0) << "\n";
-    std::cout << "t1 grad(0,0): " << t1.grad().at(0, 0) << "\n";
     assert(t1.grad().at(0, 0) == 1);
     assert(t1.grad().at(1, 1) == 1);
     assert(t2.grad().at(0, 0) == 1);
@@ -114,20 +111,35 @@ void test_tensor_linear() {
     std::cout << "test_tensor_linear passed\n";
 }
 
+struct TestEntry {
+    const char* name;
+    void (*fn)();
+};
+
+TestEntry tests[] = {
+    {"tensor_add", test_tensor_add},
+    {"tensor_matmul", test_tensor_matmul},
+    {"tensor_relu", test_tensor_relu},
+    {"tensor_linear", test_tensor_linear}
+};
+
 int main(int argc, char** argv) {
     if (argc < 2) {
-        std::cerr << "Usage: test_tensor <test_name>\n";
-        return 1;
+        std::size_t passed = 0;
+        for (const auto& t : tests) {
+            try { t.fn(); ++passed; std::cout << "  PASSED  " << t.name << "\n"; }
+            catch (const std::exception& e) { std::cout << "  FAILED  " << t.name << " : " << e.what() << "\n"; }
+        }
+        std::cout << passed << "/" << (sizeof(tests)/sizeof(tests[0])) << " passed\n";
+        return passed == sizeof(tests)/sizeof(tests[0]) ? 0 : 1;
     }
     std::string test_name = argv[1];
-    
-    if (test_name == "tensor_add") test_tensor_add();
-    else if (test_name == "tensor_matmul") test_tensor_matmul();
-    else if (test_name == "tensor_relu") test_tensor_relu();
-    else if (test_name == "tensor_linear") test_tensor_linear();
-    else {
-        std::cerr << "Unknown test: " << test_name << "\n";
-        return 1;
+    for (const auto& t : tests) {
+        if (test_name == t.name) {
+            try { t.fn(); std::cout << "  PASSED  " << t.name << "\n"; return 0; }
+            catch (const std::exception& e) { std::cout << "  FAILED  " << t.name << " : " << e.what() << "\n"; return 1; }
+        }
     }
-    return 0;
+    std::cerr << "Unknown test: " << test_name << "\n";
+    return 1;
 }

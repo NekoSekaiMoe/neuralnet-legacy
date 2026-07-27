@@ -35,18 +35,18 @@ def bpe_text_to_bytes_chunks(text: str) -> list[list[int]]:
     return chunks
 
 
-def encode_bpe(text: str, merges: list[tuple[int, int, int]]) -> list[int]:
+def encode_bpe(text: str, merges: list[tuple[int, int, int]], byte_to_id: dict[int, int]) -> list[int]:
     """BPE 编码：基于合并规则，按优先级逐步合并"""
     chunks = bpe_text_to_bytes_chunks(text)
 
     # 构建合并优先级表
     merge_priority = {}
-    for idx, (a, b, new_id) in enumerate(merges):
-        merge_priority[(a, b)] = idx
+    for a, b, new_id in merges:
+        merge_priority[(a, b)] = new_id
 
     all_ids = []
     for chunk in chunks:
-        ids = chunk[:]
+        ids = [byte_to_id.get(b, b) for b in chunk]
         while len(ids) >= 2:
             best_idx = None
             best_priority = float("inf")
@@ -57,7 +57,7 @@ def encode_bpe(text: str, merges: list[tuple[int, int, int]]) -> list[int]:
                     best_idx = i
             if best_idx is None:
                 break
-            new_id = merges[best_priority][2]
+            new_id = best_priority
             ids = ids[:best_idx] + [new_id] + ids[best_idx + 2:]
         all_ids.extend(ids)
     return all_ids
@@ -90,7 +90,8 @@ def encode_auto(text: str, tokenizer_data: dict, max_len: int = 16) -> list[int]
     vocab = tokenizer_data['vocab']
     if is_bpe(tokenizer_data):
         merges = [tuple(m) for m in tokenizer_data['merges']]
-        return encode_bpe(text, merges)
+        byte_to_id = {bs[0]: tid for tid, bs in enumerate(vocab) if bs and len(bs) == 1}
+        return encode_bpe(text, merges, byte_to_id)
     else:
         lookup = build_lookup(vocab)
         return encode_fast(text, lookup, max_len)
@@ -129,7 +130,7 @@ def encode_fast(text: str, lookup: dict, max_len: int = 16) -> list[int]:
     return ids
 
 
-def evaluate(text: str, tokenizer_data: dict, max_len: int = None) -> dict:
+def evaluate(text: str, tokenizer_data: dict, max_len: int | None = None) -> dict:
     """
     计算各项评估指标。
     若 max_len 为 None，自动取词表中最长 token 的长度。
@@ -215,10 +216,7 @@ def main():
         sample_tokens = [vocab[tid] if tid < len(vocab) else b'?' for tid in sample_ids]
         print("\n示例 Token（前20个）：")
         for i, (tid, token_bytes) in enumerate(zip(sample_ids, sample_tokens)):
-            try:
-                token_str = token_bytes.decode('utf-8', errors='replace')
-            except:
-                token_str = repr(token_bytes)
+            token_str = token_bytes.decode('utf-8', errors='replace')
             print(f"  {i:2d}: ID {tid:3d}  ->  {token_str}")
 
 

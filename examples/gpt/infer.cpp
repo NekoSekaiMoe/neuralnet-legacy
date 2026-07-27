@@ -74,16 +74,31 @@ InferConfig parse_args(int argc, char *argv[])
             cfg.temperature = std::stod(argv[++i]);
         else if (arg == "--show-tokens")
             cfg.show_tokens = true;
-        else if (arg == "--d-model" && i + 1 < argc)
-            cfg.d_model = static_cast<std::size_t>(std::stoi(argv[++i]));
-        else if (arg == "--num-heads" && i + 1 < argc)
-            cfg.num_heads = static_cast<std::size_t>(std::stoi(argv[++i]));
-        else if (arg == "--num-layers" && i + 1 < argc)
-            cfg.num_layers = static_cast<std::size_t>(std::stoi(argv[++i]));
-        else if (arg == "--d-ff" && i + 1 < argc)
-            cfg.d_ff = static_cast<std::size_t>(std::stoi(argv[++i]));
-        else if (arg == "--seq-len" && i + 1 < argc)
-            cfg.seq_len = static_cast<std::size_t>(std::stoi(argv[++i]));
+        else if (arg == "--d-model" && i + 1 < argc) {
+            int val = std::stoi(argv[++i]);
+            if (val <= 0) { std::cerr << "错误: --d-model 必须大于 0\n"; std::exit(1); }
+            cfg.d_model = static_cast<std::size_t>(val);
+        }
+        else if (arg == "--num-heads" && i + 1 < argc) {
+            int val = std::stoi(argv[++i]);
+            if (val <= 0) { std::cerr << "错误: --num-heads 必须大于 0\n"; std::exit(1); }
+            cfg.num_heads = static_cast<std::size_t>(val);
+        }
+        else if (arg == "--num-layers" && i + 1 < argc) {
+            int val = std::stoi(argv[++i]);
+            if (val <= 0) { std::cerr << "错误: --num-layers 必须大于 0\n"; std::exit(1); }
+            cfg.num_layers = static_cast<std::size_t>(val);
+        }
+        else if (arg == "--d-ff" && i + 1 < argc) {
+            int val = std::stoi(argv[++i]);
+            if (val <= 0) { std::cerr << "错误: --d-ff 必须大于 0\n"; std::exit(1); }
+            cfg.d_ff = static_cast<std::size_t>(val);
+        }
+        else if (arg == "--seq-len" && i + 1 < argc) {
+            int val = std::stoi(argv[++i]);
+            if (val <= 0) { std::cerr << "错误: --seq-len 必须大于 0\n"; std::exit(1); }
+            cfg.seq_len = static_cast<std::size_t>(val);
+        }
         else if (!(arg.size() >= 2 && arg.substr(0, 2) == "--"))
             cfg.prompt = arg;
         else

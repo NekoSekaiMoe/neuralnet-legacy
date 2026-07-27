@@ -1,26 +1,28 @@
+import argparse
 import numpy as np
 from PIL import Image
 
-# 读取 CSV 文件（假设数据在一行内，以逗号分隔）
-csv_file = "./build/digit.csv"
-with open(csv_file, "r") as f:
-    data = f.read().strip().split(",")
+def main():
+    parser = argparse.ArgumentParser(description="Convert CSV pixel data to PNG image.")
+    parser.add_argument("--input", default="./build/digit.csv", help="Input CSV file")
+    parser.add_argument("--output", default="./build/output.png", help="Output PNG file")
+    args = parser.parse_args()
 
-# 转换为浮点数数组
-pixels = np.array(data, dtype=np.float32)
+    with open(args.input, "r") as f:
+        data = f.read().strip().split(",")
 
-# 检查像素数量是否为 784 (28x28)
-if pixels.size != 784:
-    raise ValueError(f"像素数量错误，期望 784，实际 {pixels.size}")
+    pixels = np.array(data, dtype=np.float32)
 
-# 重塑为 28x28 矩阵
-img_array = pixels.reshape(28, 28)
+    if pixels.size != 784:
+        raise ValueError(f"像素数量错误，期望 784，实际 {pixels.size}")
 
-# 将像素值从 [0,1] 范围映射到 [0,255] 并转换为 uint8
-img_array = (img_array * 255).astype(np.uint8)
+    img_array = pixels.reshape(28, 28)
+    img_array = (img_array * 255).astype(np.uint8)
 
-# 创建图像并保存
-img = Image.fromarray(img_array, mode="L")  # "L" 表示灰度图
-img.save("./build/output.png")
+    img = Image.fromarray(img_array, mode="L")
+    img.save(args.output)
 
-print("图片已保存为 output.png")
+    print(f"图片已保存为 {args.output}")
+
+if __name__ == "__main__":
+    main()

@@ -7,6 +7,8 @@
 #include <optional>
 #include <stdexcept>
 #include <unordered_set>
+#include <cmath>
+#include <random>
 
 namespace nn {
 
@@ -106,31 +108,43 @@ public:
         if (!node_->requires_grad) return;
         
         // 自动将起始梯度置为 1
-        if (!node_->grad) {
-            node_->grad = Matrix(rows(), cols());
-            auto& span = node_->grad->data();
-            for (std::size_t i = 0; i < node_->grad->size(); ++i) {
-                span[i] = 1.0;
-            }
+        // 注意：TensorNode构造函数可能会把grad初始化为0，因此这里直接覆盖为1.0
+        node_->grad = Matrix(rows(), cols());
+        auto& span = node_->grad->data();
+        for (std::size_t i = 0; i < node_->grad->size(); ++i) {
+            span[i] = 1.0;
         }
 
         // 拓扑排序
         std::vector<std::shared_ptr<TensorNode>> topo;
         std::unordered_set<TensorNode*> visited;
         
-        std::function<void(std::shared_ptr<TensorNode>)> build_topo = 
-            [&](std::shared_ptr<TensorNode> v) {
-                if (!v) return;
-                if (visited.find(v.get()) == visited.end()) {
-                    visited.insert(v.get());
-                    for (auto& child : v->children) {
-                        build_topo(child);
+        std::vector<std::shared_ptr<TensorNode>> stack;
+        std::unordered_set<TensorNode*> expanded;
+        stack.push_back(node_);
+        while (!stack.empty()) {
+            auto v = stack.back();
+            if (!v) {
+                stack.pop_back();
+                continue;
+            }
+            if (expanded.find(v.get()) != expanded.end()) {
+                stack.pop_back();
+                continue;
+            }
+            if (visited.find(v.get()) == visited.end()) {
+                visited.insert(v.get());
+                for (auto it = v->children.rbegin(); it != v->children.rend(); ++it) {
+                    if (*it && visited.find((*it).get()) == visited.end()) {
+                        stack.push_back(*it);
                     }
-                    topo.push_back(v);
                 }
-            };
-            
-        build_topo(node_);
+            } else {
+                stack.pop_back();
+                expanded.insert(v.get());
+                topo.push_back(v);
+            }
+        }
         
         // 反向执行
         for (auto it = topo.rbegin(); it != topo.rend(); ++it) {
@@ -163,10 +177,8 @@ inline Tensor add(const Tensor& a, const Tensor& b) {
             auto in1 = in1_w.lock();
             auto in2 = in2_w.lock();
             if (out && out->grad) {
-                std::cout << "out->grad(0,0): " << out->grad->at(0,0) << "\n";
                 if (in1 && in1->requires_grad) {
                     in1->accumulate_grad(*(out->grad));
-                    std::cout << "in1->grad(0,0) after: " << in1->grad->at(0,0) << "\n";
                 }
                 if (in2 && in2->requires_grad) in2->accumulate_grad(*(out->grad));
             }
@@ -291,22 +303,24 @@ inline Tensor relu(const Tensor& a) {
 
 // Linear: W * x + b
 inline Tensor linear(const Tensor& x, const Tensor& weight, const Tensor& bias) {
-    bool req_grad = x.requires_grad() || weight.requires_grad() || bias.requires_grad();
+    bool req_grad = x.requires_grad() || weight.requires_grad() || (bias.node() && bias.requires_grad());
     Matrix out_data = weight.data() * x.data();
     const std::size_t cols = out_data.cols();
+    const std::size_t rows = out_data.rows();
     auto& out_span = out_data.data();
-    auto& b_span = bias.data().data();
-    for (std::size_t r = 0; r < out_data.rows(); ++r) {
-        double b_val = b_span[r];
-        for (std::size_t c = 0; c < cols; ++c) {
-            out_span[r * cols + c] += b_val;
+    if (bias.node()) {
+        auto& b_span = bias.data().data();
+        for (std::size_t r = 0; r < rows; ++r) {
+            for (std::size_t c = 0; c < cols; ++c) {
+                out_span[r * cols + c] += b_span[r];
+            }
         }
     }
     auto out_node = std::make_shared<TensorNode>(out_data, req_grad, false);
     if (req_grad) {
         out_node->children.push_back(x.node());
         out_node->children.push_back(weight.node());
-        out_node->children.push_back(bias.node());
+        if (bias.node()) out_node->children.push_back(bias.node());
         auto x_node = x.node();
         auto w_node = weight.node();
         auto b_node = bias.node();
@@ -569,7 +583,7 @@ inline Tensor batchnorm1d(const Tensor& input, const Tensor& gamma, const Tensor
     auto& norm_span = normalized.data();
     
     for (std::size_t idx = 0; idx < input.data().size(); ++idx) {
-        std::size_t i = idx / batch_size;
+        std::size_t i = idx % num_features;
         double mu = mean_src.at_unchecked(i, 0);
         double norm = (in_span[idx] - mu) * inv_std[i];
         norm_span[idx] = norm;
