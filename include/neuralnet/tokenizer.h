@@ -1,0 +1,835 @@
+#ifndef NEURALNET_TOKENIZER_H
+#define NEURALNET_TOKENIZER_H
+
+#include <algorithm>
+#include <charconv>
+#include <cstddef>
+#include <cstdint>
+#include <cstdlib>
+#include <fstream>
+#include <functional>
+#include <iomanip>
+#include <iostream>
+#include <random>
+#include <sstream>
+#include <stdexcept>
+#include <string>
+#include <string_view>
+#include <unordered_map>
+#include <unordered_set>
+#include <vector>
+
+namespace nn {
+
+inline constexpr std::size_t GPT_VOCAB_SIZE    = 10000;
+inline constexpr std::size_t GPT_D_MODEL       = 128;
+inline constexpr std::size_t GPT_NUM_HEADS     = 4;
+inline constexpr std::size_t GPT_D_FF          = 512;
+inline constexpr std::size_t GPT_NUM_LAYERS    = 4;
+inline constexpr std::size_t GPT_SEQ_LEN       = 256;
+
+namespace internal {
+
+inline std::string parse_json_string(const std::string& content, std::size_t& pos)
+{
+    std::string key;
+    if (pos >= content.size() || content[pos] != '"') return key;
+    ++pos;
+    while (pos < content.size() && content[pos] != '"')
+    {
+        if (content[pos] == '\\' && pos + 1 < content.size())
+        {
+            ++pos;
+            switch (content[pos])
+            {
+                case 'n': key += '\n'; break;
+                case 't': key += '\t'; break;
+                case 'r': key += '\r'; break;
+                case '\\': key += '\\'; break;
+                case '"': key += '"'; break;
+                case 'u':
+                {
+                    if (pos + 4 < content.size())
+                    {
+                        std::string hex = content.substr(pos + 1, 4);
+                        unsigned long cp = std::stoul(hex, nullptr, 16);
+                        if (cp < 0x80) key += static_cast<char>(cp);
+                        else if (cp < 0x800) {
+                            key += static_cast<char>(0xC0 | (cp >> 6));
+                            key += static_cast<char>(0x80 | (cp & 0x3F));
+                        } else {
+                            key += static_cast<char>(0xE0 | (cp >> 12));
+                            key += static_cast<char>(0x80 | ((cp >> 6) & 0x3F));
+                            key += static_cast<char>(0x80 | (cp & 0x3F));
+                        }
+                        pos += 4;
+                    }
+                    break;
+                }
+                default: key += content[pos]; break;
+            }
+        }
+        else
+        {
+            key += content[pos];
+        }
+        ++pos;
+    }
+    if (pos < content.size() && content[pos] == '"') {
+        ++pos;
+    }
+    return key;
+}
+
+} // namespace internal
+
+// ── 字符级词表 ────────────────────────────────────────────────────────────
+class CharTokenizer
+{
+public:
+    [[nodiscard]] std::size_t vocab_size() const noexcept { return GPT_VOCAB_SIZE; }
+
+    [[nodiscard]] std::size_t encode_one(char c) const noexcept
+    {
+        return static_cast<std::size_t>(static_cast<unsigned char>(c)) % GPT_VOCAB_SIZE;
+    }
+
+    [[nodiscard]] std::string decode_one(std::size_t id) const
+    {
+        if (id < 256)
+            return std::string(1, static_cast<char>(id));
+        return "?";
+    }
+
+    [[nodiscard]] std::vector<std::size_t> encode(const std::string &text) const
+    {
+        std::vector<std::size_t> tokens;
+        tokens.reserve(text.size());
+        for (char c : text)
+            tokens.push_back(encode_one(c));
+        return tokens;
+    }
+
+    [[nodiscard]] std::string decode(const std::vector<std::size_t> &tokens) const
+    {
+        std::string result;
+        result.reserve(tokens.size());
+        for (auto id : tokens)
+            result += decode_one(id);
+        return result;
+    }
+};
+
+// ── BPE 分词器 ────────────────────────────────────────────────────────────
+class BPETokenizer
+{
+public:
+    static constexpr std::size_t UNK_ID = 0;
+    static constexpr std::size_t PAD_ID = 1;
+    static constexpr std::size_t NUM_ID = 2;
+
+private:
+    std::vector<std::string> id_to_token_;
+    std::unordered_map<std::string, std::size_t> token_to_id_;
+    std::string vocab_path_;
+
+    [[nodiscard]] static bool is_numeric(const std::string &s) noexcept
+    {
+        if (s.empty()) return false;
+        for (char c : s)
+            if (c < '0' || c > '9') return false;
+        return true;
+    }
+
+    [[nodiscard]] bool is_word_token(std::size_t id) const noexcept
+    {
+        return id < id_to_token_.size() && id_to_token_[id].size() > 1;
+    }
+
+public:
+    BPETokenizer() = default;
+
+    [[nodiscard]] std::size_t vocab_size() const noexcept { return id_to_token_.size(); }
+    [[nodiscard]] const std::string &vocab_path() const noexcept { return vocab_path_; }
+
+    void load_vocab(const std::string &path)
+    {
+        std::ifstream ifs(path);
+        if (!ifs) throw std::runtime_error("Cannot read vocab file: " + path);
+
+        std::string content((std::istreambuf_iterator<char>(ifs)),
+                            std::istreambuf_iterator<char>());
+
+        id_to_token_.clear();
+        token_to_id_.clear();
+
+        auto vocab_pos = content.find("\"vocab\"");
+        if (vocab_pos == std::string::npos)
+            throw std::runtime_error("Invalid vocab JSON: missing \"vocab\" key");
+
+        auto brace_pos = content.find('{', vocab_pos);
+        if (brace_pos == std::string::npos)
+            throw std::runtime_error("Invalid vocab JSON: missing opening brace");
+
+        std::size_t pos = brace_pos + 1;
+        while (pos < content.size())
+        {
+            while (pos < content.size() && (content[pos] == ' ' || content[pos] == '\n' ||
+                   content[pos] == '\r' || content[pos] == '\t' || content[pos] == ','))
+                ++pos;
+            if (pos >= content.size() || content[pos] == '}') break;
+
+            if (content[pos] != '"') { ++pos; continue; }
+            std::string key = internal::parse_json_string(content, pos);
+
+            while (pos < content.size() && (content[pos] == ' ' || content[pos] == ':'))
+                ++pos;
+
+            if (pos < content.size() && content[pos] == '"')
+            {
+                std::string hex_val = internal::parse_json_string(content, pos);
+
+                std::size_t id = static_cast<std::size_t>(std::stoul(key));
+
+                std::string token;
+                for (std::size_t i = 0; i + 1 < hex_val.size(); i += 2)
+                {
+                    unsigned byte = std::stoul(hex_val.substr(i, 2), nullptr, 16);
+                    token += static_cast<char>(byte);
+                }
+
+                if (id >= id_to_token_.size())
+                    id_to_token_.resize(id + 1);
+                id_to_token_[id] = token;
+                token_to_id_[token] = id;
+            }
+            else
+            {
+                std::string val_str;
+                while (pos < content.size() && content[pos] >= '0' && content[pos] <= '9')
+                    val_str += content[pos++];
+                if (val_str.empty()) continue;
+
+                std::size_t id = static_cast<std::size_t>(std::stoul(val_str));
+                if (id >= id_to_token_.size())
+                    id_to_token_.resize(id + 1);
+                id_to_token_[id] = key;
+                token_to_id_[key] = id;
+            }
+        }
+
+        vocab_path_ = path;
+    }
+
+    [[nodiscard]] std::vector<std::size_t> encode(const std::string &text) const
+    {
+        std::vector<std::size_t> tokens;
+        std::istringstream iss(text);
+        std::string word;
+
+        while (iss >> word)
+        {
+            if (is_numeric(word))
+            {
+                tokens.push_back(NUM_ID);
+            }
+            else if (auto it = token_to_id_.find(word); it != token_to_id_.end())
+            {
+                tokens.push_back(it->second);
+            }
+            else
+            {
+                for (char c : word)
+                {
+                    std::string s(1, c);
+                    if (auto cit = token_to_id_.find(s); cit != token_to_id_.end())
+                        tokens.push_back(cit->second);
+                    else
+                        tokens.push_back(UNK_ID);
+                }
+            }
+        }
+        return tokens;
+    }
+
+    [[nodiscard]] std::string decode(const std::vector<std::size_t> &tokens) const
+    {
+        std::string result;
+
+        for (auto id : tokens)
+        {
+            if (id < id_to_token_.size())
+            {
+                if (is_word_token(id))
+                {
+                    if (!result.empty()) result += ' ';
+                    result += id_to_token_[id];
+                }
+                else
+                {
+                    result += id_to_token_[id];
+                }
+            }
+            else
+            {
+                if (!result.empty()) result += ' ';
+                result += "<unk>";
+            }
+        }
+        return result;
+    }
+};
+
+// ── ByteZipTokenizer ──────────────────────────────────────────────────────
+class ByteZipTokenizer
+{
+public:
+    static constexpr std::size_t  BYTE_OFFSET = 4;
+    static constexpr std::size_t  PAD_ID      = 0;
+    static constexpr std::size_t  UNK_ID      = 1;
+    static constexpr std::size_t  BOS_ID      = 2;
+    static constexpr std::size_t  EOS_ID      = 3;
+
+    static constexpr std::size_t   DEFAULT_VOCAB_SIZE   = 20000;
+    static constexpr std::size_t   DEFAULT_V1_MAX_LEN   = 16;
+    static constexpr std::size_t   DEFAULT_V2_MAX_LEN   = 24;
+    static constexpr std::uint32_t DEFAULT_MIN_FREQ     = 2;
+    static constexpr double        DEFAULT_SKIP_RATIO   = 1.2;
+    static constexpr double        DEFAULT_AFFIX_RATIO  = 0.4;
+    static constexpr std::size_t   DEFAULT_MAX_V2_BYTES = 300'000;
+    static constexpr std::size_t   SMALL_VOCAB_THRESHOLD = 1500;
+
+    using LogFn = std::function<void(std::string_view)>;
+
+    struct Config
+    {
+        std::size_t   vocab_size          = DEFAULT_VOCAB_SIZE;
+        std::size_t   v1_max_len          = DEFAULT_V1_MAX_LEN;
+        std::size_t   v2_max_len          = DEFAULT_V2_MAX_LEN;
+        std::uint32_t min_freq            = DEFAULT_MIN_FREQ;
+        double        skip_ratio          = DEFAULT_SKIP_RATIO;
+        double        affix_protect_ratio = DEFAULT_AFFIX_RATIO;
+        std::size_t   v2_reserve          = 0;
+        std::size_t   max_v2_scan_bytes   = DEFAULT_MAX_V2_BYTES;
+        LogFn         log                 = nullptr;
+    };
+
+    ByteZipTokenizer() = default;
+
+    void train(const std::string &text) { train(text, Config{}); }
+
+    void train(const std::string &text, const Config &config)
+    {
+        auto log = config.log
+            ? config.log
+            : LogFn{[](std::string_view m) { std::cout << m << '\n'; }};
+
+        max_v2_scan_bytes_ = config.max_v2_scan_bytes;
+
+        const auto v1_max_len    = config.v1_max_len;
+        const auto v2_max_len    = config.v2_max_len;
+        const auto min_freq      = config.min_freq;
+        const auto skip_ratio    = config.skip_ratio;
+        const auto affix_ratio   = config.affix_protect_ratio;
+
+        std::size_t v1_target, v2_reserve;
+        if (config.vocab_size <= SMALL_VOCAB_THRESHOLD)
+        {
+            v2_reserve = 0;
+            v1_target  = config.vocab_size;
+            log("小词表模式 (<=1500): 跳过 V2，全部给 V1 (目标 "
+                + std::to_string(v1_target) + ")");
+        }
+        else
+        {
+            v2_reserve = config.v2_reserve != 0
+                ? config.v2_reserve
+                : std::min(std::size_t{1500},
+                           static_cast<std::size_t>(config.vocab_size * 0.12));
+            v1_target = config.vocab_size - v2_reserve;
+            if (v1_target < BYTE_OFFSET + 256)
+            {
+                v1_target  = BYTE_OFFSET + 256;
+                v2_reserve = config.vocab_size - v1_target;
+            }
+            log("大词表模式: V1 目标 " + std::to_string(v1_target)
+                + ", V2 预留 " + std::to_string(v2_reserve));
+        }
+
+        log("\n[V1] 统计...");
+        auto chunks = pre_tokenize(text);
+
+        std::unordered_map<std::string, std::uint32_t> freq;
+        std::unordered_map<std::string, std::unordered_set<std::int32_t>> left_ctx, right_ctx;
+        freq.reserve(text.size() / 2);
+
+        for (const auto &chunk : chunks)
+        {
+            const auto L = chunk.size();
+            if (L < 2) continue;
+            for (std::size_t s = 0; s < L; ++s)
+            {
+                const auto max_e = std::min(s + v1_max_len, L);
+                if (s + 2 > max_e) break;
+                for (auto e = s + 2; e <= max_e; ++e)
+                {
+                    auto sub = chunk.substr(s, e - s);
+                    ++freq[sub];
+                    left_ctx[sub].insert(s > 0
+                        ? static_cast<std::int32_t>(static_cast<unsigned char>(chunk[s - 1]))
+                        : -1);
+                    right_ctx[sub].insert(e < L
+                        ? static_cast<std::int32_t>(static_cast<unsigned char>(chunk[e]))
+                        : -1);
+                }
+            }
+        }
+        log("  不同子串数: " + std::to_string(freq.size()));
+
+        struct Entry { std::string sub; std::uint32_t cnt; std::size_t ben; std::size_t len; };
+        std::vector<Entry> sorted;
+        sorted.reserve(freq.size());
+        for (const auto &[s, c] : freq)
+        {
+            auto l = s.size();
+            sorted.push_back({s, c, static_cast<std::size_t>(c) * (l - 1), l});
+        }
+        std::sort(sorted.begin(), sorted.end(), [](const Entry &a, const Entry &b)
+        { return a.ben != b.ben ? a.ben > b.ben : a.len > b.len; });
+
+        vocab_.clear();
+        vocab_.resize(BYTE_OFFSET);
+        for (std::size_t i = 0; i < 256; ++i)
+            vocab_.emplace_back(1, static_cast<char>(i));
+
+        std::unordered_set<std::string> skip;
+        skip.reserve(sorted.size() / 4);
+        std::size_t added = 0;
+
+        for (const auto &e : sorted)
+        {
+            if (vocab_.size() >= v1_target) break;
+            if (e.cnt < min_freq) break;
+            if (e.len <= 1 || skip.find(e.sub) != skip.end()) continue;
+
+            auto lit = left_ctx.find(e.sub);
+            auto rit = right_ctx.find(e.sub);
+            bool is_suffix = false, is_prefix = false;
+            if (lit != left_ctx.end() && rit != right_ctx.end())
+            {
+                auto len_l = lit->second.size();
+                auto len_r = rit->second.size();
+                is_suffix = (len_l >= 3 && len_l > len_r * 2.0);
+                is_prefix = (len_r >= 3 && len_r > len_l * 2.0);
+            }
+            const auto threshold = (is_suffix || is_prefix) ? affix_ratio : skip_ratio;
+
+            const auto sl = e.sub.size();
+            for (std::size_t i = 0; i < sl; ++i)
+                for (std::size_t j = i + 2; j <= sl; ++j)
+                {
+                    if (i == 0 && j == sl) continue;
+                    auto child = e.sub.substr(i, j - i);
+                    auto it = freq.find(child);
+                    if (it != freq.end() &&
+                        it->second <= static_cast<std::uint32_t>(e.cnt * threshold))
+                        skip.insert(std::move(child));
+                }
+
+            vocab_.push_back(e.sub);
+            ++added;
+            if (added % 1000 == 0)
+                log("  V1: 已添加 " + std::to_string(added) + " 个词条（总 "
+                    + std::to_string(vocab_.size()) + "）");
+        }
+        log("V1 完成: " + std::to_string(vocab_.size()) + " 词条（新增 "
+            + std::to_string(added) + "）");
+
+        if (v2_reserve > 0)
+        {
+            log("\n[V2] 提取残差...");
+            LookupTable lookup_v1;
+            for (std::size_t tid = BYTE_OFFSET; tid < vocab_.size(); ++tid)
+                if (!vocab_[tid].empty() && vocab_[tid].size() <= v1_max_len)
+                    lookup_v1[vocab_[tid]] = tid;
+
+            auto data = text;
+            auto spans = get_residual_spans(data, lookup_v1, v1_max_len);
+            std::size_t total_bytes = 0;
+            for (const auto &sp : spans) total_bytes += sp.size();
+            log("  残差跨度: " + std::to_string(spans.size()) + ", 总字节: "
+                + std::to_string(total_bytes));
+
+            if (!spans.empty())
+            {
+                log("  挖掘超长短语（最多 " + std::to_string(v2_reserve) + " 个）...");
+                auto v2_words = build_v2_from_spans(spans, v2_max_len, v2_reserve);
+                std::unordered_set<std::string> existing(vocab_.begin(), vocab_.end());
+                for (const auto &w : v2_words)
+                {
+                    if (vocab_.size() >= config.vocab_size) break;
+                    if (existing.find(w) == existing.end())
+                    {
+                        vocab_.push_back(w);
+                        existing.insert(w);
+                    }
+                }
+                log("  V2 新增 " + std::to_string(vocab_.size() - (BYTE_OFFSET + 256 + added))
+                    + " 个");
+            }
+        }
+        else
+        {
+            log("\n[V2] 跳过（小词表或预留为 0）");
+        }
+
+        log("\n最终词表: " + std::to_string(vocab_.size()));
+        max_subword_len_ = std::max(v1_max_len, v2_max_len);
+        build_lookup();
+    }
+
+    [[nodiscard]] std::vector<std::size_t> encode(const std::string &text) const
+    {
+        std::vector<std::size_t> all;
+        all.reserve(text.size() / 2);
+        for (const auto &chunk : pre_tokenize(text))
+        {
+            auto ids = encode_bytes(chunk);
+            all.insert(all.end(), ids.begin(), ids.end());
+        }
+        return all;
+    }
+
+    [[nodiscard]] std::string decode(const std::vector<std::size_t>& ids) const
+    {
+        std::string raw;
+        raw.reserve(ids.size() * 2);
+        for (auto tid : ids)
+            raw += tid < vocab_.size() ? vocab_[tid] : std::string{"\xef\xbf\xbd"};
+        return raw;
+    }
+
+    void save(const std::string &path) const
+    {
+        std::ofstream ofs(path);
+        if (!ofs) throw std::runtime_error("Cannot write: " + path);
+
+        ofs << "{\n  \"type\": \"freq_based_tokenizer\",\n  \"vocab\": {\n";
+        bool first = true;
+        for (std::size_t tid = BYTE_OFFSET; tid < vocab_.size(); ++tid)
+        {
+            if (vocab_[tid].empty()) continue;
+            if (!first) ofs << ",\n";
+            first = false;
+            ofs << "    \"" << std::dec << tid << "\": \"";
+            for (unsigned char b : vocab_[tid])
+                ofs << std::hex << std::setw(2) << std::setfill('0') << static_cast<unsigned>(b);
+            ofs << "\"" << std::dec;
+        }
+        ofs << "\n  },\n  \"vocab_size\": " << std::dec << vocab_.size()
+            << ",\n  \"byte_offset\": " << BYTE_OFFSET
+            << ",\n  \"max_subword_len\": " << max_subword_len_
+            << ",\n  \"special_tokens\": {"
+            << "\n    \"<pad>\": 0,\n    \"<unk>\": 1,"
+            << "\n    \"<bos>\": 2,\n    \"<eos>\": 3\n  }\n}\n";
+    }
+
+    void load(const std::string &path)
+    {
+        std::ifstream ifs(path);
+        if (!ifs) throw std::runtime_error("Cannot read: " + path);
+        std::string content((std::istreambuf_iterator<char>(ifs)),
+                             std::istreambuf_iterator<char>());
+
+        vocab_.clear();
+
+        if (auto p = content.find("\"vocab_size\""); p != std::string::npos)
+            if (auto c = content.find(':', p); c != std::string::npos)
+            {
+                ++c; while (c < content.size() && content[c] == ' ') ++c;
+                std::size_t v = 0;
+                auto [ptr, ec] = std::from_chars(content.data()+c, content.data()+content.size(), v);
+                if (ec == std::errc{}) vocab_.resize(v);
+            }
+
+        auto vp = content.find("\"vocab\"");
+        if (vp == std::string::npos)
+            throw std::runtime_error("Invalid JSON: missing \"vocab\"");
+        auto br = content.find('{', vp);
+        if (br == std::string::npos)
+            throw std::runtime_error("Invalid JSON: missing '{'");
+
+        std::size_t pos = br + 1;
+        while (pos < content.size())
+        {
+            while (pos < content.size() && (content[pos]==' '||content[pos]=='\n'||
+                   content[pos]=='\r'||content[pos]=='\t'||content[pos]==',')) ++pos;
+            if (pos >= content.size() || content[pos] == '}') break;
+            if (content[pos] != '"') { ++pos; continue; }
+            std::string key = internal::parse_json_string(content, pos);
+            while (pos < content.size() && (content[pos]==' '||content[pos]==':')) ++pos;
+            if (pos < content.size() && content[pos] == '"')
+            {
+                std::string hex = internal::parse_json_string(content, pos);
+                std::size_t id = 0;
+                std::from_chars(key.data(), key.data()+key.size(), id);
+                std::string tok;
+                tok.reserve(hex.size()/2);
+                for (std::size_t i = 0; i+1 < hex.size(); i += 2)
+                { unsigned b = 0; std::from_chars(hex.data()+i, hex.data()+i+2, b, 16); tok += static_cast<char>(b); }
+                if (id >= vocab_.size()) vocab_.resize(id+1);
+                vocab_[id] = std::move(tok);
+            }
+        }
+
+        max_subword_len_ = DEFAULT_V1_MAX_LEN;
+        if (auto p = content.find("\"max_subword_len\""); p != std::string::npos)
+            if (auto c = content.find(':', p); c != std::string::npos)
+            {
+                ++c; while (c < content.size() && content[c] == ' ') ++c;
+                std::size_t v = 0;
+                std::from_chars(content.data()+c, content.data()+content.size(), v);
+                if (v > 0) max_subword_len_ = v;
+            }
+
+        build_lookup();
+    }
+
+    [[nodiscard]] std::size_t vocab_size()      const noexcept { return vocab_.size(); }
+    [[nodiscard]] constexpr std::size_t max_subword_len() const noexcept { return max_subword_len_; }
+    [[nodiscard]] constexpr std::size_t byte_offset()     const noexcept { return BYTE_OFFSET; }
+    [[nodiscard]] const std::vector<std::string> &vocab() const noexcept { return vocab_; }
+
+    [[nodiscard]] std::string token_bytes(std::size_t id) const
+    {
+        if (id >= vocab_.size()) throw std::runtime_error("Token ID out of range");
+        return vocab_[id];
+    }
+
+    [[nodiscard]] std::string try_decode_token(std::size_t id) const
+    {
+        if (id >= vocab_.size()) return "<invalid>";
+        std::string r;
+        for (char c : vocab_[id])
+        {
+            if      (c >= 32 && c < 127) r += c;
+            else if (c == '\n')          r += "\\n";
+            else if (c == '\t')          r += "\\t";
+            else if (c == ' ')           r += "␣";
+            else { r += "\\x"; r += "0123456789abcdef"[(static_cast<unsigned char>(c)>>4)&0xF];
+                                  r += "0123456789abcdef"[ static_cast<unsigned char>(c)   &0xF]; }
+        }
+        return r;
+    }
+
+    [[nodiscard]] static std::vector<std::string> pre_tokenize(std::string_view text)
+    {
+        std::vector<std::string> chunks;
+        chunks.reserve(text.size() / 4);
+        std::size_t pos = 0;
+        while (pos < text.size())
+        {
+            if (auto n = try_contraction(text, pos); n > 0)
+            { chunks.emplace_back(text.substr(pos, n)); pos += n; continue; }
+
+            const char c = text[pos];
+
+            if (is_alpha(c) || (c==' ' && pos+1<text.size() && is_alpha(text[pos+1])))
+            { auto s=pos; if(c==' ')++pos; while(pos<text.size()&&is_alpha(text[pos]))++pos;
+              chunks.emplace_back(text.substr(s,pos-s)); continue; }
+
+            if (is_digit(c) || (c==' ' && pos+1<text.size() && is_digit(text[pos+1])))
+            { auto s=pos; if(c==' ')++pos; while(pos<text.size()&&is_digit(text[pos]))++pos;
+              chunks.emplace_back(text.substr(s,pos-s)); continue; }
+
+            if (!is_whitespace(c) && !is_word_char(c) && c!='\'')
+            { auto s=pos; while(pos<text.size()&&!is_whitespace(text[pos])&&
+                  !is_word_char(text[pos])&&text[pos]!='\'') ++pos;
+              chunks.emplace_back(text.substr(s,pos-s)); continue; }
+
+            if (is_whitespace(c))
+            { auto s=pos; while(pos<text.size()&&is_whitespace(text[pos]))++pos;
+              chunks.emplace_back(text.substr(s,pos-s)); continue; }
+
+            chunks.emplace_back(text.substr(pos, 1)); ++pos;
+        }
+        return chunks;
+    }
+
+private:
+    std::vector<std::string> vocab_;
+    std::size_t max_subword_len_ = DEFAULT_V1_MAX_LEN;
+
+    struct TransparentHash {
+        using is_transparent = void;
+        [[nodiscard]] std::size_t operator()(std::string_view s)  const noexcept { return std::hash<std::string_view>{}(s); }
+        [[nodiscard]] std::size_t operator()(const std::string &s) const noexcept { return std::hash<std::string>{}(s); }
+    };
+    struct TransparentEqual {
+        using is_transparent = void;
+        [[nodiscard]] bool operator()(std::string_view a, std::string_view b) const noexcept { return a==b; }
+    };
+    using LookupTable = std::unordered_map<std::string, std::size_t, TransparentHash, TransparentEqual>;
+    LookupTable lookup_;
+
+    [[nodiscard]] static constexpr bool is_alpha(char c)      noexcept { return (c>='a'&&c<='z')||(c>='A'&&c<='Z'); }
+    [[nodiscard]] static constexpr bool is_digit(char c)      noexcept { return c>='0'&&c<='9'; }
+    [[nodiscard]] static constexpr bool is_whitespace(char c) noexcept { return c==' '||c=='\t'||c=='\n'||c=='\r'||c=='\f'||c=='\v'; }
+    [[nodiscard]] static constexpr bool is_word_char(char c)  noexcept { return is_alpha(c)||is_digit(c)||c=='_'; }
+
+    [[nodiscard]] static constexpr std::size_t try_contraction(std::string_view t, std::size_t p) noexcept
+    {
+        if (p>=t.size()||t[p]!='\'') return 0;
+        auto r = t.size()-p; if (r<2) return 0;
+        auto n1 = t[p+1];
+        if (n1=='s'||n1=='t'||n1=='m'||n1=='d') return 2;
+        if (r>=3) { auto n2=t[p+2];
+            if ((n1=='r'&&n2=='e')||(n1=='v'&&n2=='e')||(n1=='l'&&n2=='l')) return 3; }
+        return 0;
+    }
+
+    struct EncodedChunk { std::vector<std::size_t> ids; std::vector<std::size_t> positions; };
+
+    [[nodiscard]] EncodedChunk encode_with_positions(
+        std::string_view data, const LookupTable &lut, std::size_t max_len) const
+    {
+        EncodedChunk result;
+        result.ids.reserve(data.size());
+        result.positions.reserve(data.size());
+        std::size_t pos = 0;
+        while (pos < data.size())
+        {
+            result.positions.push_back(pos);
+            auto best_id  = static_cast<std::size_t>(static_cast<unsigned char>(data[pos])) + BYTE_OFFSET;
+            auto best_len = std::size_t{1};
+            for (auto l = std::min(max_len, data.size() - pos); l > 1; --l)
+                if (auto it = lut.find(std::string(data.substr(pos, l))); it != lut.end())
+                { best_id = it->second; best_len = l; break; }
+            result.ids.push_back(best_id);
+            pos += best_len;
+        }
+        return result;
+    }
+
+    [[nodiscard]] std::vector<std::size_t> encode_bytes(std::string_view data) const
+    {
+        std::vector<std::size_t> ids;
+        ids.reserve(data.size());
+        std::size_t pos = 0;
+        while (pos < data.size())
+        {
+            auto best_id  = static_cast<std::size_t>(static_cast<unsigned char>(data[pos])) + BYTE_OFFSET;
+            auto best_len = std::size_t{1};
+            for (auto l = std::min(max_subword_len_, data.size()-pos); l > 1; --l)
+                if (auto it = lookup_.find(std::string(data.substr(pos, l))); it != lookup_.end())
+                { best_id = it->second; best_len = l; break; }
+            ids.push_back(best_id);
+            pos += best_len;
+        }
+        return ids;
+    }
+
+    [[nodiscard]] std::vector<std::string> get_residual_spans(
+        const std::string &text, const LookupTable &lut, std::size_t max_len) const
+    {
+        auto enc = encode_with_positions(text, lut, max_len);
+        const auto n_tokens = enc.ids.size();
+        const auto data_size = text.size();
+
+        std::vector<std::string> spans;
+        std::size_t i = 0;
+        while (i < n_tokens)
+        {
+            if (enc.ids[i] < BYTE_OFFSET + 256)
+            {
+                auto start_pos = enc.positions[i];
+                auto j = i;
+                while (j < n_tokens && enc.ids[j] < BYTE_OFFSET + 256)
+                    ++j;
+                auto end_pos = (j < n_tokens) ? enc.positions[j] : data_size;
+                auto ext_start = (start_pos >= 8) ? start_pos - 8 : 0;
+                auto ext_end   = std::min(data_size, end_pos + 8);
+                spans.emplace_back(text.substr(ext_start, ext_end - ext_start));
+                i = j;
+            }
+            else
+            {
+                ++i;
+            }
+        }
+        return spans;
+    }
+
+    [[nodiscard]] std::vector<std::string> build_v2_from_spans(
+        std::vector<std::string> &spans, std::size_t max_len,
+        std::size_t max_items) const
+    {
+        std::size_t total_bytes = 0;
+        for (const auto &s : spans) total_bytes += s.size();
+        if (total_bytes == 0 || max_items == 0)
+            return {};
+
+        if (total_bytes > max_v2_scan_bytes_)
+        {
+            std::shuffle(spans.begin(), spans.end(), rng_);
+            std::string sampled;
+            sampled.reserve(max_v2_scan_bytes_);
+            for (const auto &sp : spans)
+            {
+                if (sampled.size() >= max_v2_scan_bytes_) break;
+                auto remain = max_v2_scan_bytes_ - sampled.size();
+                sampled.append(sp, 0, remain);
+            }
+            spans = {std::move(sampled)};
+        }
+
+        std::unordered_map<std::string, std::uint32_t> freq;
+        for (const auto &span : spans)
+        {
+            const auto L = span.size();
+            if (L < 16) continue;
+            for (std::size_t s = 0; s < L; ++s)
+            {
+                const auto max_e = std::min(s + max_len, L);
+                if (s + 16 > max_e) break;
+                for (auto e = s + 16; e <= max_e; ++e)
+                    ++freq[span.substr(s, e - s)];
+            }
+        }
+
+        struct V2Entry { std::string sub; std::uint32_t cnt; std::size_t ben; };
+        std::vector<V2Entry> sorted;
+        sorted.reserve(freq.size());
+        for (const auto &[s, c] : freq)
+        {
+            if (c < 2) continue;
+            sorted.push_back({s, c, static_cast<std::size_t>(c) * (s.size() - 1)});
+        }
+        std::sort(sorted.begin(), sorted.end(), [](const V2Entry &a, const V2Entry &b)
+        { return a.ben > b.ben; });
+
+        std::vector<std::string> result;
+        result.reserve(std::min(max_items, sorted.size()));
+        for (auto &e : sorted)
+        {
+            if (result.size() >= max_items) break;
+            result.push_back(std::move(e.sub));
+        }
+        return result;
+    }
+
+    void build_lookup()
+    {
+        lookup_.clear();
+        lookup_.reserve(vocab_.size() - BYTE_OFFSET);
+        for (std::size_t i = BYTE_OFFSET; i < vocab_.size(); ++i)
+            if (!vocab_[i].empty()) lookup_[vocab_[i]] = i;
+    }
+
+    inline static thread_local std::mt19937_64 rng_{std::random_device{}()};
+    std::size_t max_v2_scan_bytes_ = DEFAULT_MAX_V2_BYTES;
+};
+
+} // namespace nn
+
+#endif // NEURALNET_TOKENIZER_H

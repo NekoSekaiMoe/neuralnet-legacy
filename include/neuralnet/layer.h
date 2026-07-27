@@ -933,6 +933,7 @@ namespace nn
         }
     };
 
+
     // ── Softmax ──────────────────────────────────────────────────────────────
     class Softmax final : public Layer
     {
@@ -1045,6 +1046,7 @@ namespace nn
         std::size_t num_heads_;
         std::size_t head_dim_;
         double scale_;
+        bool causal_;
 
         Matrix W_q_, W_k_, W_v_, W_o_;
         Matrix dW_q_, dW_k_, dW_v_, dW_o_;
@@ -1118,10 +1120,11 @@ namespace nn
         }
 
     public:
-        MultiHeadAttention(std::size_t d_model, std::size_t num_heads)
+        MultiHeadAttention(std::size_t d_model, std::size_t num_heads, bool causal = false)
             : d_model_(d_model), num_heads_(num_heads),
               head_dim_(validated_head_dim(d_model, num_heads)),
               scale_(1.0 / std::sqrt(static_cast<double>(head_dim_))),
+              causal_(causal),
               W_q_(xavier_init(d_model, d_model)),
               W_k_(xavier_init(d_model, d_model)),
               W_v_(xavier_init(d_model, d_model)),
@@ -1167,6 +1170,12 @@ namespace nn
 
                 Matrix scores = Q_h.matmul_TN(K_h);
                 scores.scale_inplace(scale_);
+                if (causal_)
+                {
+                    for (std::size_t i = 0; i < sl; ++i)
+                        for (std::size_t j = i + 1; j < sl; ++j)
+                            scores.set_value_unchecked(i, j, -1e9);
+                }
                 softmax_rows_inplace(scores);
                 attn_cache_[h] = scores;
 
@@ -1201,6 +1210,13 @@ namespace nn
 
                 Matrix grad_scores = softmax_backward_rows(grad_attn, attn_h);
                 grad_scores.scale_inplace(scale_);
+
+                if (causal_)
+                {
+                    for (std::size_t i = 0; i < sl; ++i)
+                        for (std::size_t j = i + 1; j < sl; ++j)
+                            grad_scores.set_value_unchecked(i, j, 0.0);
+                }
 
                 Matrix grad_Q_h = K_h.matmul_NT(grad_scores);
                 Matrix grad_K_h = Q_h * grad_scores;
@@ -1464,6 +1480,384 @@ namespace nn
                 pg[k].get() = grad_accum[k];
 
             return grad_input;
+        }
+    };
+
+    // ── GPTBlock ─────────────────────────────────────────────────────────────
+    class GPTBlock final : public Layer
+    {
+    private:
+        MultiHeadAttention self_attn_;
+        LayerNorm norm1_;
+        FeedForward ff_;
+        LayerNorm norm2_;
+
+
+    public:
+        GPTBlock(std::size_t d_model, std::size_t num_heads, std::size_t d_ff)
+            : self_attn_(d_model, num_heads, true),
+              norm1_(d_model),
+              ff_(d_model, d_ff),
+              norm2_(d_model)
+        {}
+
+        const char *name() const override { return "GPTBlock"; }
+        [[nodiscard]] std::size_t param_count() const noexcept override
+        {
+            return self_attn_.param_count() + norm1_.param_count()
+                 + ff_.param_count() + norm2_.param_count();
+        }
+
+        std::vector<std::reference_wrapper<Matrix>> parameters() override
+        {
+            auto params = self_attn_.parameters();
+            auto n1 = norm1_.parameters();
+            auto f  = ff_.parameters();
+            auto n2 = norm2_.parameters();
+            params.insert(params.end(), n1.begin(), n1.end());
+            params.insert(params.end(), f.begin(), f.end());
+            params.insert(params.end(), n2.begin(), n2.end());
+            return params;
+        }
+
+        std::vector<std::reference_wrapper<Matrix>> param_gradients() override
+        {
+            auto grads = self_attn_.param_gradients();
+            auto gn1 = norm1_.param_gradients();
+            auto gf  = ff_.param_gradients();
+            auto gn2 = norm2_.param_gradients();
+            grads.insert(grads.end(), gn1.begin(), gn1.end());
+            grads.insert(grads.end(), gf.begin(), gf.end());
+            grads.insert(grads.end(), gn2.begin(), gn2.end());
+            return grads;
+        }
+
+        Matrix forward(const Matrix &input) override
+        {
+            // 子层1: CausalSelfAttention + 残差 (Pre-Norm)
+            Matrix sa_out = self_attn_.forward(norm1_.forward(input));
+            Matrix residual2 = input + sa_out;
+
+            // 子层2: FFN + 残差 (Pre-Norm)
+            Matrix ff_out = ff_.forward(norm2_.forward(residual2));
+            return residual2 + ff_out;
+        }
+
+        Matrix backward(const Matrix &grad_output) override
+        {
+            Matrix grad_residual1 = grad_output;
+            Matrix grad_ff_out    = grad_output;
+
+            Matrix b_ff = ff_.backward(grad_ff_out);
+            Matrix b_n2 = norm2_.backward(b_ff);
+            grad_residual1 = grad_residual1 + b_n2;
+
+            Matrix grad_input = grad_residual1;
+            Matrix grad_attn_out = grad_residual1;
+
+            Matrix b_sa = self_attn_.backward(grad_attn_out);
+            Matrix b_n1 = norm1_.backward(b_sa);
+            grad_input = grad_input + b_n1;
+
+            return grad_input;
+        }
+    };
+
+    // ── GPTModel ─────────────────────────────────────────────────────────────
+    class GPTModel final : public Layer
+    {
+    private:
+        std::size_t vocab_size_;
+        std::size_t d_model_;
+        std::size_t seq_len_;
+
+        Matrix token_emb_;
+        Matrix grad_token_emb_;
+
+        Matrix pos_emb_;
+        Matrix grad_pos_emb_;
+
+        std::vector<GPTBlock> blocks_;
+        LayerNorm ln_f_;
+        Linear lm_head_;
+
+        std::vector<Matrix> stored_inputs_;
+        std::vector<std::vector<std::size_t>> stored_tokens_;
+        std::size_t batch_size_{0};
+
+    public:
+        GPTModel(std::size_t vocab_size, std::size_t d_model, std::size_t seq_len,
+                 std::size_t num_heads, std::size_t d_ff, std::size_t num_layers)
+            : vocab_size_(vocab_size), d_model_(d_model), seq_len_(seq_len),
+              token_emb_(vocab_size, d_model),
+              grad_token_emb_(vocab_size, d_model),
+              pos_emb_(seq_len, d_model),
+              grad_pos_emb_(seq_len, d_model),
+              ln_f_(d_model),
+              lm_head_(d_model, vocab_size)
+        {
+            constexpr double emb_init_std = 0.02;
+            std::mt19937_64 rng{42};
+            std::normal_distribution<double> dist(0.0, emb_init_std);
+            for (std::size_t i = 0; i < token_emb_.size(); ++i)
+                token_emb_.data()[i] = dist(rng);
+            for (std::size_t i = 0; i < pos_emb_.size(); ++i)
+                pos_emb_.data()[i] = dist(rng);
+
+            for (std::size_t i = 0; i < num_layers; ++i)
+                blocks_.emplace_back(d_model, num_heads, d_ff);
+        }
+
+        const char *name() const override { return "GPTModel"; }
+
+        [[nodiscard]] std::size_t param_count() const noexcept override
+        {
+            std::size_t p = token_emb_.size() + pos_emb_.size();
+            for (const auto &b : blocks_)
+                p += b.param_count();
+            p += ln_f_.param_count();
+            p += lm_head_.param_count();
+            return p;
+        }
+
+        std::vector<std::reference_wrapper<Matrix>> parameters() override
+        {
+            std::vector<std::reference_wrapper<Matrix>> params;
+            params.push_back(std::ref(token_emb_));
+            params.push_back(std::ref(pos_emb_));
+            for (auto &b : blocks_)
+            {
+                auto bp = b.parameters();
+                params.insert(params.end(), bp.begin(), bp.end());
+            }
+            auto lp = ln_f_.parameters();
+            params.insert(params.end(), lp.begin(), lp.end());
+            auto hp = lm_head_.parameters();
+            params.insert(params.end(), hp.begin(), hp.end());
+            return params;
+        }
+
+        std::vector<std::reference_wrapper<Matrix>> param_gradients() override
+        {
+            std::vector<std::reference_wrapper<Matrix>> grads;
+            grads.push_back(std::ref(grad_token_emb_));
+            grads.push_back(std::ref(grad_pos_emb_));
+            for (auto &b : blocks_)
+            {
+                auto bg = b.param_gradients();
+                grads.insert(grads.end(), bg.begin(), bg.end());
+            }
+            auto lg = ln_f_.param_gradients();
+            grads.insert(grads.end(), lg.begin(), lg.end());
+            auto hg = lm_head_.param_gradients();
+            grads.insert(grads.end(), hg.begin(), hg.end());
+            return grads;
+        }
+
+        Matrix forward(const Matrix &input) override
+        {
+            const std::size_t sl = input.rows();
+            batch_size_ = input.cols();
+            stored_inputs_.resize(batch_size_);
+            stored_tokens_.resize(batch_size_);
+
+            for (auto &v : stored_tokens_)
+                v.clear();
+
+            Matrix output(vocab_size_, sl * batch_size_);
+
+            for (std::size_t b = 0; b < batch_size_; ++b)
+            {
+                stored_tokens_[b].reserve(sl);
+
+                Matrix x(d_model_, sl);
+                for (std::size_t t = 0; t < sl; ++t)
+                {
+                    if (t >= seq_len_)
+                        throw std::invalid_argument("GPTModel forward: sequence length exceeds seq_len_");
+
+                    auto token_id = static_cast<std::size_t>(input.at_unchecked(t, b));
+                    if (token_id >= vocab_size_)
+                        token_id = 0;
+                    stored_tokens_[b].push_back(token_id);
+
+                    for (std::size_t d = 0; d < d_model_; ++d)
+                    {
+                        double pe = pos_emb_.at_unchecked(t, d);
+                        x.set_value_unchecked(d, t,
+                            token_emb_.at_unchecked(token_id, d) + pe);
+                    }
+                }
+
+                stored_inputs_[b] = x;
+
+                for (std::size_t l = 0; l < blocks_.size(); ++l)
+                    x = blocks_[l].forward(x);
+
+                x = ln_f_.forward(x);
+                Matrix logits = lm_head_.forward(x);
+
+                for (std::size_t r = 0; r < vocab_size_; ++r)
+                    for (std::size_t t = 0; t < sl; ++t)
+                        output.set_value_unchecked(r, t * batch_size_ + b,
+                            logits.at_unchecked(r, t));
+            }
+
+            return output;
+        }
+
+        Matrix backward(const Matrix &grad_output) override
+        {
+            const std::size_t sl = grad_output.cols() / batch_size_;
+            grad_token_emb_.zero();
+            grad_pos_emb_.zero();
+
+            Matrix grad_input(sl, batch_size_);
+            grad_input.zero();
+
+            auto all_grads = param_gradients();
+            std::vector<Matrix> accum_grads;
+            for (auto& g : all_grads) accum_grads.push_back(Matrix(g.get().rows(), g.get().cols(), 0.0));
+
+            for (std::size_t b = 0; b < batch_size_; ++b)
+            {
+                Matrix grad_logits(vocab_size_, sl);
+                for (std::size_t r = 0; r < vocab_size_; ++r)
+                    for (std::size_t t = 0; t < sl; ++t)
+                        grad_logits.set_value_unchecked(r, t,
+                            grad_output.at_unchecked(r, t * batch_size_ + b));
+
+                // Re-forward to rebuild cache for this sample
+                Matrix x = stored_inputs_[b];
+                for (std::size_t l = 0; l < blocks_.size(); ++l)
+                    x = blocks_[l].forward(x);
+                x = ln_f_.forward(x);
+                lm_head_.forward(x); // rebuild lm_head_ cache
+
+                for (auto& g : all_grads) g.get().zero();
+
+                Matrix grad_ln = lm_head_.backward(grad_logits);
+                grad_ln = ln_f_.backward(grad_ln);
+
+                for (int l = static_cast<int>(blocks_.size()) - 1; l >= 0; --l)
+                    grad_ln = blocks_[l].backward(grad_ln);
+
+                const auto &tokens = stored_tokens_[b];
+                for (std::size_t t = 0; t < sl; ++t)
+                {
+                    const std::size_t tid = tokens[t];
+                    for (std::size_t d = 0; d < d_model_; ++d)
+                    {
+                        double g = grad_ln.at_unchecked(d, t);
+                        grad_token_emb_.data()[tid * d_model_ + d] += g;
+                        grad_pos_emb_.data()[t * d_model_ + d] += g;
+                    }
+                }
+                
+                for (std::size_t i = 0; i < all_grads.size(); ++i) {
+                    auto& ag = accum_grads[i];
+                    auto& cg = all_grads[i].get();
+                    for (std::size_t j = 0; j < ag.size(); ++j) ag.data()[j] += cg.data()[j];
+                }
+            }
+            
+            for (std::size_t i = 0; i < all_grads.size(); ++i) {
+                auto& ag = accum_grads[i];
+                auto& cg = all_grads[i].get();
+                for (std::size_t j = 0; j < ag.size(); ++j) cg.data()[j] = ag.data()[j];
+            }
+
+            return grad_input;
+        }
+
+        std::vector<std::size_t> generate(const std::vector<std::size_t> &prompt,
+                                          std::size_t max_new_tokens,
+                                          double temperature = 1.0)
+        {
+            std::vector<std::size_t> context(prompt);
+            std::vector<std::size_t> generated;
+            std::mt19937_64 rng{std::random_device{}()};
+            std::uniform_real_distribution<double> dist(0.0, 1.0);
+            
+            auto saved_inputs = stored_inputs_;
+            auto saved_tokens = stored_tokens_;
+            auto saved_bs = batch_size_;
+
+            for (std::size_t step = 0; step < max_new_tokens; ++step)
+            {
+                std::size_t start = 0;
+                if (context.size() > seq_len_)
+                    start = context.size() - seq_len_;
+
+                std::size_t cur_len = context.size() - start;
+                Matrix input(cur_len, 1);
+                for (std::size_t t = 0; t < cur_len; ++t)
+                    input.set_value_unchecked(t, 0, static_cast<double>(context[start + t]));
+
+                Matrix logits = forward(input);
+
+                std::vector<double> last_logits(vocab_size_);
+                for (std::size_t v = 0; v < vocab_size_; ++v)
+                    last_logits[v] = logits.at_unchecked(v, cur_len - 1);
+
+                if (temperature > 0.0 && temperature != 1.0)
+                {
+                    for (auto &v : last_logits)
+                        v /= temperature;
+                }
+
+                double max_val = last_logits[0];
+                for (std::size_t v = 1; v < vocab_size_; ++v)
+                    max_val = std::max(max_val, last_logits[v]);
+                
+                double sum_exp = 0.0;
+                for (auto &v : last_logits)
+                {
+                    v = std::exp(v - max_val);
+                    sum_exp += v;
+                }
+                for (auto &v : last_logits)
+                    v /= sum_exp;
+
+                std::size_t next_token;
+                if (temperature > 0.0 && temperature != 1.0)
+                {
+                    double r = dist(rng);
+                    double cumulative = 0.0;
+                    next_token = vocab_size_ - 1;
+                    for (std::size_t v = 0; v < vocab_size_; ++v)
+                    {
+                        cumulative += last_logits[v];
+                        if (r <= cumulative)
+                        {
+                            next_token = v;
+                            break;
+                        }
+                    }
+                }
+                else
+                {
+                    next_token = 0;
+                    double best = last_logits[0];
+                    for (std::size_t v = 1; v < vocab_size_; ++v)
+                    {
+                        if (last_logits[v] > best)
+                        {
+                            best = last_logits[v];
+                            next_token = v;
+                        }
+                    }
+                }
+
+                generated.push_back(next_token);
+                context.push_back(next_token);
+            }
+            
+            stored_inputs_ = saved_inputs;
+            stored_tokens_ = saved_tokens;
+            batch_size_ = saved_bs;
+
+            return generated;
         }
     };
 

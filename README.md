@@ -31,16 +31,25 @@ neuralnet.cpp/
 │           ├── config.h              # NN_EXEC_POLICY / BLOCK_SIZE / counting_iterator
 │           └── nn.h                  # 聚合头：包含上述所有 + one_hot
 ├── examples/
-│   └── mnist/
+│   ├── mnist/                      # MNIST 分类示例
+│   │   ├── CMakeLists.txt
+│   │   ├── infer.cpp                 
+│   │   └── train.cpp                 
+│   └── gpt/                        # GPT 文本生成示例
 │       ├── CMakeLists.txt
-│       ├── infer.cpp                 # 单样本推理（CSV 输入）
-│       └── train.cpp                 # 训练入口
+│       ├── train.cpp                 # GPT 模型训练
+│       ├── infer.cpp                 # GPT 文本生成推理
+│       ├── tokenizer_train.cpp       # ByteZip 词表训练
+│       └── tokenizer_infer.cpp       # 分词器测试
 ├── tests/
 │   ├── CMakeLists.txt
-│   └── test_nn.cpp                   # 67 个 CTest 用例
-├── csv_png.py
-├── extract_digits.py
-└── save_dataset.py
+│   ├── test_gpt.cpp                  # GPT 模型组件测试
+│   ├── test_tokenizer.cpp            # 分词器组件测试
+│   └── test_tensor.cpp               # 基础网络 CTest 用例
+├── scripts/
+│   └── *.py                          # 数据下载、词表训练等辅助工具
+└── data/
+    └── gpt_bpe.json                  # BPE 词表数据
 ```
 
 ## 构建产物
@@ -48,11 +57,18 @@ neuralnet.cpp/
 ```
 build/
 ├── examples/
-│   └── mnist/
-│       ├── mnist_train        # 训练入口
-│       └── mnist_infer        # 推理入口
+│   ├── mnist/
+│   │   ├── mnist_train        # MNIST 训练入口
+│   │   └── mnist_infer        # MNIST 推理入口
+│   └── gpt/
+│       ├── gpt_train          # GPT 训练入口
+│       ├── gpt_infer          # GPT 交互式推理入口
+│       ├── gpt_tokenizer_train # 词表训练工具
+│       └── gpt_tokenizer_infer # 分词器调试工具
 └── tests/
-    └── test_nn                # 测试入口（67 个 CTest 用例）
+    ├── test_tensor                # 基础测试
+    ├── test_gpt               # GPT 测试
+    └── test_tokenizer         # 分词器测试
 ```
 
 ## 依赖
@@ -106,7 +122,7 @@ python save_dataset.py
 ### 验证安装
 
 ```bash
-ctest --test-dir build --output-on-failure       # 跑全部 67 个测试
+ctest --test-dir build --output-on-failure       # 跑全部测试
 cmake --install build --prefix /tmp/nn-test      # 装到临时目录验证 install 流程
 ls /tmp/nn-test/bin 2>&1                         # 应当 "No such file or directory"（demos 不安装）
 ```
@@ -190,7 +206,7 @@ int main() {
 
 | 选项 | 默认 | 说明 |
 |------|------|------|
-| `BUILD_TESTING` | `${PROJECT_IS_TOP_LEVEL}` | 关闭后不构建 `test_nn` 也不注册 CTest |
+| `BUILD_TESTING` | `${PROJECT_IS_TOP_LEVEL}` | 关闭后不构建测试程序也不注册 CTest |
 | `BUILD_EXAMPLES` | ON | 关闭后不构建 `examples/mnist/` 下的 demo 程序（不影响库本身） |
 | `ENABLE_ASAN` | OFF | 启用 AddressSanitizer（必须搭配 Debug 或 RelWithDebInfo，不能与 Release 同用） |
 | `ENABLE_UBSAN` | OFF | 启用 UndefinedBehaviorSanitizer（同上） |
@@ -220,13 +236,12 @@ Linear(784, 64) → BatchNorm1d(64) → ReLU
 | **`Model::summary()`** (F4) | `model.summary()` 或 `nn::summary(model, &stream)` | `summary.h` |
 | **`Model::train()/eval()`** (F6) | `model.train()` / `model.eval()` / `model.is_training()`（向 `Layer::on_mode_change` 传播） | `model.h` |
 
-### v2 模型格式（F5）
+### v2/v3 模型格式（F5）
 
-- 文件 magic 不变 (`0x4E4E4E4E`)，版本号 2
-- 写入顺序：`magic → version → n_params → 逐个 param 矩阵 → n_state_layers → 逐个有状态层 save_state`
-- 额外写入每层的非参数状态（BatchNorm 的 `running_mean`、`running_var`、`num_batches_tracked`）
-- v1 文件向后兼容，可正常读取
-- 升级到 v2 后：含 BatchNorm 的模型推理前需调用 `model.eval()` 使用 running stats
+- **V2**: 写入每层的非参数状态（如 BatchNorm 的 running stats）。
+- **V3**: 新增了 `ModelSpec` 规范（如 GPT 架构特有的 `d_model, num_heads, num_layers, seq_len` 等），在模型参数前写入序列化的超参，实现按配置自动初始化。
+- 文件 magic 不变 (`0x4E4E4E4E`)，版本号递增。
+- 向后兼容：V1/V2 格式文件均可正常读取并兼容旧代码逻辑。
 
 ### 3 项性能优化（Linear 层）
 
@@ -236,10 +251,10 @@ Linear(784, 64) → BatchNorm1d(64) → ReLU
 
 ### 测试覆盖
 
-**67 个 CTest**（矩阵与基础层 18 + BatchNorm 13 + DataLoader 4 + grad_clip 4 + summary 3 + 其余 25）：
+**CTest 用例**：
 
 ```bash
-ctest --test-dir build --output-on-failure       # 跑全部 67 个测试
+ctest --test-dir build --output-on-failure       # 跑全部测试
 ```
 
 ## 提供的组件
@@ -266,6 +281,19 @@ ctest --test-dir build --output-on-failure       # 跑全部 67 个测试
 | `nn::Dropout` | 训练时缩放倒置 dropout；`on_mode_change` 自动同步 `training_` 标志 |
 | `nn::BatchNorm1d` | 输入 `(num_features, batch)`；可选 affine；持久化 running stats（v2） |
 | `nn::BatchNorm2d` | 复用 `BatchNorm1d`（视 `(C, N*H*W)` 为 `(C, batch)`）；仅 `name()` 差异 |
+| `nn::LayerNorm` | 层归一化，支持 `(features, batch_size)` 输入 |
+| `nn::MultiHeadAttention`| 带因果掩码的多头自注意力机制（Q, K, V 映射） |
+| `nn::GPTBlock` | 前置归一化架构的 GPT 解码器块 |
+| `nn::GPTModel` | 完整的 GPT 语言模型实现，内置 `generate()` 生成接口 |
+
+### 分词器（`<neuralnet/tokenizer.h>`）
+
+| 组件 | 说明 |
+|------|------|
+| `nn::Tokenizer` | 抽象基类（`encode` / `decode`） |
+| `nn::CharTokenizer` | 朴素字符级分词器（基于 UTF-8 映射） |
+| `nn::BPETokenizer` | 标准 BPE 分词器，支持解析 HF tokenizers 格式 JSON 词表 |
+| `nn::ByteZipTokenizer` | 优化的两阶段高频字节对和块分词器（带原生训练支持） |
 
 ### 损失（`<neuralnet/loss.h>`）
 

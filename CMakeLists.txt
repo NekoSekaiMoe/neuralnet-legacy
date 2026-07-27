@@ -78,6 +78,7 @@ target_link_libraries(neuralnet INTERFACE TBB::tbb)
 option(BUILD_EXAMPLES "Build example programs" ON)
 if(BUILD_EXAMPLES)
     add_subdirectory(examples/mnist)
+    add_subdirectory(examples/gpt)
 endif()
 
 # 启用 CTest

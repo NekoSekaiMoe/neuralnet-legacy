@@ -4,6 +4,25 @@ if(BUILD_TESTING)
     target_link_libraries(test_nn PRIVATE neuralnet::neuralnet)
     target_include_directories(test_nn PRIVATE ${PROJECT_SOURCE_DIR}/include)
 
+    add_executable(test_tensor test_tensor.cpp)
+    target_link_libraries(test_tensor PRIVATE neuralnet::neuralnet)
+    target_include_directories(test_tensor PRIVATE ${PROJECT_SOURCE_DIR}/include)
+    if(MSVC)
+        target_compile_options(test_tensor PRIVATE /UNDEBUG)
+    else()
+        target_compile_options(test_tensor PRIVATE -UNDEBUG)
+    endif()
+
+    set(tensor_test_names
+        tensor_add
+        tensor_matmul
+        tensor_relu
+        tensor_linear
+    )
+    foreach(name ${tensor_test_names})
+        add_test(NAME ${name} COMMAND test_tensor ${name})
+    endforeach()
+
     add_executable(test_transformer test_transformer.cpp)
     target_link_libraries(test_transformer PRIVATE neuralnet::neuralnet)
     target_include_directories(test_transformer PRIVATE ${PROJECT_SOURCE_DIR}/include)
@@ -125,5 +144,43 @@ if(BUILD_TESTING)
 
     foreach(name ${transformer_test_names})
         add_test(NAME transformer_${name} COMMAND test_transformer ${name})
+    endforeach()
+    add_executable(test_gpt test_gpt.cpp)
+    target_link_libraries(test_gpt PRIVATE neuralnet::neuralnet)
+    target_include_directories(test_gpt PRIVATE ${PROJECT_SOURCE_DIR}/include)
+    if(MSVC)
+        target_compile_options(test_gpt PRIVATE /UNDEBUG)
+    else()
+        target_compile_options(test_gpt PRIVATE -UNDEBUG)
+    endif()
+
+    set(gpt_test_names
+        causal_self_attention_shape
+        causal_self_attention_masking
+        gpt_block_shape
+        gpt_model_shape
+        gpt_model_numeric_grad
+        gpt_model_generate
+    )
+    foreach(name ${gpt_test_names})
+        add_test(NAME gpt_${name} COMMAND test_gpt ${name})
+    endforeach()
+
+    add_executable(test_tokenizer test_tokenizer.cpp)
+    target_link_libraries(test_tokenizer PRIVATE neuralnet::neuralnet)
+    target_include_directories(test_tokenizer PRIVATE ${PROJECT_SOURCE_DIR}/include)
+    if(MSVC)
+        target_compile_options(test_tokenizer PRIVATE /UNDEBUG)
+    else()
+        target_compile_options(test_tokenizer PRIVATE -UNDEBUG)
+    endif()
+
+    set(tokenizer_test_names
+        char_tokenizer
+        byte_zip_tokenizer_train
+        bpe_tokenizer_load_vocab
+    )
+    foreach(name ${tokenizer_test_names})
+        add_test(NAME tokenizer_${name} COMMAND test_tokenizer ${name})
     endforeach()
 endif()
