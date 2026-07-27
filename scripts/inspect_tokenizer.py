@@ -3,7 +3,7 @@ import sys
 from pathlib import Path
 
 # 使用 pathlib 处理路径并 with-managed
-vocab_path = Path(__file__).parent.parent / 'bpe_compatible.json'
+vocab_path = Path(__file__).resolve().parent.parent / 'data' / 'gpt_bpe.json'
 with open(vocab_path, encoding='utf-8') as f:
     d = json.load(f)
 v = d['vocab']

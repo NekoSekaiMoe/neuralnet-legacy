@@ -1,208 +1,137 @@
-Verify each finding against current code. Fix only still-valid issues, skip the
-rest with a brief reason, keep changes minimal, and validate.
-
 Inline comments:
 In `@include/neuralnet/module.h`:
-- Around line 100-106: Update the LinearModule weight initialization around the
-local rng so instances do not all produce identical matrices: replace the
-per-instance fixed seed with a shared random engine, while preserving the
-existing uniform distribution range and optionally allowing an externally
-configured seed for reproducibility.
+- Around line 1523-1570: Update the decoding conditions in the generation logic
+so temperature scaling applies only when temperature is positive and differs
+from 1.0, while token selection samples for every temperature greater than 0.0,
+including the default 1.0; reserve argmax decoding exclusively for temperature
+== 0.0.
+- Around line 1020-1056: 在 TransformerEncoderModule 构造函数中复用同文件既有的
+validated_num_patches 校验逻辑，确保传入的 num_patches 为有效非零值后再初始化 num_patches_；不要让
+forward 中的除法和取模接收到零值。
+- Around line 551-574: Update the backward-gradient block guarded by
+`in->requires_grad` to validate the `gamma_node` weak-pointer result before
+accessing `gamma_node->data`. Preserve the existing gradient computation when
+`gamma_node` is available, and follow the null-handling behavior already used at
+L532 and L547 for an expired node.
+- Line 1387: 在 forward() 中将 req_grad 从硬编码 true 改为根据输入 requires_grad
+与模型参数实际梯度需求推导；更新 generate() 使用 requires_grad=false 的 Tensor
+input，并在生成期间临时禁用参数梯度、完成后恢复原状态，以确保推理路径不构建或保留反向图。
 
-In `@include/neuralnet/tensor.h`:
-- Around line 296-305: Update include/neuralnet/tensor.h lines 296-305 in linear
-to use column-major indexing out_span[r + c * rows] and short-circuit when bias
-has no node (node_ == nullptr). Also update include/neuralnet/tensor.h lines
-572-582 in batchnorm1d so the feature index uses idx % num_features, preserving
-column-major layout throughout.
-- Around line 1-9: 添加缺失的标准库直接依赖：在 include/neuralnet/tensor.h 的头文件区域加入 <cmath> 和
-<random>，并删除使用 std::cout 的调试输出（无需为其新增 <iostream>）；在 include/neuralnet/module.h
-的头文件区域加入 <cmath> 和 <random>，确保各自使用的数学与随机数设施独立可编译。
-- Around line 166-173: Remove both std::cout debug statements from the backward
-propagation block in add, including the out->grad and in1->grad diagnostics.
-This eliminates the undeclared iostream dependency and prevents dereferencing
-in1->grad or accessing (0,0) for empty tensors; leave the existing gradient
-accumulation behavior unchanged.
+In `@ref`:
+- Line 1: 修复仓库中的 ref gitlink 配置：在 .gitmodules 中补充 ref
+的子模块路径和对应元数据，并确保引用的提交对象可获取；如果 ref 不应作为子模块，则移除该 gitlink，改为提交源码或声明为普通依赖。
+
+In `@refactor_norms_layers.py`:
+- Around line 88-130: Update each regex replacement in the migration logic,
+including bn1d_regex, bn2d_regex, and ln_regex, to use re.subn and capture the
+replacement count. Raise an error when any count is not exactly one, and only
+write layer.h after all three substitutions succeed.
+
+In `@review.md`:
+- Around line 188-190: 在 review.md 对应说明中，将索引表达式 `merges[best_priority][2]`
+用反引号标记为行内代码，确保 Markdown 将其作为代码而不是引用链接解析。
 
 In `@scripts/gui.py`:
-- Around line 910-911: 在 scripts/gui.py#L910-L911 的异常处理回调中，将 lambda
-注册时的错误消息通过默认参数固化，避免延迟执行时访问已被删除的 e；同样修改 scripts/gui.py#L1055-L1056 的 log_fn
-回调，确保两处都按捕获时的消息记录错误。
-- Around line 17-25: 修正脚本顶部的 BUILD_DIR 和可执行文件常量：从仓库根目录定位 build，并将 MNIST 目标指向
-build/examples/mnist 下的 mnist_train、mnist_infer，将文本训练/推理目标改为 build/examples/gpt
-下的 gpt_train、gpt_infer；保留现有 Windows 后缀逻辑，使
-_start_training、_start_infer、_recognize_drawing、_start_text_training 和
-_start_text_infer 能找到实际产物。
+- Around line 17-22: Update BUILD_DIR to derive from the resolved absolute path
+of __file__ before traversing to the project root and appending "build"; keep
+the executable path constants TRAIN_EXE, INFER_EXE, TEXT_TRAIN_EXE, and
+TEXT_INFER_EXE based on BUILD_DIR.
 
-In `@scripts/token_bench.py`:
-- Around line 38-63: Update the BPE encoding path around encode_bpe and
-encode_auto so initial byte values are converted to their corresponding
-single-byte vocabulary IDs before merge lookup. Build byte_to_id from the
-tokenizer vocabulary returned by load_tokenizer by mapping each length-one token
-to its ID, pass it into encode_auto/encode_bpe, and preserve the existing
-merge-priority behavior using vocabulary IDs throughout.
+In `@scripts/inspect_tokenizer.py`:
+- Around line 6-8: Update the vocab_path definition in inspect_tokenizer.py to
+reference the existing data/gpt_bpe.json artifact instead of the repository-root
+bpe_compatible.json, ensuring the subsequent open call loads the actual
+vocabulary file.
 
-In `@scripts/train_bpe.py`:
-- Around line 57-60: 调整临时文件处理流程：在 tokenizer.save 调用前关闭
-NamedTemporaryFile，避免文件句柄仍占用路径；围绕保存和后续使用加入 try/finally，并在 finally 中通过 os.unlink
-清理临时文件。更新 scripts/train_bpe.py 的导入以包含 os，并删除原先位置的 unlink，确保成功和异常路径都能完成清理。
-- Around line 40-43: 更新 scripts/train_bpe.py 中构建 vocab 的逻辑，避免在遍历 vocab_str_to_id
-时直接对所有 token_str 使用 UTF-8 编码。对 ByteLevel token 使用其反向字节映射还原原始字节（如
-Ġ→0x20、Ċ→0x0a），对普通特殊 token 保留原样 UTF-8 编码，并继续写入 vocab[tid]。
+In `@scripts/test_tokenizer.py`:
+- Line 1: 删除 scripts/test_tokenizer.py，或将其真正重命名为
+inspect_tokenizer.py，确保仓库中不再存在会被 pytest 默认收集的 test_tokenizer.py 占位文件。
+
+In `@test_topo.cpp`:
+- Around line 6-47: 将 test_topo.cpp 中自定义的 TensorNode、手写 stack/visited/expanded
+拓扑遍历替换为生产代码中的 nn::TensorNode 和实际 Tensor 图构造；通过 Tensor::backward()
+作为反向传播入口验证拓扑处理结果。删除测试内复制的遍历逻辑，并复用生产类型、API 及其可观察结果，确保测试能覆盖
+include/neuralnet/tensor.h 中的真实实现。
+- Around line 1-8: 在 test_topo.cpp 的 TensorNode 定义所在包含区域显式添加 <string>，确保
+std::string 直接依赖对应的标准头文件，不依赖 <iostream> 的传递包含。
+- Around line 49-52: 在遍历 topo
+的测试逻辑中加入对预期顺序（t1、t2、t3）的显式断言或比较，顺序不匹配时返回非零结果而不是仅打印输出；同时将该测试可执行文件注册到 CTest，确保 CI
+会执行它。
 
 ---
 
 Outside diff comments:
-In `@examples/gpt/infer.cpp`:
-- Around line 77-86: Validate that the values for --d-model, --num-heads,
---num-layers, --d-ff, and --seq-len are positive before converting them to
-std::size_t and assigning them to cfg. Reuse the existing --max-tokens
-validation behavior and reject invalid or negative values before they can reach
-build_gpt_model.
-
----
-
-Minor comments:
 In `@AGENTS.md`:
-- Line 16: 更新 AGENTS.md 中与本 PR 不一致的指导内容：将测试数量和构建目标补充
-test_gpt、test_tokenizer、test_tensor；在组件清单加入
-LayerNorm、MultiHeadAttention、GPTBlock、GPTModel；在测试文件和模块清单加入对应
-GPT、tokenizer、tensor 文件；删除 GPT/decoder 尚未实现的过时描述，并补充 V3 ModelSpec 序列化说明，使其与
-README 及当前实现一致。
+- Around line 57-68: Update the AGENTS.md “Test structure” and “CMake Options”
+documentation to reflect the current test and example targets introduced by the
+PR, including test_tensor, test_gpt, test_tokenizer, and the GPT examples.
+Remove or replace stale references to test_nn, mnist_train, and mnist_infer,
+preferably using the same general target wording as README.
 
-In `@include/neuralnet/module.h`:
-- Around line 296-330: 修复 BatchNorm eval 模式下 `normalized_tensor` 反向传播被静默截断的问题。更新
-`normalized_tensor.node()->backward_op` 的设置逻辑，使其在 `input.requires_grad()`
-且非训练模式时也注册反向函数；训练模式保留现有批统计公式，eval 模式使用 `running_var` 计算 `inv_std` 并按 `dx = g *
-inv_std` 累积输入梯度，与 `tensor.h::batchnorm1d` 保持一致。
-
-In `@README.md`:
-- Around line 284-296: 更新 README 的神经网络组件表，移除已删除的 nn::CausalSelfAttention
-条目，并改为记录使用 causal=true 构造的 nn::MultiHeadAttention。保持其余 GPT 组件和说明不变。
-- Around line 44-71: 更新 README.md 中的项目结构和“构建产物”列表，在 tests 目录及 build/tests
-目录分别补充新增的 test_tensor 和既有的 test_transformer；同时为新增的 build/代码围栏添加 text 语言标识，消除
-MD040 检查问题。
-
-In `@scripts/download_books.py`:
-- Around line 48-58: Update the download/write flow around strip_gutenberg and
-filepath so content is written to a temporary file in the same directory, then
-atomically renamed to filepath only after the write succeeds. Ensure failed
-downloads clean up the temporary file and never leave a partial cache file that
-later runs can reuse.
-
-In `@scripts/extract_digits.py`:
-- Around line 21-26: 在处理 row[0] 的 extract_digits 主流程中，先校验并转换 label
-为纯数字值，再使用其规范化后的字符串创建 label_dir；遇到非数字标签时跳过或按现有无效行处理逻辑处理，确保任何标签都不能通过路径遍历写入
-output_dir 之外，并保持后续 key=int 流程可正常执行。
-
-In `@scripts/test_tokenizer.py`:
-- Around line 1-10: Update the vocabulary inspection script to load the
-repository’s provided BPE vocabulary via a with-managed file handle instead of
-hardcoding the current working directory file. Read ascii_start defensively
-because the vocabulary JSON may contain only vocab, and prevent execution during
-pytest collection by renaming the script from the test naming pattern to an
-inspection-oriented name. In the parts handling near the reported line, split
-the single-line compound statement into separate statements to satisfy Ruff
-E701.
+In `@include/neuralnet/tensor.h`:
+- Around line 585-595: Update the normalization loop’s feature-index calculation
+to match Matrix row-major storage: derive the feature from the flattened index
+using batch_size, not num_features. Use this corrected feature index
+consistently for mean, inverse standard deviation, gamma, and beta lookups in
+the affine and non-affine paths.
+- Around line 111-116: 修改 TensorNode 的 backward() 起始梯度逻辑：仅在调用方尚未设置梯度时初始化全 1，保留
+TransformerEncoderModule 和 GPTModelModule 通过 out_t.grad() 写入的
+grad_sample（包括缩放和实际 logits 梯度）。如采用 seed_ones 参数，默认保持现有行为，并让这些模块调用 backward()
+时显式禁用单位梯度初始化。
 
 In `@scripts/token_bench.py`:
-- Around line 218-221: Remove the unnecessary try/except around
-token_bytes.decode in the token string conversion flow. Decode directly with
-UTF-8 and errors='replace', preserving the existing token_str result while
-eliminating the unreachable bare-except branch and its exception swallowing.
+- Around line 42-61: 更新合并逻辑：在构建 merge_priority 时使用 merges 的列表顺序作为 rank，而不是用
+new_id 比较优先级；选择 pair 时按最低 rank 合并，但仍使用对应的 new_id 替换。同步修改 chunks 的初始 ID 转换，避免
+byte_to_id.get(b, b) 将缺失字节回退为可能与 token ID 冲突的裸字节值，改为使用词表中明确且不冲突的字节 ID，或在缺失时显式报错。
 
-In `@scripts/train_bpe.py`:
-- Around line 31-49: Update the return annotation of extract_vocab_hex to
-describe its actual two-element return value: the vocabulary hex mapping and the
-vocabulary length. Keep the existing tuple return and its element types
-unchanged.
-
-In `@scripts/train_ByteZip.py`:
-- Line 268: 更新训练输出流程中 Path.write_text 的调用，显式指定 encoding="utf-8"，使
-scripts/train_ByteZip.py 与 train_vocab.py 的写入行为一致，并确保生成的 JSON 始终采用 UTF-8 编码。
-- Line 21: 同步更新 MAX_V2_SCAN_BYTES 及其行内注释，使常量实际值与注释描述一致；保留预期的扫描字节数，不要留下相互矛盾的容量说明。
-
-In `@scripts/train_vocab.py`:
-- Around line 1-12: Update the module docstring to match the current
-implementation: remove the unsupported --vocab-size option and describe that
-high-frequency tokens are assigned before ASCII characters fill remaining
-vocabulary slots. Keep the documented output behavior and valid --output usage
-accurate without changing implementation.
-- Around line 47-51: Update the vocabulary statistics in the relevant training
-flow: remove the unnecessary f-string prefix from the 100% coverage print, and
-calculate word_count from the words actually inserted into vocab after excluding
-special-token collisions such as <unk>, <pad>, and <num>, so ascii_count cannot
-become negative or misrepresent the vocabulary breakdown.
-
-In `@tests/test_tokenizer.cpp`:
-- Around line 62-73: 修正 tests/test_tokenizer.cpp 中 decode 预期输出逻辑的注释，使各步骤与最终断言
-"hello worldA 中 test" 一致：第 3 步及后续步骤均不得错误地添加初始前导空格，同时保留单词之间实际需要的空格说明。
-
----
-
-Duplicate comments:
-In `@include/neuralnet/layer.h`:
-- Around line 1683-1685: 在该位置嵌入计算逻辑中，避免序列长度超过 seq_len_ 时静默使用零向量；参照
-PositionalEncoding::forward 的行为，在 t 越界时显式抛出 std::invalid_argument。完成边界校验后，将 pe
-的三元表达式改为直接调用 pos_emb_.at_unchecked(t, d)，保持正常范围内的计算不变。
+In `@tests/test_transformer.cpp`:
+- Around line 424-454: Update test_vit_e2e_backward to invoke Tensor::backward()
+on the output after assigning loss.backward() to out.grad(), rather than calling
+out.node()->backward_op() directly. Keep the existing input gradient shape
+assertions so the test verifies gradients propagate through
+TransformerEncoderModule and PatchEmbeddingModule to input.
 
 ---
 
 Nitpick comments:
-In `@include/neuralnet/tensor.h`:
-- Around line 119-134: Replace the recursive build_topo traversal in the Tensor
-graph construction with an explicit-stack iterative traversal. Preserve the
-existing visited-set behavior, child traversal order, null-node handling, and
-postorder insertion into topo so the resulting topological order remains
-unchanged without risking call-stack overflow.
+In `@include/neuralnet/module.h`:
+- Around line 971-981: 为四个复合模块补充 on_mode_change 覆写并向所有子模块传播模式变化：在
+include/neuralnet/module.h:971-981 的 TransformerEncoderLayerModule 中依次转发给
+norm1_、mha_、norm2_、ffn_；在 include/neuralnet/module.h:1021-1028 的
+TransformerEncoderModule 中遍历 layers_ 转发；在 include/neuralnet/module.h:1278-1283 的
+GPTBlockModule 中转发给 self_attn_、norm1_、ff_、norm2_；在
+include/neuralnet/module.h:1329-1347 的 GPTModelModule 中遍历 blocks_，并转发给 ln_f_ 与
+lm_head_，沿用 Sequential 的模式传播行为。
 
 In `@scripts/csv_png.py`:
-- Around line 5-24: Refactor the script’s top-level CSV-to-image flow to use
-argparse-provided input and output paths instead of hardcoded
-"./build/digit.csv" and "./build/output.png" values. Add a main-entry guard so
-argument parsing and file processing run only when the script is executed
-directly, while preserving the existing pixel validation, reshaping, conversion,
-and image-saving behavior.
-
-In `@scripts/extract_digits.py`:
-- Around line 16-17: Update both CSV open calls in the extraction flow to
-explicitly specify newline='' and a consistent encoding, including the reader
-around csv.reader and the corresponding writer-side call. Preserve the existing
-CSV read/write behavior while ensuring embedded newlines and cross-platform text
-encoding are handled consistently.
-
-In `@scripts/gui.py`:
-- Around line 384-398: Remove the unused dist calculation from _paint_at and
-move the sigma-derived constant setup outside the nested pixel loops, while
-preserving the existing intensity calculation and drawing behavior.
-
-In `@scripts/save_dataset.py`:
-- Around line 7-13: Update export_to_csv so pixel values are rounded to four
-decimal places before writer.writerow emits them, while preserving the existing
-0–1 floating-point representation and label ordering.
-
-In `@scripts/token_bench.py`:
-- Line 132: Update the max_len parameter annotation in evaluate to explicitly
-allow None by using int | None, while preserving its default value and existing
-function behavior.
-- Around line 44-45: 更新合并优先级表构建逻辑：在遍历 merges 时让 merge_priority 直接将每个 (a, b)
-映射到对应的 new_id，避免未使用的循环变量。随后在使用 best_priority 的逻辑中直接取得该映射值，删除通过
-merges[best_priority][2] 的回查。
+- Around line 19-23: 在生成图像的流程中，更新 img_array 的缩放逻辑，在转换为 np.uint8 前先将像素值限制到 [0, 1]
+范围，确保超出范围的 CSV 值不会发生静默取模溢出；保持 Image.fromarray 和保存流程不变。
 
 In `@scripts/train_ByteZip.py`:
-- Around line 158-166: 在 build_v2_from_spans 的采样逻辑中避免直接修改调用方传入的 spans：先创建 spans
-的副本，再对该副本执行 random.shuffle，并使用副本完成采样；保持 MAX_V2_SCAN_BYTES 限制和最终 spans 赋值行为不变。
-- Around line 32-57: Reduce scan_v1’s memory usage for large corpora by adding
-bounded processing before populating freq, left_ctx, and right_ctx: process
-oversized tokenized input in chunks or sample a limited subset, and prune
-low-frequency substrings before retaining their context sets. Preserve existing
-substring enumeration and context semantics for the processed data while
-ensuring memory scales within a defined bound.
+- Line 291: 将最终词表写入逻辑改为原子写入：在训练结果保存处先写入同目录临时文件，完成并关闭后使用 os.replace
+替换目标路径，避免中断时留下损坏文件；复用 download_book 中现有的临时文件命名、清理和替换模式。
+- Around line 180-189: Update the sampling logic in the total_bytes >
+MAX_V2_SCAN_BYTES branch to preserve original span boundaries instead of
+concatenating sampled spans into one bytearray. Limit the sampled data to
+MAX_V2_SCAN_BYTES while keeping each selected span separate, and ensure the
+downstream n-gram scan processes spans independently so no cross-boundary
+substrings are generated.
 
 In `@tests/test_tensor.cpp`:
-- Around line 117-133: Update the test_tensor main entry point to match the
-exception-handling behavior of test_gpt.cpp and test_tokenizer.cpp: wrap test
-execution in try/catch for std::exception, print the failure reason, and return
-a failure status instead of terminating. Preserve the existing named-test
-dispatch while also supporting no-argument execution of all tests, and add the
-required standard headers including string and stdexcept.
+- Around line 114-145: 抽取 tests/test_tensor.cpp 中的 TestEntry、测试表遍历及 main
+分发逻辑为公共测试运行器头文件，并让 tensor 测试复用该实现；同时更新 tests/test_transformer.cpp
+使用相同的共享符号，保持批量执行、单测试执行、异常报告及未知测试返回值行为不变。
+- Line 1: 将 tests/test_tensor.cpp 和 tests/test_transformer.cpp 中重复的 TestEntry
+定义及 main 测试运行/分发逻辑抽取到公共头文件（如 tests/test_runner.h）。两个测试文件仅保留各自的 tests[]
+表并包含该头文件，确保共享逻辑可供后续 test_gpt.cpp 和 test_tokenizer.cpp 复用。
+
+In `@tests/test_transformer.cpp`:
+- Around line 309-318: 为 TransformerEncoderLayerModule 补充与
+test_encoder_layer_shape 对应的
+test_encoder_layer_backward_shape，用与文件中其他模块一致的方式执行反向传播并断言梯度形状；保持现有前向形状测试不变，并沿用已有反向测试使用的
+API 和断言风格。
+- Around line 488-514: Refactor the test dispatch logic in main and the tests
+collection handling into a shared header reused by test_tensor.cpp, avoiding
+duplicated runner code. Ensure test failures from assertions are reported by the
+shared runner, and verify the build configuration does not define NDEBUG so
+assertions in this test file remain active.

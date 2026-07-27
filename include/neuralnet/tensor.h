@@ -104,15 +104,15 @@ public:
     std::shared_ptr<TensorNode> node() const { return node_; }
 
     // 反向传播
-    void backward() {
+    void backward(bool seed_ones = true) {
         if (!node_->requires_grad) return;
         
-        // 自动将起始梯度置为 1
-        // 注意：TensorNode构造函数可能会把grad初始化为0，因此这里直接覆盖为1.0
-        node_->grad = Matrix(rows(), cols());
-        auto& span = node_->grad->data();
-        for (std::size_t i = 0; i < node_->grad->size(); ++i) {
-            span[i] = 1.0;
+        if (seed_ones) {
+            node_->grad = Matrix(rows(), cols());
+            auto& span = node_->grad->data();
+            for (std::size_t i = 0; i < node_->grad->size(); ++i) {
+                span[i] = 1.0;
+            }
         }
 
         // 拓扑排序
@@ -583,7 +583,7 @@ inline Tensor batchnorm1d(const Tensor& input, const Tensor& gamma, const Tensor
     auto& norm_span = normalized.data();
     
     for (std::size_t idx = 0; idx < input.data().size(); ++idx) {
-        std::size_t i = idx % num_features;
+        std::size_t i = idx / batch_size;
         double mu = mean_src.at_unchecked(i, 0);
         double norm = (in_span[idx] - mu) * inv_std[i];
         norm_span[idx] = norm;

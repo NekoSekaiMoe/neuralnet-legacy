@@ -308,15 +308,35 @@ static void test_feedforward_params()
 
 static void test_encoder_layer_shape()
 {
-    nn::TransformerEncoderLayerModule enc(16, 4, 64);
-    nn::Matrix in_m(16, 8);
-    nn::Tensor input(in_m);
-    nn::Tensor out = enc.forward(input);
-    assert(out.rows() == 16);
-    assert(out.cols() == 8);
+    std::size_t d_model = 16, num_heads = 4, d_ff = 64;
+    nn::TransformerEncoderLayerModule layer(d_model, num_heads, d_ff);
+
+    const std::size_t batch = 2, seq_len = 10;
+    nn::Matrix in_m(d_model, batch * seq_len, 1.0);
+    nn::Tensor input(in_m, true);
+
+    nn::Tensor out = layer.forward(input);
+    assert(out.rows() == d_model);
+    assert(out.cols() == batch * seq_len);
 }
 
-// ── TransformerEncoder ──────────────────────────────────────────────────────
+static void test_encoder_layer_backward_shape()
+{
+    std::size_t d_model = 16, num_heads = 4, d_ff = 64;
+    nn::TransformerEncoderLayerModule layer(d_model, num_heads, d_ff);
+
+    const std::size_t batch = 2, seq_len = 10;
+    nn::Matrix in_m(d_model, batch * seq_len, 1.0);
+    nn::Tensor input(in_m, true);
+
+    nn::Tensor out = layer.forward(input);
+    
+    out.grad() = nn::Matrix(d_model, batch * seq_len, 1.0);
+    out.backward(false);
+    
+    assert(input.grad().rows() == d_model);
+    assert(input.grad().cols() == batch * seq_len);
+}
 
 static void test_encoder_forward_shape()
 {
@@ -326,11 +346,16 @@ static void test_encoder_forward_shape()
     std::mt19937_64 rng(42);
     std::normal_distribution<double> dist(0.0, 0.1);
     for (auto &v : in_m.data()) v = dist(rng);
-    nn::Tensor input(in_m);
+    nn::Tensor input(in_m, true);
 
     nn::Tensor out = enc.forward(input);
-    assert(out.rows() == d_model);
-    assert(out.cols() == batch);
+    
+    nn::Matrix grad_out(d_model, batch, 0.01);
+    out.grad() = grad_out;
+    out.node()->backward_op();
+    
+    assert(input.grad().rows() == d_model);
+    assert(input.grad().cols() == num_patches * batch);
 }
 
 static void test_encoder_backward_shape()
@@ -345,7 +370,7 @@ static void test_encoder_backward_shape()
 
     nn::Tensor out = enc.forward(input);
     
-    nn::Matrix grad_out(d_model, batch, 0.01);
+    nn::Matrix grad_out(d_model, num_patches * batch, 0.01);
     out.grad() = grad_out;
     out.node()->backward_op();
     
@@ -448,17 +473,16 @@ static void test_vit_e2e_backward()
     (void)lv;
 
     out.grad() = loss.backward();
-    out.node()->backward_op();
+    out.backward(false);
     assert(input.grad().rows() == img * img);
     assert(input.grad().cols() == batch);
 }
 
 // ── Dispatch ────────────────────────────────────────────────────────────────
 
-using TestFn = void (*)();
-struct TestEntry { const char *name; TestFn fn; };
+#include "test_runner.h"
 
-static const TestEntry tests[] = {
+TestEntry tests[] = {
     {"matrix_resize",                      test_matrix_resize},
     {"matrix_row_slice",                   test_matrix_row_slice},
     {"matrix_set_row_slice",               test_matrix_set_row_slice},
@@ -477,6 +501,7 @@ static const TestEntry tests[] = {
     {"feedforward_shape",                  test_feedforward_shape},
     {"feedforward_params",                 test_feedforward_params},
     {"encoder_layer_shape",                test_encoder_layer_shape},
+    {"encoder_layer_backward_shape",       test_encoder_layer_backward_shape},
     {"encoder_forward_shape",              test_encoder_forward_shape},
     {"encoder_backward_shape",             test_encoder_backward_shape},
     {"patch_embedding_shape",              test_patch_embedding_shape},
@@ -487,28 +512,5 @@ static const TestEntry tests[] = {
 
 int main(int argc, char *argv[])
 {
-    if (argc < 2)
-    {
-        std::size_t passed = 0;
-        for (const auto &t : tests)
-        {
-            try { t.fn(); ++passed; std::cout << "  PASSED  " << t.name << "\n"; }
-            catch (const std::exception &e)
-            { std::cout << "  FAILED  " << t.name << " : " << e.what() << "\n"; }
-        }
-        std::cout << passed << "/" << (sizeof(tests) / sizeof(tests[0])) << " passed\n";
-        return passed == sizeof(tests) / sizeof(tests[0]) ? 0 : 1;
-    }
-
-    for (const auto &t : tests)
-    {
-        if (std::string(argv[1]) == t.name)
-        {
-            try { t.fn(); std::cout << "  PASSED  " << t.name << "\n"; return 0; }
-            catch (const std::exception &e)
-            { std::cout << "  FAILED  " << t.name << " : " << e.what() << "\n"; return 1; }
-        }
-    }
-    std::cerr << "Unknown test: " << argv[1] << "\n";
-    return 1;
+    return run_tests(argc, argv, tests, sizeof(tests) / sizeof(tests[0]));
 }

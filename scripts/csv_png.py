@@ -17,7 +17,7 @@ def main():
         raise ValueError(f"像素数量错误，期望 784，实际 {pixels.size}")
 
     img_array = pixels.reshape(28, 28)
-    img_array = (img_array * 255).astype(np.uint8)
+    img_array = (np.clip(img_array, 0, 1) * 255).astype(np.uint8)
 
     img = Image.fromarray(img_array, mode="L")
     img.save(args.output)

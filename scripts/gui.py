@@ -14,7 +14,7 @@ from tkinter import ttk, filedialog, messagebox
 from pathlib import Path
 
 # ── 常量 ──────────────────────────────────────────────
-BUILD_DIR = Path(__file__).parent.parent / "build"
+BUILD_DIR = Path(__file__).resolve().parent.parent / "build"
 _EXE_SUFFIX = ".exe" if sys.platform == "win32" else ""
 TRAIN_EXE = BUILD_DIR / "examples" / "mnist" / f"mnist_train{_EXE_SUFFIX}"
 INFER_EXE = BUILD_DIR / "examples" / "mnist" / f"mnist_infer{_EXE_SUFFIX}"

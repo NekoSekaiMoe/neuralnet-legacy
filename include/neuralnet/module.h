@@ -25,7 +25,7 @@ namespace nn
 
         virtual Tensor forward(const Tensor &input) = 0;
         
-        virtual void on_mode_change(bool training) {}
+        virtual void on_mode_change(bool /*training*/) {}
         virtual bool has_state() const { return false; }
     };
 
@@ -551,20 +551,21 @@ namespace nn
                     if (in && in->requires_grad)
                     {
                         Matrix grad_input(feat, batch);
-                        const Matrix &g = gamma_node->data;
                         for (std::size_t j = 0; j < batch; ++j)
                         {
                             double inv_std = (*inv_std_cache_ptr)[j];
                             double sum_dxhat = 0.0, sum_dxhat_xhat = 0.0;
                             for (std::size_t i = 0; i < feat; ++i)
                             {
-                                double dxhat = grad_output.at_unchecked(i, j) * g.at_unchecked(i, 0);
+                                double g_val = gamma_node ? gamma_node->data.at_unchecked(i, 0) : 1.0;
+                                double dxhat = grad_output.at_unchecked(i, j) * g_val;
                                 sum_dxhat += dxhat;
                                 sum_dxhat_xhat += dxhat * norm_m_ptr->at_unchecked(i, j);
                             }
                             for (std::size_t i = 0; i < feat; ++i)
                             {
-                                double dxhat = grad_output.at_unchecked(i, j) * g.at_unchecked(i, 0);
+                                double g_val = gamma_node ? gamma_node->data.at_unchecked(i, 0) : 1.0;
+                                double dxhat = grad_output.at_unchecked(i, j) * g_val;
                                 grad_input.set_value_unchecked(i, j,
                                     inv_std / N * (N * dxhat - sum_dxhat
                                         - norm_m_ptr->at_unchecked(i, j) * sum_dxhat_xhat));
@@ -987,6 +988,14 @@ namespace nn
             return norm1_.param_count() + mha_.param_count() + norm2_.param_count() + ffn_.param_count();
         }
         
+        void on_mode_change(bool training) override
+        {
+            norm1_.on_mode_change(training);
+            mha_.on_mode_change(training);
+            norm2_.on_mode_change(training);
+            ffn_.on_mode_change(training);
+        }
+
         std::vector<Tensor> parameters() override
         {
             std::vector<Tensor> p;
@@ -1017,17 +1026,29 @@ namespace nn
         std::size_t d_model_;
         std::size_t num_patches_;
 
+        static std::size_t validated_num_patches(std::size_t num_patches)
+        {
+            if (num_patches == 0)
+                throw std::invalid_argument("num_patches must be > 0");
+            return num_patches;
+        }
+
     public:
         TransformerEncoderModule(std::size_t d_model, std::size_t num_heads,
                                  std::size_t d_ff, std::size_t num_layers,
                                  std::size_t num_patches)
-            : d_model_(d_model), num_patches_(num_patches)
+            : d_model_(d_model), num_patches_(validated_num_patches(num_patches))
         {
             for (std::size_t i = 0; i < num_layers; ++i)
                 layers_.push_back(std::make_shared<TransformerEncoderLayerModule>(d_model, num_heads, d_ff));
         }
 
         const char *name() const override { return "TransformerEncoderModule"; }
+
+        void on_mode_change(bool training) override
+        {
+            for (auto &l : layers_) l->on_mode_change(training);
+        }
 
         std::size_t param_count() const noexcept override
         {
@@ -1121,7 +1142,7 @@ namespace nn
                         }
                         
                         out_t.grad() = grad_sample;
-                        out_t.backward();
+                        out_t.backward(false);
                         
                         if (in && in->requires_grad)
                         {
@@ -1290,6 +1311,14 @@ namespace nn
                  + ff_.param_count() + norm2_.param_count();
         }
 
+        void on_mode_change(bool training) override
+        {
+            self_attn_.on_mode_change(training);
+            norm1_.on_mode_change(training);
+            ff_.on_mode_change(training);
+            norm2_.on_mode_change(training);
+        }
+
         std::vector<Tensor> parameters() override
         {
             std::vector<Tensor> params;
@@ -1358,6 +1387,13 @@ namespace nn
             return p;
         }
 
+        void on_mode_change(bool training) override
+        {
+            for (auto &b : blocks_) b->on_mode_change(training);
+            ln_f_.on_mode_change(training);
+            lm_head_.on_mode_change(training);
+        }
+
         std::vector<Tensor> parameters() override
         {
             std::vector<Tensor> params;
@@ -1384,7 +1420,8 @@ namespace nn
             auto sample_inputs = std::make_shared<std::vector<Tensor>>();
             auto sample_outputs = std::make_shared<std::vector<Tensor>>();
 
-            bool req_grad = true; 
+            bool req_grad = input.requires_grad();
+            for (auto &p : parameters()) if (p.requires_grad()) req_grad = true;
 
             for (std::size_t b = 0; b < batch; ++b)
             {
@@ -1484,7 +1521,7 @@ namespace nn
                                 grad_sample.set_value_unchecked(r, t, grad_output.at_unchecked(r, t * batch + b));
                         
                         logits_t.grad() = grad_sample;
-                        logits_t.backward();
+                        logits_t.backward(false);
                     }
                 };
             }
@@ -1496,6 +1533,14 @@ namespace nn
                                           std::size_t max_new_tokens,
                                           double temperature = 1.0)
         {
+            // Disable parameter gradients during generation
+            std::vector<bool> orig_req_grad;
+            auto params = parameters();
+            for (auto &p : params) {
+                orig_req_grad.push_back(p.requires_grad());
+                p.node()->requires_grad = false;
+            }
+
             std::vector<std::size_t> context(prompt);
             std::vector<std::size_t> generated;
             std::mt19937_64 rng{std::random_device{}()};
@@ -1512,7 +1557,7 @@ namespace nn
                 for (std::size_t t = 0; t < cur_len; ++t)
                     input_m.set_value_unchecked(t, 0, static_cast<double>(context[start + t]));
 
-                Tensor input(input_m);
+                Tensor input(input_m, false);
                 Tensor logits_t = forward(input);
                 Matrix logits = logits_t.data();
 
@@ -1520,28 +1565,28 @@ namespace nn
                 for (std::size_t v = 0; v < vocab_size_; ++v)
                     last_logits[v] = logits.at_unchecked(v, cur_len - 1);
 
-                if (temperature > 0.0 && temperature != 1.0)
-                {
-                    for (auto &v : last_logits)
-                        v /= temperature;
-                }
-
-                double max_val = last_logits[0];
-                for (std::size_t v = 1; v < vocab_size_; ++v)
-                    max_val = std::max(max_val, last_logits[v]);
-                
-                double sum_exp = 0.0;
-                for (auto &v : last_logits)
-                {
-                    v = std::exp(v - max_val);
-                    sum_exp += v;
-                }
-                for (auto &v : last_logits)
-                    v /= sum_exp;
-
                 std::size_t next_token;
-                if (temperature > 0.0 && temperature != 1.0)
+                if (temperature > 0.0)
                 {
+                    if (temperature != 1.0)
+                    {
+                        for (auto &v : last_logits)
+                            v /= temperature;
+                    }
+
+                    double max_val = last_logits[0];
+                    for (std::size_t v = 1; v < vocab_size_; ++v)
+                        max_val = std::max(max_val, last_logits[v]);
+                    
+                    double sum_exp = 0.0;
+                    for (auto &v : last_logits)
+                    {
+                        v = std::exp(v - max_val);
+                        sum_exp += v;
+                    }
+                    for (auto &v : last_logits)
+                        v /= sum_exp;
+
                     double r = dist(rng);
                     double cumulative = 0.0;
                     next_token = vocab_size_ - 1;
@@ -1573,6 +1618,11 @@ namespace nn
                 context.push_back(next_token);
             }
             
+            // Restore parameter gradients
+            for (std::size_t i = 0; i < params.size(); ++i) {
+                params[i].node()->requires_grad = orig_req_grad[i];
+            }
+
             return generated;
         }
     };

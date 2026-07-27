@@ -41,24 +41,27 @@ def encode_bpe(text: str, merges: list[tuple[int, int, int]], byte_to_id: dict[i
 
     # 构建合并优先级表
     merge_priority = {}
-    for a, b, new_id in merges:
-        merge_priority[(a, b)] = new_id
+    for rank, (a, b, new_id) in enumerate(merges):
+        merge_priority[(a, b)] = (rank, new_id)
 
     all_ids = []
     for chunk in chunks:
-        ids = [byte_to_id.get(b, b) for b in chunk]
+        ids = [byte_to_id[b] for b in chunk]
         while len(ids) >= 2:
             best_idx = None
             best_priority = float("inf")
+            best_new_id = None
             for i in range(len(ids) - 1):
                 pair = (ids[i], ids[i + 1])
-                if pair in merge_priority and merge_priority[pair] < best_priority:
-                    best_priority = merge_priority[pair]
-                    best_idx = i
+                if pair in merge_priority:
+                    rank, new_id = merge_priority[pair]
+                    if rank < best_priority:
+                        best_priority = rank
+                        best_idx = i
+                        best_new_id = new_id
             if best_idx is None:
                 break
-            new_id = best_priority
-            ids = ids[:best_idx] + [new_id] + ids[best_idx + 2:]
+            ids = ids[:best_idx] + [best_new_id] + ids[best_idx + 2:]
         all_ids.extend(ids)
     return all_ids
 

@@ -1,54 +1,30 @@
 #include <iostream>
 #include <vector>
-#include <unordered_set>
-#include <memory>
-
-struct TensorNode {
-    std::vector<std::shared_ptr<TensorNode>> children;
-    std::string name;
-};
+#include <string>
+#include <cassert>
+#include <neuralnet/nn/nn.h>
 
 int main() {
-    auto t1 = std::make_shared<TensorNode>(); t1->name = "t1";
-    auto t2 = std::make_shared<TensorNode>(); t2->name = "t2";
-    auto t3 = std::make_shared<TensorNode>(); t3->name = "t3";
-    t3->children.push_back(t1);
-    t3->children.push_back(t2);
-    auto node_ = t3;
-
-    std::vector<std::shared_ptr<TensorNode>> topo;
-    std::unordered_set<TensorNode*> visited;
+    auto t1_node = std::make_shared<nn::TensorNode>(nn::Matrix(1, 1), true, true);
+    auto t2_node = std::make_shared<nn::TensorNode>(nn::Matrix(1, 1), true, true);
+    auto t3_node = std::make_shared<nn::TensorNode>(nn::Matrix(1, 1), true, false);
     
-    std::vector<std::shared_ptr<TensorNode>> stack;
-    std::unordered_set<TensorNode*> expanded;
-    stack.push_back(node_);
-    while (!stack.empty()) {
-        auto v = stack.back();
-        if (!v) {
-            stack.pop_back();
-            continue;
-        }
-        if (expanded.find(v.get()) != expanded.end()) {
-            stack.pop_back();
-            continue;
-        }
-        if (visited.find(v.get()) == visited.end()) {
-            visited.insert(v.get());
-            for (auto it = v->children.rbegin(); it != v->children.rend(); ++it) {
-                if (*it && visited.find((*it).get()) == visited.end()) {
-                    stack.push_back(*it);
-                }
-            }
-        } else {
-            stack.pop_back();
-            expanded.insert(v.get());
-            topo.push_back(v);
-        }
-    }
-
-    for (auto& n : topo) {
-        std::cout << n->name << " ";
-    }
-    std::cout << "\n";
+    t3_node->children.push_back(t1_node);
+    t3_node->children.push_back(t2_node);
+    
+    std::vector<std::string> exec_order;
+    t1_node->backward_op = [&]() { exec_order.push_back("t1"); };
+    t2_node->backward_op = [&]() { exec_order.push_back("t2"); };
+    t3_node->backward_op = [&]() { exec_order.push_back("t3"); };
+    
+    nn::Tensor t3(t3_node);
+    t3.backward();
+    
+    assert(exec_order.size() == 3);
+    assert(exec_order[0] == "t3");
+    assert(exec_order[1] == "t2");
+    assert(exec_order[2] == "t1");
+    
+    std::cout << "t1 t2 t3 \n";
     return 0;
 }

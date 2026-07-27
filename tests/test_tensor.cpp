@@ -111,10 +111,7 @@ void test_tensor_linear() {
     std::cout << "test_tensor_linear passed\n";
 }
 
-struct TestEntry {
-    const char* name;
-    void (*fn)();
-};
+#include "test_runner.h"
 
 TestEntry tests[] = {
     {"tensor_add", test_tensor_add},
@@ -124,22 +121,5 @@ TestEntry tests[] = {
 };
 
 int main(int argc, char** argv) {
-    if (argc < 2) {
-        std::size_t passed = 0;
-        for (const auto& t : tests) {
-            try { t.fn(); ++passed; std::cout << "  PASSED  " << t.name << "\n"; }
-            catch (const std::exception& e) { std::cout << "  FAILED  " << t.name << " : " << e.what() << "\n"; }
-        }
-        std::cout << passed << "/" << (sizeof(tests)/sizeof(tests[0])) << " passed\n";
-        return passed == sizeof(tests)/sizeof(tests[0]) ? 0 : 1;
-    }
-    std::string test_name = argv[1];
-    for (const auto& t : tests) {
-        if (test_name == t.name) {
-            try { t.fn(); std::cout << "  PASSED  " << t.name << "\n"; return 0; }
-            catch (const std::exception& e) { std::cout << "  FAILED  " << t.name << " : " << e.what() << "\n"; return 1; }
-        }
-    }
-    std::cerr << "Unknown test: " << test_name << "\n";
-    return 1;
+    return run_tests(argc, argv, tests, sizeof(tests)/sizeof(tests[0]));
 }

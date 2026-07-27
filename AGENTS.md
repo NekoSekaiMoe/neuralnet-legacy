@@ -56,14 +56,14 @@ This is a header-only C++17 neural network library. All code lives in `include/n
 
 **Transformer components**: LayerNorm, Softmax, PositionalEncoding, MultiHeadAttention, FeedForward, GPTBlock, GPTModel, PatchEmbedding.
 
-**Test structure**: Tests use `<cassert>` (not a framework). Each test is a named function in `test_nn.cpp` or `test_transformer.cpp`, dispatched by name via command-line argument. The CMake config forces `-UNDEBUG` so assertions remain active even in Release builds.
+**Test structure**: Tests use `<cassert>` (not a framework). Each test is a named function in test files (like `test_tensor.cpp`, `test_gpt.cpp`, `test_tokenizer.cpp`, `test_transformer.cpp`), dispatched by name via command-line argument. The CMake config forces `-UNDEBUG` so assertions remain active even in Release builds.
 
 ## CMake Options
 
 | Option | Default | Notes |
 |--------|---------|-------|
-| `BUILD_TESTING` | ON (top-level) | Builds test_nn and test_transformer |
-| `BUILD_EXAMPLES` | ON | Builds mnist_train and mnist_infer |
+| `BUILD_TESTING` | ON (top-level) | Builds tests (test_tensor, test_gpt, test_tokenizer, test_transformer) |
+| `BUILD_EXAMPLES` | ON | Builds examples (mnist, gpt) |
 | `ENABLE_ASAN` | OFF | Requires Debug or RelWithDebInfo |
 | `ENABLE_UBSAN` | OFF | Requires Debug or RelWithDebInfo |
 

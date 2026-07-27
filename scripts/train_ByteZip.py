@@ -178,15 +178,17 @@ def build_v2_from_spans(spans, max_len, max_items):
 
     # 采样
     if total_bytes > MAX_V2_SCAN_BYTES:
-        sampled = bytearray()
+        sampled_spans = []
+        current_bytes = 0
         spans_copy = list(spans)
         random.shuffle(spans_copy)
         for span in spans_copy:
-            if len(sampled) >= MAX_V2_SCAN_BYTES:
+            if current_bytes >= MAX_V2_SCAN_BYTES:
                 break
-            remaining = MAX_V2_SCAN_BYTES - len(sampled)
-            sampled.extend(span[:remaining])
-        spans = [bytes(sampled)]
+            remaining = MAX_V2_SCAN_BYTES - current_bytes
+            sampled_spans.append(bytes(span[:remaining]))
+            current_bytes += remaining
+        spans = sampled_spans
 
     freq_v2 = Counter()
     for span in spans:
@@ -288,7 +290,11 @@ def main():
         "byte_offset": BYTE_OFFSET,
         "special_tokens": SPECIAL_TOKENS,
     }
-    Path(args.output).write_text(json.dumps(data, indent=2), encoding="utf-8")
+    import os
+    out_path = Path(args.output)
+    tmp_path = out_path.with_name(out_path.name + ".tmp")
+    tmp_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    os.replace(tmp_path, out_path)
     print(f"保存至: {args.output}")
 
 if __name__ == "__main__":
