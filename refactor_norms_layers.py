@@ -86,7 +86,8 @@ bn1d_new = """    class BatchNorm1d : public Layer
         }
     };\n"""
 content, count = bn1d_regex.subn(bn1d_new, content)
-if count != 1: raise RuntimeError("bn1d_regex mismatch")
+if count != 1:
+    raise RuntimeError("bn1d_regex mismatch")
 
 bn2d_regex = re.compile(r'    class BatchNorm2d : public BatchNorm1d\s*\{.*?\n    };\n', re.DOTALL)
 bn2d_new = """    class BatchNorm2d : public BatchNorm1d
@@ -96,7 +97,8 @@ bn2d_new = """    class BatchNorm2d : public BatchNorm1d
         const char *name() const override { return "BatchNorm2d"; }
     };\n"""
 content, count = bn2d_regex.subn(bn2d_new, content)
-if count != 1: raise RuntimeError("bn2d_regex mismatch")
+if count != 1:
+    raise RuntimeError("bn2d_regex mismatch")
 
 ln_regex = re.compile(r'    class LayerNorm final : public Layer\s*\{.*?\n    };\n', re.DOTALL)
 ln_new = """    class LayerNorm final : public Layer
@@ -127,7 +129,8 @@ ln_new = """    class LayerNorm final : public Layer
         }
     };\n"""
 content, count = ln_regex.subn(ln_new, content)
-if count != 1: raise RuntimeError("ln_regex mismatch")
+if count != 1:
+    raise RuntimeError("ln_regex mismatch")
 
 with open('include/neuralnet/layer.h', 'w', encoding='utf-8') as f:
     f.write(content)

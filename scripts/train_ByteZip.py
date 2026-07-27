@@ -186,8 +186,9 @@ def build_v2_from_spans(spans, max_len, max_items):
             if current_bytes >= MAX_V2_SCAN_BYTES:
                 break
             remaining = MAX_V2_SCAN_BYTES - current_bytes
-            sampled_spans.append(bytes(span[:remaining]))
-            current_bytes += remaining
+            to_add = bytes(span[:remaining])
+            sampled_spans.append(to_add)
+            current_bytes += len(to_add)
         spans = sampled_spans
 
     freq_v2 = Counter()
