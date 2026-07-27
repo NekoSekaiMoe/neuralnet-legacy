@@ -145,4 +145,20 @@ if(BUILD_TESTING)
     foreach(name ${gpt_test_names})
         add_test(NAME gpt_${name} COMMAND test_gpt ${name})
     endforeach()
+
+    add_executable(test_tokenizer test_tokenizer.cpp)
+    target_include_directories(test_tokenizer PRIVATE ${PROJECT_SOURCE_DIR}/include)
+    if(MSVC)
+        target_compile_options(test_tokenizer PRIVATE /UNDEBUG)
+    else()
+        target_compile_options(test_tokenizer PRIVATE -UNDEBUG)
+    endif()
+
+    set(tokenizer_test_names
+        char_tokenizer
+        byte_zip_tokenizer_train
+    )
+    foreach(name ${tokenizer_test_names})
+        add_test(NAME tokenizer_${name} COMMAND test_tokenizer ${name})
+    endforeach()
 endif()

@@ -15,6 +15,7 @@
 #include <neuralnet/dataloader.h>
 #include <neuralnet/grad_clip.h>
 #include <neuralnet/summary.h>
+#include <neuralnet/tokenizer.h>
 
 namespace nn
 {
