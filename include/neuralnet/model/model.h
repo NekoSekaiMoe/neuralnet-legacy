@@ -12,9 +12,25 @@
 
 #include <neuralnet/nn/config.h>
 #include <neuralnet/layer.h>
+#include <optional>
 
 namespace nn
 {
+    enum class ModelType : uint32_t {
+        Unknown = 0,
+        Sequential = 1,
+        GPT = 2
+    };
+
+    struct ModelSpec {
+        ModelType type = ModelType::Unknown;
+        std::size_t vocab_size = 0;
+        std::size_t d_model = 0;
+        std::size_t seq_len = 0;
+        std::size_t num_heads = 0;
+        std::size_t d_ff = 0;
+        std::size_t num_layers = 0;
+    };
     class Model
     {
     private:
@@ -46,6 +62,12 @@ namespace nn
         [[nodiscard]] const std::vector<std::unique_ptr<Layer>> &get_layers() const noexcept
         {
             return layers_;
+        }
+
+        [[nodiscard]] Layer& layer_at(std::size_t index)
+        {
+            if (index >= layers_.size()) throw std::out_of_range("Layer index out of range");
+            return *layers_[index];
         }
 
         // ── summary (F4) ──
@@ -156,23 +178,35 @@ namespace nn
         //     layer->save_state(os)
         //
         // 注意：网络结构（各层维度）必须与加载时一致。load() 按版本分发；未知版本抛错。
-        void save(const std::string &filename)
+        void save(const std::string &filename, const std::optional<ModelSpec>& spec = std::nullopt)
         {
             std::ofstream ofs(filename, std::ios::binary);
             if (!ofs)
             {
                 throw std::runtime_error("Cannot write model file: " + filename);
             }
-            save(ofs);
+            save(ofs, spec);
             std::cout << "Model saved to " << filename << std::endl;
         }
 
-        void save(std::ostream &os)
+        void save(std::ostream &os, const std::optional<ModelSpec>& spec = std::nullopt)
         {
             const uint32_t magic = 0x4E4E4E4E;
-            const uint32_t version = 2;
+            const uint32_t version = spec.has_value() ? 3 : 2;
             os.write(reinterpret_cast<const char *>(&magic), sizeof(magic));
             os.write(reinterpret_cast<const char *>(&version), sizeof(version));
+
+            if (version == 3)
+            {
+                ModelType type = spec->type;
+                os.write(reinterpret_cast<const char *>(&type), sizeof(type));
+                os.write(reinterpret_cast<const char *>(&spec->vocab_size), sizeof(std::size_t));
+                os.write(reinterpret_cast<const char *>(&spec->d_model), sizeof(std::size_t));
+                os.write(reinterpret_cast<const char *>(&spec->seq_len), sizeof(std::size_t));
+                os.write(reinterpret_cast<const char *>(&spec->num_heads), sizeof(std::size_t));
+                os.write(reinterpret_cast<const char *>(&spec->d_ff), sizeof(std::size_t));
+                os.write(reinterpret_cast<const char *>(&spec->num_layers), sizeof(std::size_t));
+            }
 
             auto write_matrix = [&](const Matrix &m)
             {
@@ -229,9 +263,22 @@ namespace nn
             {
                 throw std::runtime_error("Invalid model file format");
             }
-            if (version != 1 && version != 2)
+            if (version != 1 && version != 2 && version != 3)
             {
                 throw std::runtime_error("Unsupported model file version");
+            }
+
+            if (version == 3)
+            {
+                ModelType type;
+                std::size_t dummy;
+                is.read(reinterpret_cast<char *>(&type), sizeof(type));
+                is.read(reinterpret_cast<char *>(&dummy), sizeof(dummy));
+                is.read(reinterpret_cast<char *>(&dummy), sizeof(dummy));
+                is.read(reinterpret_cast<char *>(&dummy), sizeof(dummy));
+                is.read(reinterpret_cast<char *>(&dummy), sizeof(dummy));
+                is.read(reinterpret_cast<char *>(&dummy), sizeof(dummy));
+                is.read(reinterpret_cast<char *>(&dummy), sizeof(dummy));
             }
 
             auto read_matrix = [&](Matrix &m)
