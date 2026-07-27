@@ -139,6 +139,8 @@ if(BUILD_TESTING)
         causal_self_attention_shape
         causal_self_attention_masking
         gpt_block_shape
+        gpt_model_shape
+        gpt_model_generate
     )
     foreach(name ${gpt_test_names})
         add_test(NAME gpt_${name} COMMAND test_gpt ${name})

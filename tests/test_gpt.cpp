@@ -74,6 +74,32 @@ static void test_gpt_block_shape()
     assert(grad_in.cols() == 10);
 }
 
+static void test_gpt_model_shape()
+{
+    // vocab_size=100, d_model=16, seq_len=10, num_heads=4, d_ff=32, num_layers=2
+    nn::GPTModel model(100, 16, 10, 4, 32, 2);
+    nn::Matrix input(5, 2); // seq_len=5, batch_size=2
+    for (std::size_t i = 0; i < input.size(); ++i)
+        input.data()[i] = static_cast<double>(i % 100);
+
+    nn::Matrix out = model.forward(input);
+    assert(out.rows() == 100);
+    assert(out.cols() == 10); // seq_len=5 * batch_size=2 = 10
+
+    nn::Matrix grad_out(100, 10, 0.1);
+    nn::Matrix grad_in = model.backward(grad_out);
+    assert(grad_in.rows() == 5);
+    assert(grad_in.cols() == 2);
+}
+
+static void test_gpt_model_generate()
+{
+    nn::GPTModel model(100, 16, 10, 4, 32, 2);
+    std::vector<std::size_t> prompt = {1, 2, 3};
+    auto generated = model.generate(prompt, 5, 0.0); // greedy
+    assert(generated.size() == 5);
+}
+
 struct TestEntry {
     const char *name;
     void (*fn)();
@@ -82,7 +108,9 @@ struct TestEntry {
 static const TestEntry tests[] = {
     {"causal_self_attention_shape", test_causal_self_attention_shape},
     {"causal_self_attention_masking", test_causal_self_attention_masking},
-    {"gpt_block_shape", test_gpt_block_shape}
+    {"gpt_block_shape", test_gpt_block_shape},
+    {"gpt_model_shape", test_gpt_model_shape},
+    {"gpt_model_generate", test_gpt_model_generate}
 };
 
 int main(int argc, char *argv[])

@@ -1735,6 +1735,274 @@ namespace nn
         }
     };
 
+    // ── GPTModel ─────────────────────────────────────────────────────────────
+    class GPTModel final : public Layer
+    {
+    private:
+        std::size_t vocab_size_;
+        std::size_t d_model_;
+        std::size_t seq_len_;
+
+        Matrix token_emb_;
+        Matrix grad_token_emb_;
+
+        Matrix pos_emb_;
+        Matrix grad_pos_emb_;
+
+        std::vector<GPTBlock> blocks_;
+        LayerNorm ln_f_;
+        Linear lm_head_;
+
+        std::vector<Matrix> stored_inputs_;
+        std::vector<std::vector<std::size_t>> stored_tokens_;
+        std::size_t batch_size_{0};
+
+    public:
+        GPTModel(std::size_t vocab_size, std::size_t d_model, std::size_t seq_len,
+                 std::size_t num_heads, std::size_t d_ff, std::size_t num_layers)
+            : vocab_size_(vocab_size), d_model_(d_model), seq_len_(seq_len),
+              token_emb_(vocab_size, d_model),
+              grad_token_emb_(vocab_size, d_model),
+              pos_emb_(seq_len, d_model),
+              grad_pos_emb_(seq_len, d_model),
+              ln_f_(d_model),
+              lm_head_(d_model, vocab_size)
+        {
+            constexpr double emb_init_std = 0.02;
+            std::mt19937_64 rng{42};
+            std::normal_distribution<double> dist(0.0, emb_init_std);
+            for (std::size_t i = 0; i < token_emb_.size(); ++i)
+                token_emb_.data()[i] = dist(rng);
+            for (std::size_t i = 0; i < pos_emb_.size(); ++i)
+                pos_emb_.data()[i] = dist(rng);
+
+            for (std::size_t i = 0; i < num_layers; ++i)
+                blocks_.emplace_back(d_model, num_heads, d_ff);
+        }
+
+        const char *name() const override { return "GPTModel"; }
+
+        [[nodiscard]] std::size_t param_count() const noexcept override
+        {
+            std::size_t p = token_emb_.size() + pos_emb_.size();
+            for (const auto &b : blocks_)
+                p += b.param_count();
+            p += ln_f_.param_count();
+            p += lm_head_.param_count();
+            return p;
+        }
+
+        std::vector<std::reference_wrapper<Matrix>> parameters() override
+        {
+            std::vector<std::reference_wrapper<Matrix>> params;
+            params.push_back(std::ref(token_emb_));
+            params.push_back(std::ref(pos_emb_));
+            for (auto &b : blocks_)
+            {
+                auto bp = b.parameters();
+                params.insert(params.end(), bp.begin(), bp.end());
+            }
+            auto lp = ln_f_.parameters();
+            params.insert(params.end(), lp.begin(), lp.end());
+            auto hp = lm_head_.parameters();
+            params.insert(params.end(), hp.begin(), hp.end());
+            return params;
+        }
+
+        std::vector<std::reference_wrapper<Matrix>> param_gradients() override
+        {
+            std::vector<std::reference_wrapper<Matrix>> grads;
+            grads.push_back(std::ref(grad_token_emb_));
+            grads.push_back(std::ref(grad_pos_emb_));
+            for (auto &b : blocks_)
+            {
+                auto bg = b.param_gradients();
+                grads.insert(grads.end(), bg.begin(), bg.end());
+            }
+            auto lg = ln_f_.param_gradients();
+            grads.insert(grads.end(), lg.begin(), lg.end());
+            auto hg = lm_head_.param_gradients();
+            grads.insert(grads.end(), hg.begin(), hg.end());
+            return grads;
+        }
+
+        Matrix forward(const Matrix &input) override
+        {
+            const std::size_t sl = input.rows();
+            batch_size_ = input.cols();
+            stored_inputs_.resize(batch_size_);
+            stored_tokens_.resize(batch_size_);
+
+            for (auto &v : stored_tokens_)
+                v.clear();
+
+            Matrix output(vocab_size_, sl * batch_size_);
+
+            for (std::size_t b = 0; b < batch_size_; ++b)
+            {
+                stored_tokens_[b].reserve(sl);
+
+                Matrix x(d_model_, sl);
+                for (std::size_t t = 0; t < sl; ++t)
+                {
+                    auto token_id = static_cast<std::size_t>(input.at_unchecked(t, b));
+                    if (token_id >= vocab_size_)
+                        token_id = 0;
+                    stored_tokens_[b].push_back(token_id);
+
+                    for (std::size_t d = 0; d < d_model_; ++d)
+                    {
+                        x.set_value_unchecked(d, t,
+                            token_emb_.at_unchecked(token_id, d) +
+                            pos_emb_.at_unchecked(t, d));
+                    }
+                }
+
+                stored_inputs_[b] = x;
+
+                for (std::size_t l = 0; l < blocks_.size(); ++l)
+                    x = blocks_[l].forward(x);
+
+                x = ln_f_.forward(x);
+                Matrix logits = lm_head_.forward(x);
+
+                for (std::size_t r = 0; r < vocab_size_; ++r)
+                    for (std::size_t t = 0; t < sl; ++t)
+                        output.set_value_unchecked(r, t * batch_size_ + b,
+                            logits.at_unchecked(r, t));
+            }
+
+            return output;
+        }
+
+        Matrix backward(const Matrix &grad_output) override
+        {
+            const std::size_t sl = grad_output.cols() / batch_size_;
+            grad_token_emb_.zero();
+            grad_pos_emb_.zero();
+
+            Matrix grad_input(sl, batch_size_);
+            grad_input.zero();
+
+            for (std::size_t b = 0; b < batch_size_; ++b)
+            {
+                Matrix grad_logits(vocab_size_, sl);
+                for (std::size_t r = 0; r < vocab_size_; ++r)
+                    for (std::size_t t = 0; t < sl; ++t)
+                        grad_logits.set_value_unchecked(r, t,
+                            grad_output.at_unchecked(r, t * batch_size_ + b));
+
+                // Re-forward to rebuild cache for this sample
+                Matrix x = stored_inputs_[b];
+                for (std::size_t l = 0; l < blocks_.size(); ++l)
+                    x = blocks_[l].forward(x);
+                x = ln_f_.forward(x);
+
+                Matrix grad_ln = lm_head_.backward(grad_logits);
+                grad_ln = ln_f_.backward(grad_ln);
+
+                for (int l = static_cast<int>(blocks_.size()) - 1; l >= 0; --l)
+                    grad_ln = blocks_[l].backward(grad_ln);
+
+                const auto &tokens = stored_tokens_[b];
+                for (std::size_t t = 0; t < sl; ++t)
+                {
+                    const std::size_t tid = tokens[t];
+                    for (std::size_t d = 0; d < d_model_; ++d)
+                    {
+                        double g = grad_ln.at_unchecked(d, t);
+                        grad_token_emb_.data()[d * vocab_size_ + tid] += g;
+                        grad_pos_emb_.data()[d * seq_len_ + t] += g;
+                    }
+                }
+            }
+
+            return grad_input;
+        }
+
+        std::vector<std::size_t> generate(const std::vector<std::size_t> &prompt,
+                                          std::size_t max_new_tokens,
+                                          double temperature = 1.0)
+        {
+            std::vector<std::size_t> context(prompt);
+            std::vector<std::size_t> generated;
+            std::mt19937_64 rng{std::random_device{}()};
+            std::uniform_real_distribution<double> dist(0.0, 1.0);
+
+            for (std::size_t step = 0; step < max_new_tokens; ++step)
+            {
+                std::size_t start = 0;
+                if (context.size() > seq_len_)
+                    start = context.size() - seq_len_;
+
+                std::size_t cur_len = context.size() - start;
+                Matrix input(cur_len, 1);
+                for (std::size_t t = 0; t < cur_len; ++t)
+                    input.set_value_unchecked(t, 0, static_cast<double>(context[start + t]));
+
+                Matrix logits = forward(input);
+
+                std::vector<double> last_logits(vocab_size_);
+                for (std::size_t v = 0; v < vocab_size_; ++v)
+                    last_logits[v] = logits.at_unchecked(v, cur_len - 1);
+
+                if (temperature > 0.0 && temperature != 1.0)
+                {
+                    for (auto &v : last_logits)
+                        v /= temperature;
+                }
+
+                double max_val = last_logits[0];
+                for (std::size_t v = 1; v < vocab_size_; ++v)
+                    max_val = std::max(max_val, last_logits[v]);
+                
+                double sum_exp = 0.0;
+                for (auto &v : last_logits)
+                {
+                    v = std::exp(v - max_val);
+                    sum_exp += v;
+                }
+                for (auto &v : last_logits)
+                    v /= sum_exp;
+
+                std::size_t next_token;
+                if (temperature > 0.0 && temperature != 1.0)
+                {
+                    double r = dist(rng);
+                    double cumulative = 0.0;
+                    next_token = vocab_size_ - 1;
+                    for (std::size_t v = 0; v < vocab_size_; ++v)
+                    {
+                        cumulative += last_logits[v];
+                        if (r <= cumulative)
+                        {
+                            next_token = v;
+                            break;
+                        }
+                    }
+                }
+                else
+                {
+                    next_token = 0;
+                    double best = last_logits[0];
+                    for (std::size_t v = 1; v < vocab_size_; ++v)
+                    {
+                        if (last_logits[v] > best)
+                        {
+                            best = last_logits[v];
+                            next_token = v;
+                        }
+                    }
+                }
+
+                context.push_back(next_token);
+                generated.push_back(next_token);
+            }
+
+            return generated;
+        }
+    };
+
     // ── PatchEmbedding ───────────────────────────────────────────────────────
     class PatchEmbedding final : public Layer
     {
