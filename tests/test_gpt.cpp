@@ -15,38 +15,42 @@ static bool approx(double a, double b, double tol = 1e-6)
 static void test_causal_self_attention_shape()
 {
     // vocab_size=10, d_model=16, seq_len=5, num_heads=4
-    nn::MultiHeadAttention attn(16, 4, true);
-    nn::Matrix input(16, 5); // seq_len=5, batch_size=1
-    for (std::size_t i = 0; i < input.size(); ++i)
-        input.data()[i] = 1.0;
+    nn::MultiHeadAttentionModule attn(16, 4, true);
+    nn::Matrix in_m(16, 5); // seq_len=5, batch_size=1
+    for (std::size_t i = 0; i < in_m.size(); ++i)
+        in_m.data()[i] = 1.0;
+    nn::Tensor input(in_m);
 
-    nn::Matrix out = attn.forward(input);
+    nn::Tensor out = attn.forward(input);
     assert(out.rows() == 16);
     assert(out.cols() == 5);
 }
 
 static void test_causal_self_attention_masking()
 {
-    nn::MultiHeadAttention attn(8, 2, true);
+    nn::MultiHeadAttentionModule attn(8, 2, true);
     
     // We create a dummy sequence of length 3
-    nn::Matrix input1(8, 3);
-    nn::Matrix input2(8, 3);
+    nn::Matrix input1_m(8, 3);
+    nn::Matrix input2_m(8, 3);
 
     for (std::size_t i = 0; i < 24; ++i)
     {
-        input1.data()[i] = 0.5 * i;
-        input2.data()[i] = 0.5 * i;
+        input1_m.data()[i] = 0.5 * i;
+        input2_m.data()[i] = 0.5 * i;
     }
     
     // Change token 2 (the 3rd token) in input2
     for (std::size_t d = 0; d < 8; ++d)
     {
-        input2.set_value_unchecked(d, 2, input2.at_unchecked(d, 2) + 10.0);
+        input2_m.set_value_unchecked(d, 2, input2_m.at_unchecked(d, 2) + 10.0);
     }
+    
+    nn::Tensor input1(input1_m);
+    nn::Tensor input2(input2_m);
 
-    nn::Matrix out1 = attn.forward(input1);
-    nn::Matrix out2 = attn.forward(input2);
+    nn::Tensor out1 = attn.forward(input1);
+    nn::Tensor out2 = attn.forward(input2);
 
     // Because of causal masking, the output of the first two tokens (0 and 1)
     // should not depend on the third token (2).
@@ -54,7 +58,7 @@ static void test_causal_self_attention_masking()
     {
         for (std::size_t d = 0; d < 8; ++d)
         {
-            double diff = std::abs(out1.at_unchecked(d, t) - out2.at_unchecked(d, t));
+            double diff = std::abs(out1.data().at_unchecked(d, t) - out2.data().at_unchecked(d, t));
             assert(diff < 1e-7);
         }
     }
@@ -62,60 +66,67 @@ static void test_causal_self_attention_masking()
 
 static void test_gpt_block_shape()
 {
-    nn::GPTBlock block(16, 4, 32);
-    nn::Matrix input(16, 10);
-    for (std::size_t i = 0; i < input.size(); ++i)
-        input.data()[i] = 0.5;
+    nn::GPTBlockModule block(16, 4, 32);
+    nn::Matrix in_m(16, 10);
+    for (std::size_t i = 0; i < in_m.size(); ++i)
+        in_m.data()[i] = 0.5;
+    nn::Tensor input(in_m, true);
 
-    nn::Matrix out = block.forward(input);
+    nn::Tensor out = block.forward(input);
     assert(out.rows() == 16);
     assert(out.cols() == 10);
 
     nn::Matrix grad_out(16, 10, 1.0);
-    nn::Matrix grad_in = block.backward(grad_out);
-    assert(grad_in.rows() == 16);
-    assert(grad_in.cols() == 10);
+    out.grad() = grad_out;
+    out.node()->backward_op();
+    
+    assert(input.grad().rows() == 16);
+    assert(input.grad().cols() == 10);
 }
 
 static void test_gpt_model_shape()
 {
     // vocab_size=100, d_model=16, seq_len=10, num_heads=4, d_ff=32, num_layers=2
-    nn::GPTModel model(100, 16, 10, 4, 32, 2);
-    nn::Matrix input(5, 2); // seq_len=5, batch_size=2
-    for (std::size_t i = 0; i < input.size(); ++i)
-        input.data()[i] = static_cast<double>(i % 100);
+    nn::GPTModelModule model(100, 16, 10, 4, 32, 2);
+    nn::Matrix in_m(5, 2); // seq_len=5, batch_size=2
+    for (std::size_t i = 0; i < in_m.size(); ++i)
+        in_m.data()[i] = static_cast<double>(i % 100);
+    nn::Tensor input(in_m, true);
 
-    nn::Matrix out = model.forward(input);
+    nn::Tensor out = model.forward(input);
     assert(out.rows() == 100);
     assert(out.cols() == 10); // seq_len=5 * batch_size=2 = 10
 
     nn::Matrix grad_out(100, 10, 0.1);
-    nn::Matrix grad_in = model.backward(grad_out);
-    assert(grad_in.rows() == 5);
-    assert(grad_in.cols() == 2);
+    out.grad() = grad_out;
+    out.node()->backward_op();
+    
+    assert(input.grad().rows() == 5);
+    assert(input.grad().cols() == 2);
 }
 
 static void test_gpt_model_numeric_grad()
 {
     // Small GPT model for gradient checking
-    nn::GPTModel model(10, 8, 4, 2, 16, 1);
-    nn::Matrix input(4, 2); // seq_len=4, batch=2
-    for (std::size_t i = 0; i < input.size(); ++i)
-        input.data()[i] = static_cast<double>(i % 10);
+    nn::GPTModelModule model(10, 8, 4, 2, 16, 1);
+    nn::Matrix in_m(4, 2); // seq_len=4, batch=2
+    for (std::size_t i = 0; i < in_m.size(); ++i)
+        in_m.data()[i] = static_cast<double>(i % 10);
+    nn::Tensor input(in_m);
     
     auto params = model.parameters();
-    auto grads = model.param_gradients();
     
     // forward
-    nn::Matrix out = model.forward(input);
+    nn::Tensor out = model.forward(input);
     
     // define a simple loss: sum of all elements
     nn::Matrix grad_out(out.rows(), out.cols(), 1.0);
-    model.backward(grad_out);
+    out.grad() = grad_out;
+    out.node()->backward_op();
     
     // Pick one parameter to check (e.g. token_emb_)
-    auto& p = params[0].get();
-    auto& g = grads[0].get();
+    auto& p = params[0].data();
+    auto& g = params[0].grad();
     
     if (p.size() > 0) {
         std::size_t check_idx = 0;
@@ -123,14 +134,14 @@ static void test_gpt_model_numeric_grad()
         double eps = 1e-5;
         
         p.data()[check_idx] = orig_val + eps;
-        nn::Matrix out_plus = model.forward(input);
+        nn::Tensor out_plus = model.forward(input);
         double loss_plus = 0.0;
-        for (double v : out_plus.data()) loss_plus += v;
+        for (double v : out_plus.data().data()) loss_plus += v;
         
         p.data()[check_idx] = orig_val - eps;
-        nn::Matrix out_minus = model.forward(input);
+        nn::Tensor out_minus = model.forward(input);
         double loss_minus = 0.0;
-        for (double v : out_minus.data()) loss_minus += v;
+        for (double v : out_minus.data().data()) loss_minus += v;
         
         p.data()[check_idx] = orig_val;
         
@@ -143,7 +154,7 @@ static void test_gpt_model_numeric_grad()
 
 static void test_gpt_model_generate()
 {
-    nn::GPTModel model(100, 16, 10, 4, 32, 2);
+    nn::GPTModelModule model(100, 16, 10, 4, 32, 2);
     std::vector<std::size_t> prompt = {1, 2, 3};
     auto generated = model.generate(prompt, 5, 0.0); // greedy
     assert(generated.size() == 5);

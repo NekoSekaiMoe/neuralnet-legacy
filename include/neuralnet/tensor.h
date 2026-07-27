@@ -108,11 +108,10 @@ public:
         // 自动将起始梯度置为 1
         if (!node_->grad) {
             node_->grad = Matrix(rows(), cols());
-            node_->grad->zero();
-        }
-        auto& span = node_->grad->data();
-        for (std::size_t i = 0; i < node_->grad->size(); ++i) {
-            span[i] = 1.0;
+            auto& span = node_->grad->data();
+            for (std::size_t i = 0; i < node_->grad->size(); ++i) {
+                span[i] = 1.0;
+            }
         }
 
         // 拓扑排序

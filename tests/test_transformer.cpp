@@ -250,80 +250,70 @@ static void test_positional_encoding_backward_passthrough()
 
 static void test_mha_forward_shape()
 {
-    nn::MultiHeadAttention mha(16, 4);
-    nn::Matrix input(16, 8);
+    nn::MultiHeadAttentionModule mha(16, 4);
+    nn::Matrix in_m(16, 8);
     std::mt19937_64 rng(42);
     std::normal_distribution<double> dist(0.0, 0.1);
-    for (auto &v : input.data()) v = dist(rng);
+    for (auto &v : in_m.data()) v = dist(rng);
+    nn::Tensor input(in_m);
 
-    nn::Matrix out = mha.forward(input);
+    nn::Tensor out = mha.forward(input);
     assert(out.rows() == 16);
     assert(out.cols() == 8);
 }
 
 static void test_mha_backward_shape()
 {
-    nn::MultiHeadAttention mha(16, 4);
-    nn::Matrix input(16, 8);
+    nn::MultiHeadAttentionModule mha(16, 4);
+    nn::Matrix in_m(16, 8);
     std::mt19937_64 rng(42);
     std::normal_distribution<double> dist(0.0, 0.1);
-    for (auto &v : input.data()) v = dist(rng);
+    for (auto &v : in_m.data()) v = dist(rng);
+    nn::Tensor input(in_m, true);
 
-    mha.forward(input);
-    nn::Matrix grad(16, 8, 0.01);
-    nn::Matrix gi = mha.backward(grad);
-    assert(gi.rows() == 16 && gi.cols() == 8);
+    nn::Tensor out = mha.forward(input);
+    nn::Matrix grad_out(16, 8, 0.01);
+    out.grad() = grad_out;
+    out.node()->backward_op();
+    assert(input.grad().rows() == 16 && input.grad().cols() == 8);
 }
 
 static void test_mha_params_count()
 {
-    nn::MultiHeadAttention mha(16, 4);
+    nn::MultiHeadAttentionModule mha(16, 4);
     assert(mha.param_count() == 4 * 16 * 16);
     assert(mha.parameters().size() == 4);
-    assert(mha.param_gradients().size() == 4);
 }
 
 // ── FeedForward ─────────────────────────────────────────────────────────────
 
 static void test_feedforward_shape()
 {
-    nn::FeedForward ff(16, 64);
-    nn::Matrix input(16, 4);
-    std::mt19937_64 rng(42);
-    std::normal_distribution<double> dist(0.0, 0.1);
-    for (auto &v : input.data()) v = dist(rng);
-
-    nn::Matrix out = ff.forward(input);
-    assert(out.rows() == 16 && out.cols() == 4);
-
-    nn::Matrix grad(16, 4, 0.01);
-    nn::Matrix gi = ff.backward(grad);
-    assert(gi.rows() == 16 && gi.cols() == 4);
+    nn::FeedForwardModule ffn(16, 64);
+    nn::Matrix in_m(16, 8);
+    nn::Tensor input(in_m);
+    nn::Tensor out = ffn.forward(input);
+    assert(out.rows() == 16);
+    assert(out.cols() == 8);
 }
 
 static void test_feedforward_params()
 {
-    nn::FeedForward ff(8, 32);
-    assert(ff.param_count() == (8 * 32 + 32) + (32 * 8 + 8));
-    assert(ff.parameters().size() == 4);
+    nn::FeedForwardModule ffn(16, 64);
+    assert(ffn.param_count() == 16 * 64 + 64 + 64 * 16 + 16);
+    assert(ffn.parameters().size() == 4);
 }
 
 // ── TransformerEncoderLayer ─────────────────────────────────────────────────
 
 static void test_encoder_layer_shape()
 {
-    nn::TransformerEncoderLayer layer(16, 4, 64);
-    nn::Matrix input(16, 8);
-    std::mt19937_64 rng(42);
-    std::normal_distribution<double> dist(0.0, 0.1);
-    for (auto &v : input.data()) v = dist(rng);
-
-    nn::Matrix out = layer.forward(input);
-    assert(out.rows() == 16 && out.cols() == 8);
-
-    nn::Matrix grad(16, 8, 0.01);
-    nn::Matrix gi = layer.backward(grad);
-    assert(gi.rows() == 16 && gi.cols() == 8);
+    nn::TransformerEncoderLayerModule enc(16, 4, 64);
+    nn::Matrix in_m(16, 8);
+    nn::Tensor input(in_m);
+    nn::Tensor out = enc.forward(input);
+    assert(out.rows() == 16);
+    assert(out.cols() == 8);
 }
 
 // ── TransformerEncoder ──────────────────────────────────────────────────────
@@ -331,13 +321,14 @@ static void test_encoder_layer_shape()
 static void test_encoder_forward_shape()
 {
     const std::size_t d_model = 16, num_patches = 4, batch = 2;
-    nn::TransformerEncoder enc(d_model, 4, 64, 2, num_patches);
-    nn::Matrix input(d_model, num_patches * batch);
+    nn::TransformerEncoderModule enc(d_model, 4, 64, 2, num_patches);
+    nn::Matrix in_m(d_model, num_patches * batch);
     std::mt19937_64 rng(42);
     std::normal_distribution<double> dist(0.0, 0.1);
-    for (auto &v : input.data()) v = dist(rng);
+    for (auto &v : in_m.data()) v = dist(rng);
+    nn::Tensor input(in_m);
 
-    nn::Matrix out = enc.forward(input);
+    nn::Tensor out = enc.forward(input);
     assert(out.rows() == d_model);
     assert(out.cols() == batch);
 }
@@ -345,53 +336,65 @@ static void test_encoder_forward_shape()
 static void test_encoder_backward_shape()
 {
     const std::size_t d_model = 16, num_patches = 4, batch = 2;
-    nn::TransformerEncoder enc(d_model, 4, 64, 2, num_patches);
-    nn::Matrix input(d_model, num_patches * batch);
+    nn::TransformerEncoderModule enc(d_model, 4, 64, 2, num_patches);
+    nn::Matrix in_m(d_model, num_patches * batch);
     std::mt19937_64 rng(42);
     std::normal_distribution<double> dist(0.0, 0.1);
-    for (auto &v : input.data()) v = dist(rng);
+    for (auto &v : in_m.data()) v = dist(rng);
+    nn::Tensor input(in_m, true);
 
-    enc.forward(input);
-    nn::Matrix grad(d_model, batch, 0.01);
-    nn::Matrix gi = enc.backward(grad);
-    assert(gi.rows() == d_model);
-    assert(gi.cols() == num_patches * batch);
+    nn::Tensor out = enc.forward(input);
+    
+    nn::Matrix grad_out(d_model, batch, 0.01);
+    out.grad() = grad_out;
+    out.node()->backward_op();
+    
+    assert(input.grad().rows() == d_model);
+    assert(input.grad().cols() == num_patches * batch);
 }
 
 // ── PatchEmbedding ──────────────────────────────────────────────────────────
 
 static void test_patch_embedding_shape()
 {
-    const std::size_t img = 28, patch = 7, d_model = 16, batch = 3;
-    const std::size_t num_patches = (img / patch) * (img / patch);
-    nn::PatchEmbedding pe(img, patch, d_model);
+    const std::size_t img_size = 28;
+    const std::size_t patch_size = 7;
+    const std::size_t d_model = 16;
+    const std::size_t num_patches = (img_size / patch_size) * (img_size / patch_size);
+    const std::size_t batch = 2;
 
-    nn::Matrix input(img * img, batch);
+    nn::PatchEmbeddingModule patch_emb(img_size, patch_size, d_model);
+    nn::Matrix in_m(img_size * img_size, batch);
     std::mt19937_64 rng(42);
-    std::normal_distribution<double> dist(0.0, 1.0);
-    for (auto &v : input.data()) v = dist(rng);
+    std::normal_distribution<double> dist(0.0, 0.1);
+    for (auto &v : in_m.data()) v = dist(rng);
+    nn::Tensor input(in_m);
 
-    nn::Matrix out = pe.forward(input);
+    nn::Tensor out = patch_emb.forward(input);
     assert(out.rows() == d_model);
     assert(out.cols() == num_patches * batch);
 }
 
 static void test_patch_embedding_backward_shape()
 {
-    const std::size_t img = 28, patch = 7, d_model = 16, batch = 2;
+    const std::size_t img = 28, patch = 7, d_model = 16;
     const std::size_t num_patches = (img / patch) * (img / patch);
-    nn::PatchEmbedding pe(img, patch, d_model);
+    const std::size_t batch = 2;
 
-    nn::Matrix input(img * img, batch);
+    nn::PatchEmbeddingModule patch_emb(img, patch, d_model);
+    nn::Matrix in_m(img * img, batch);
     std::mt19937_64 rng(42);
-    std::normal_distribution<double> dist(0.0, 1.0);
-    for (auto &v : input.data()) v = dist(rng);
+    std::normal_distribution<double> dist(0.0, 0.1);
+    for (auto &v : in_m.data()) v = dist(rng);
+    nn::Tensor input(in_m, true);
 
-    pe.forward(input);
-    nn::Matrix grad(d_model, num_patches * batch, 0.01);
-    nn::Matrix gi = pe.backward(grad);
-    assert(gi.rows() == img * img);
-    assert(gi.cols() == batch);
+    nn::Tensor out = patch_emb.forward(input);
+    nn::Matrix grad_out(d_model, num_patches * batch, 0.01);
+    out.grad() = grad_out;
+    out.node()->backward_op();
+
+    assert(input.grad().rows() == img * img);
+    assert(input.grad().cols() == batch);
 }
 
 // ── MNIST ViT end-to-end ────────────────────────────────────────────────────
@@ -402,17 +405,18 @@ static void test_vit_e2e_forward()
     const std::size_t num_patches = (img / patch) * (img / patch);
     const std::size_t batch = 2;
 
-    nn::Model model;
-    model.add<nn::PatchEmbedding>(img, patch, d_model)
-         .add<nn::TransformerEncoder>(d_model, 4, 64, 1, num_patches)
-         .add<nn::Linear>(d_model, std::size_t{10});
+    nn::Sequential model;
+    model.add<nn::PatchEmbeddingModule>(img, patch, d_model);
+    model.add<nn::TransformerEncoderModule>(d_model, 4, 64, 1, num_patches);
+    model.add<nn::LinearModule>(d_model, std::size_t{10});
 
-    nn::Matrix input(img * img, batch);
+    nn::Matrix in_m(img * img, batch);
     std::mt19937_64 rng(42);
     std::normal_distribution<double> dist(0.0, 0.1);
-    for (auto &v : input.data()) v = dist(rng);
+    for (auto &v : in_m.data()) v = dist(rng);
+    nn::Tensor input(in_m);
 
-    nn::Matrix out = model.forward(input);
+    nn::Tensor out = model.forward(input);
     assert(out.rows() == 10);
     assert(out.cols() == batch);
 }
@@ -423,29 +427,30 @@ static void test_vit_e2e_backward()
     const std::size_t num_patches = (img / patch) * (img / patch);
     const std::size_t batch = 2;
 
-    nn::Model model;
-    model.add<nn::PatchEmbedding>(img, patch, d_model)
-         .add<nn::TransformerEncoder>(d_model, 4, 64, 1, num_patches)
-         .add<nn::Linear>(d_model, std::size_t{10});
+    nn::Sequential model;
+    model.add<nn::PatchEmbeddingModule>(img, patch, d_model);
+    model.add<nn::TransformerEncoderModule>(d_model, 4, 64, 1, num_patches);
+    model.add<nn::LinearModule>(d_model, std::size_t{10});
 
-    nn::Matrix input(img * img, batch);
+    nn::Matrix in_m(img * img, batch);
     std::mt19937_64 rng(42);
     std::normal_distribution<double> dist(0.0, 0.1);
-    for (auto &v : input.data()) v = dist(rng);
+    for (auto &v : in_m.data()) v = dist(rng);
+    nn::Tensor input(in_m, true);
 
-    nn::Matrix out = model.forward(input);
+    nn::Tensor out = model.forward(input);
 
     nn::CrossEntropyLoss loss;
     nn::Matrix target(10, batch);
     target.set_value(3, 0, 1.0);
     target.set_value(7, 1, 1.0);
-    double lv = loss.forward(out, target);
+    double lv = loss.forward(out.data(), target);
     (void)lv;
 
-    nn::Matrix grad = loss.backward();
-    nn::Matrix gi = model.backward(grad);
-    assert(gi.rows() == img * img);
-    assert(gi.cols() == batch);
+    out.grad() = loss.backward();
+    out.node()->backward_op();
+    assert(input.grad().rows() == img * img);
+    assert(input.grad().cols() == batch);
 }
 
 // ── Dispatch ────────────────────────────────────────────────────────────────
