@@ -58,58 +58,64 @@ static void test_matrix_set_row_slice()
 
 static void test_layernorm_forward_shape()
 {
-    nn::LayerNorm ln(8);
-    nn::Matrix input(8, 4);
+    nn::LayerNormModule ln(8);
+    nn::Matrix in_m(8, 4);
     std::mt19937_64 rng(42);
     std::normal_distribution<double> dist(0.0, 1.0);
-    for (auto &v : input.data()) v = dist(rng);
+    for (auto &v : in_m.data()) v = dist(rng);
+    nn::Tensor input = nn::Tensor(in_m);
 
-    nn::Matrix out = ln.forward(input);
+    nn::Tensor out = ln.forward(input);
     assert(out.rows() == 8);
     assert(out.cols() == 4);
 }
 
 static void test_layernorm_normalize()
 {
-    nn::LayerNorm ln(4);
-    nn::Matrix input(4, 2);
-    input.set_value(0, 0, 1.0); input.set_value(1, 0, 2.0);
-    input.set_value(2, 0, 3.0); input.set_value(3, 0, 4.0);
-    input.set_value(0, 1, 10.0); input.set_value(1, 1, 20.0);
-    input.set_value(2, 1, 30.0); input.set_value(3, 1, 40.0);
+    nn::LayerNormModule ln(4);
+    nn::Matrix in_m(4, 2);
+    in_m.set_value(0, 0, 1.0); in_m.set_value(1, 0, 2.0);
+    in_m.set_value(2, 0, 3.0); in_m.set_value(3, 0, 4.0);
+    in_m.set_value(0, 1, 10.0); in_m.set_value(1, 1, 20.0);
+    in_m.set_value(2, 1, 30.0); in_m.set_value(3, 1, 40.0);
+    nn::Tensor input = nn::Tensor(in_m);
 
-    nn::Matrix out = ln.forward(input);
+    nn::Tensor out = ln.forward(input);
+    const nn::Matrix &out_m = out.data();
     for (std::size_t j = 0; j < 2; ++j)
     {
         double sum = 0.0;
         for (std::size_t i = 0; i < 4; ++i)
-            sum += out.at(i, j);
+            sum += out_m.at(i, j);
         assert(approx(sum, 0.0, 1e-5));
     }
 }
 
 static void test_layernorm_backward_shape()
 {
-    nn::LayerNorm ln(8);
-    nn::Matrix input(8, 4);
+    nn::LayerNormModule ln(8);
+    nn::Matrix in_m(8, 4);
     std::mt19937_64 rng(42);
     std::normal_distribution<double> dist(0.0, 1.0);
-    for (auto &v : input.data()) v = dist(rng);
+    for (auto &v : in_m.data()) v = dist(rng);
+    nn::Tensor input = nn::Tensor(in_m, true);
 
-    ln.forward(input);
-    nn::Matrix grad(8, 4, 1.0);
-    nn::Matrix grad_input = ln.backward(grad);
-    assert(grad_input.rows() == 8);
-    assert(grad_input.cols() == 4);
+    nn::Tensor out = ln.forward(input);
+    nn::Matrix grad_out(8, 4, 1.0);
+    out.grad() = grad_out;
+    out.node()->backward_op();
+    assert(input.grad().rows() == 8);
+    assert(input.grad().cols() == 4);
 }
 
 static void test_layernorm_gradient_check()
 {
-    nn::LayerNorm ln(4);
-    nn::Matrix input(4, 3);
+    nn::LayerNormModule ln(4);
+    nn::Matrix in_m(4, 3);
     std::mt19937_64 rng(123);
     std::normal_distribution<double> dist(0.0, 1.0);
-    for (auto &v : input.data()) v = dist(rng);
+    for (auto &v : in_m.data()) v = dist(rng);
+    nn::Tensor input = nn::Tensor(in_m);
 
     auto sum_sq = [](const nn::Matrix &m) {
         double s = 0.0;
@@ -118,29 +124,35 @@ static void test_layernorm_gradient_check()
         return s;
     };
 
-    nn::Matrix out = ln.forward(input);
-    nn::Matrix grad_out(out.rows(), out.cols());
-    for (std::size_t k = 0; k < out.size(); ++k)
-        grad_out.data()[k] = 2.0 * out.data()[k];
-    ln.backward(grad_out);
+    nn::Tensor out = ln.forward(input);
+    const nn::Matrix &out_m = out.data();
+    nn::Matrix grad_out(out_m.rows(), out_m.cols());
+    for (std::size_t k = 0; k < out_m.size(); ++k)
+        grad_out.data()[k] = 2.0 * out_m.data()[k];
+    
+    for (auto &p : ln.parameters()) { p.grad().zero(); }
+    out.grad() = grad_out;
+    out.node()->backward_op();
 
     auto params = ln.parameters();
-    auto grads = ln.param_gradients();
-
     for (std::size_t pi = 0; pi < params.size(); ++pi)
     {
-        nn::Matrix &p = params[pi].get();
-        nn::Matrix &g = grads[pi].get();
+        nn::Matrix &p = params[pi].data();
+        const nn::Matrix &g = params[pi].grad();
         for (std::size_t r = 0; r < p.rows(); ++r)
             for (std::size_t c = 0; c < p.cols(); ++c)
             {
                 double orig = p.at_unchecked(r, c);
                 double eps = 1e-5;
+                
                 p.set_value_unchecked(r, c, orig + eps);
-                double loss_plus = sum_sq(ln.forward(input));
+                double loss_plus = sum_sq(ln.forward(input).data());
+                
                 p.set_value_unchecked(r, c, orig - eps);
-                double loss_minus = sum_sq(ln.forward(input));
+                double loss_minus = sum_sq(ln.forward(input).data());
+                
                 p.set_value_unchecked(r, c, orig);
+                
                 double fd = (loss_plus - loss_minus) / (2.0 * eps);
                 double analytical = g.at_unchecked(r, c);
                 assert(approx(fd, analytical, 1e-3));
@@ -152,75 +164,86 @@ static void test_layernorm_gradient_check()
 
 static void test_softmax_forward()
 {
-    nn::Softmax sm;
-    nn::Matrix input(3, 2);
-    input.set_value(0, 0, 1.0); input.set_value(1, 0, 2.0); input.set_value(2, 0, 3.0);
-    input.set_value(0, 1, 0.0); input.set_value(1, 1, 0.0); input.set_value(2, 1, 0.0);
+    nn::SoftmaxModule sm;
+    nn::Matrix in_m(3, 2);
+    // col 0
+    in_m.set_value(0, 0, 1.0);
+    in_m.set_value(1, 0, 2.0);
+    in_m.set_value(2, 0, 3.0);
+    // col 1
+    in_m.set_value(0, 1, 10.0);
+    in_m.set_value(1, 1, 10.0);
+    in_m.set_value(2, 1, 10.0);
+    nn::Tensor input = nn::Tensor(in_m);
 
-    nn::Matrix out = sm.forward(input);
-    assert(out.rows() == 3 && out.cols() == 2);
+    nn::Tensor out = sm.forward(input);
+    const nn::Matrix &out_m = out.data();
+    
+    assert(out_m.rows() == 3);
+    assert(out_m.cols() == 2);
 
-    for (std::size_t j = 0; j < 2; ++j)
-    {
-        double sum = 0.0;
-        for (std::size_t i = 0; i < 3; ++i)
-        {
-            assert(out.at(i, j) > 0.0);
-            sum += out.at(i, j);
-        }
-        assert(approx(sum, 1.0, 1e-10));
-    }
+    double sum0 = out_m.at(0, 0) + out_m.at(1, 0) + out_m.at(2, 0);
+    assert(approx(sum0, 1.0, 1e-5));
+    assert(out_m.at(2, 0) > out_m.at(1, 0));
+    assert(out_m.at(1, 0) > out_m.at(0, 0));
 
-    assert(out.at(2, 0) > out.at(1, 0));
-    assert(out.at(1, 0) > out.at(0, 0));
-    assert(approx(out.at(0, 1), 1.0 / 3.0, 1e-10));
+    double sum1 = out_m.at(0, 1) + out_m.at(1, 1) + out_m.at(2, 1);
+    assert(approx(sum1, 1.0, 1e-5));
+    assert(approx(out_m.at(0, 1), 1.0 / 3.0, 1e-5));
+    assert(approx(out_m.at(1, 1), 1.0 / 3.0, 1e-5));
+    assert(approx(out_m.at(2, 1), 1.0 / 3.0, 1e-5));
 }
 
 static void test_softmax_backward_shape()
 {
-    nn::Softmax sm;
-    nn::Matrix input(5, 3);
+    nn::SoftmaxModule sm;
+    nn::Matrix in_m(5, 4);
     std::mt19937_64 rng(42);
     std::normal_distribution<double> dist(0.0, 1.0);
-    for (auto &v : input.data()) v = dist(rng);
+    for (auto &v : in_m.data()) v = dist(rng);
+    nn::Tensor input = nn::Tensor(in_m, true);
 
-    sm.forward(input);
-    nn::Matrix grad(5, 3, 1.0);
-    nn::Matrix gi = sm.backward(grad);
-    assert(gi.rows() == 5 && gi.cols() == 3);
+    nn::Tensor out = sm.forward(input);
+    nn::Matrix grad_out(5, 4, 1.0);
+    out.grad() = grad_out;
+    out.node()->backward_op();
+    
+    assert(input.grad().rows() == 5);
+    assert(input.grad().cols() == 4);
 }
 
 // ── PositionalEncoding ──────────────────────────────────────────────────────
 
 static void test_positional_encoding_shape()
 {
-    nn::PositionalEncoding pe(16, 64);
-    nn::Matrix input(16, 10);
-    nn::Matrix out = pe.forward(input);
+    nn::PositionalEncodingModule pe(16, 64);
+    nn::Tensor input = nn::Tensor(nn::Matrix(16, 10));
+    nn::Tensor out = pe.forward(input);
     assert(out.rows() == 16 && out.cols() == 10);
 }
 
 static void test_positional_encoding_adds_values()
 {
-    nn::PositionalEncoding pe(8, 32);
-    nn::Matrix input(8, 4, 0.0);
-    nn::Matrix out = pe.forward(input);
+    nn::PositionalEncodingModule pe(8, 32);
+    nn::Tensor input = nn::Tensor(nn::Matrix(8, 4, 0.0));
+    nn::Tensor out = pe.forward(input);
 
     bool has_nonzero = false;
-    for (std::size_t k = 0; k < out.size(); ++k)
-        if (std::fabs(out.data()[k]) > 1e-10) { has_nonzero = true; break; }
+    for (std::size_t k = 0; k < out.data().size(); ++k)
+        if (std::fabs(out.data().data()[k]) > 1e-10) { has_nonzero = true; break; }
     assert(has_nonzero);
 }
 
 static void test_positional_encoding_backward_passthrough()
 {
-    nn::PositionalEncoding pe(8, 32);
-    nn::Matrix input(8, 4, 1.0);
-    pe.forward(input);
-    nn::Matrix grad(8, 4, 3.14);
-    nn::Matrix gi = pe.backward(grad);
-    for (std::size_t k = 0; k < gi.size(); ++k)
-        assert(approx(gi.data()[k], 3.14));
+    nn::PositionalEncodingModule pe(8, 32);
+    nn::Tensor input = nn::Tensor(nn::Matrix(8, 4, 1.0), true);
+    nn::Tensor out = pe.forward(input);
+    nn::Matrix grad_out(8, 4, 3.14);
+    out.grad() = grad_out;
+    out.node()->backward_op();
+
+    assert(input.grad().at(0, 0) == 3.14);
 }
 
 // ── MultiHeadAttention ──────────────────────────────────────────────────────

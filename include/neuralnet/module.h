@@ -403,6 +403,278 @@ namespace nn
         }
     };
 
+    // ── LayerNormModule ────────────────────────────────────────────────────────
+    class LayerNormModule : public Module
+    {
+    private:
+        std::size_t normalized_shape_;
+        double eps_;
+        Tensor gamma_;
+        Tensor beta_;
+
+    public:
+        LayerNormModule(std::size_t normalized_shape, double eps = 1e-5)
+            : normalized_shape_(normalized_shape), eps_(eps),
+              gamma_(Tensor(Matrix(normalized_shape, 1, 1.0), true)),
+              beta_(Tensor(Matrix(normalized_shape, 1, 0.0), true))
+        {
+        }
+
+        const char *name() const override { return "LayerNormModule"; }
+        std::size_t param_count() const noexcept override { return 2 * normalized_shape_; }
+        bool has_state() const override { return false; }
+
+        std::vector<Tensor> parameters() override
+        {
+            return {gamma_, beta_};
+        }
+
+        Tensor forward(const Tensor &input) override
+        {
+            const Matrix &in_m = input.data();
+            if (in_m.rows() != normalized_shape_)
+                throw std::invalid_argument("LayerNormModule forward: input rows != normalized_shape");
+
+            const std::size_t feat = in_m.rows();
+            const std::size_t batch = in_m.cols();
+            const double N = static_cast<double>(feat);
+
+            std::vector<double> inv_std_cache(batch);
+            Matrix norm_m(feat, batch);
+
+            for (std::size_t j = 0; j < batch; ++j)
+            {
+                double sum = 0.0;
+                for (std::size_t i = 0; i < feat; ++i)
+                    sum += in_m.at_unchecked(i, j);
+                double mu = sum / N;
+
+                double var_sum = 0.0;
+                for (std::size_t i = 0; i < feat; ++i)
+                {
+                    double d = in_m.at_unchecked(i, j) - mu;
+                    var_sum += d * d;
+                }
+                double inv_std = 1.0 / std::sqrt(var_sum / N + eps_);
+                inv_std_cache[j] = inv_std;
+
+                for (std::size_t i = 0; i < feat; ++i)
+                    norm_m.set_value_unchecked(i, j, (in_m.at_unchecked(i, j) - mu) * inv_std);
+            }
+
+            Matrix out_m(feat, batch);
+            const Matrix &g = gamma_.data();
+            const Matrix &b = beta_.data();
+            std::for_each(NN_EXEC_POLICY,
+                          counting_iterator<std::size_t>(0),
+                          counting_iterator<std::size_t>(feat * batch),
+                          [&](std::size_t idx) {
+                              std::size_t i = idx / batch;
+                              out_m.data()[idx] = norm_m.data()[idx] * g.at_unchecked(i, 0) + b.at_unchecked(i, 0);
+                          });
+
+            bool req_grad = input.requires_grad() || gamma_.requires_grad() || beta_.requires_grad();
+            Tensor out(out_m, req_grad);
+            
+            if (req_grad)
+            {
+                out.node()->children.push_back(input.node());
+                out.node()->children.push_back(gamma_.node());
+                out.node()->children.push_back(beta_.node());
+                
+                auto inv_std_cache_ptr = std::make_shared<std::vector<double>>(std::move(inv_std_cache));
+                auto norm_m_ptr = std::make_shared<Matrix>(std::move(norm_m));
+                
+                out.node()->backward_op = [out_node_w = std::weak_ptr<TensorNode>(out.node()),
+                                           in_node_w = std::weak_ptr<TensorNode>(input.node()),
+                                           gamma_node_w = std::weak_ptr<TensorNode>(gamma_.node()),
+                                           beta_node_w = std::weak_ptr<TensorNode>(beta_.node()),
+                                           inv_std_cache_ptr, norm_m_ptr, feat, batch, N]() {
+                    auto out = out_node_w.lock();
+                    if (!out || !out->grad) return;
+                    auto in = in_node_w.lock();
+                    auto gamma_node = gamma_node_w.lock();
+                    auto beta_node = beta_node_w.lock();
+
+                    const Matrix &grad_output = *(out->grad);
+
+                    if ((gamma_node && gamma_node->requires_grad) || (beta_node && beta_node->requires_grad))
+                    {
+                        Matrix dgamma(feat, 1, 0.0);
+                        Matrix dbeta(feat, 1, 0.0);
+                        for (std::size_t i = 0; i < feat; ++i)
+                        {
+                            double dg = 0.0, db = 0.0;
+                            for (std::size_t j = 0; j < batch; ++j)
+                            {
+                                dg += grad_output.at_unchecked(i, j) * norm_m_ptr->at_unchecked(i, j);
+                                db += grad_output.at_unchecked(i, j);
+                            }
+                            dgamma.set_value_unchecked(i, 0, dg);
+                            dbeta.set_value_unchecked(i, 0, db);
+                        }
+                        if (gamma_node && gamma_node->requires_grad) gamma_node->accumulate_grad(dgamma);
+                        if (beta_node && beta_node->requires_grad) beta_node->accumulate_grad(dbeta);
+                    }
+
+                    if (in && in->requires_grad)
+                    {
+                        Matrix grad_input(feat, batch);
+                        const Matrix &g = gamma_node->data;
+                        for (std::size_t j = 0; j < batch; ++j)
+                        {
+                            double inv_std = (*inv_std_cache_ptr)[j];
+                            double sum_dxhat = 0.0, sum_dxhat_xhat = 0.0;
+                            for (std::size_t i = 0; i < feat; ++i)
+                            {
+                                double dxhat = grad_output.at_unchecked(i, j) * g.at_unchecked(i, 0);
+                                sum_dxhat += dxhat;
+                                sum_dxhat_xhat += dxhat * norm_m_ptr->at_unchecked(i, j);
+                            }
+                            for (std::size_t i = 0; i < feat; ++i)
+                            {
+                                double dxhat = grad_output.at_unchecked(i, j) * g.at_unchecked(i, 0);
+                                grad_input.set_value_unchecked(i, j,
+                                    inv_std / N * (N * dxhat - sum_dxhat
+                                        - norm_m_ptr->at_unchecked(i, j) * sum_dxhat_xhat));
+                            }
+                        }
+                        in->accumulate_grad(grad_input);
+                    }
+                };
+            }
+            return out;
+        }
+    };
+
+    // ── SoftmaxModule ────────────────────────────────────────────────────────
+    class SoftmaxModule : public Module
+    {
+    public:
+        const char *name() const override { return "SoftmaxModule"; }
+
+        Tensor forward(const Tensor &input) override
+        {
+            const Matrix &in_m = input.data();
+            const std::size_t rows = in_m.rows();
+            const std::size_t cols = in_m.cols();
+            if (rows == 0)
+                throw std::invalid_argument("SoftmaxModule forward: input must have at least one row");
+                
+            Matrix out_m(rows, cols);
+
+            for (std::size_t j = 0; j < cols; ++j)
+            {
+                double max_val = in_m.at_unchecked(0, j);
+                for (std::size_t i = 1; i < rows; ++i)
+                    if (in_m.at_unchecked(i, j) > max_val)
+                        max_val = in_m.at_unchecked(i, j);
+
+                double sum_exp = 0.0;
+                for (std::size_t i = 0; i < rows; ++i)
+                {
+                    double e = std::exp(in_m.at_unchecked(i, j) - max_val);
+                    out_m.set_value_unchecked(i, j, e);
+                    sum_exp += e;
+                }
+                for (std::size_t i = 0; i < rows; ++i)
+                    out_m.set_value_unchecked(i, j,
+                        out_m.at_unchecked(i, j) / sum_exp);
+            }
+            
+            bool req_grad = input.requires_grad();
+            Tensor out(out_m, req_grad);
+            
+            if (req_grad)
+            {
+                out.node()->children.push_back(input.node());
+                auto out_m_ptr = std::make_shared<Matrix>(std::move(out_m));
+                
+                out.node()->backward_op = [out_node_w = std::weak_ptr<TensorNode>(out.node()),
+                                           in_node_w = std::weak_ptr<TensorNode>(input.node()),
+                                           out_m_ptr, rows, cols]() {
+                    auto out = out_node_w.lock();
+                    if (!out || !out->grad) return;
+                    auto in = in_node_w.lock();
+                    if (!in || !in->requires_grad) return;
+                    
+                    const Matrix &grad_output = *(out->grad);
+                    Matrix grad_input(rows, cols);
+                    for (std::size_t j = 0; j < cols; ++j)
+                    {
+                        double dot = 0.0;
+                        for (std::size_t i = 0; i < rows; ++i)
+                            dot += grad_output.at_unchecked(i, j) * out_m_ptr->at_unchecked(i, j);
+                        for (std::size_t i = 0; i < rows; ++i)
+                            grad_input.set_value_unchecked(i, j,
+                                out_m_ptr->at_unchecked(i, j)
+                                * (grad_output.at_unchecked(i, j) - dot));
+                    }
+                    in->accumulate_grad(grad_input);
+                };
+            }
+            return out;
+        }
+    };
+
+    // ── PositionalEncodingModule ─────────────────────────────────────────────
+    class PositionalEncodingModule : public Module
+    {
+    private:
+        Matrix pe_;
+        std::size_t d_model_;
+        std::size_t max_seq_len_;
+
+    public:
+        PositionalEncodingModule(std::size_t d_model, std::size_t max_seq_len)
+            : pe_(d_model, max_seq_len), d_model_(d_model), max_seq_len_(max_seq_len)
+        {
+            for (std::size_t pos = 0; pos < max_seq_len; ++pos)
+                for (std::size_t i = 0; i < d_model; ++i)
+                {
+                    double angle = static_cast<double>(pos)
+                        / std::pow(10000.0, 2.0 * static_cast<double>(i / 2)
+                                            / static_cast<double>(d_model));
+                    pe_.set_value_unchecked(i, pos,
+                        (i % 2 == 0) ? std::sin(angle) : std::cos(angle));
+                }
+        }
+
+        const char *name() const override { return "PositionalEncodingModule"; }
+
+        Tensor forward(const Tensor &input) override
+        {
+            const Matrix &in_m = input.data();
+            if (in_m.rows() != d_model_)
+                throw std::invalid_argument("PositionalEncodingModule forward: input rows != d_model");
+            if (in_m.cols() > max_seq_len_)
+                throw std::invalid_argument("PositionalEncodingModule forward: seq length > max_seq_len");
+
+            Matrix out_m = in_m;
+            for (std::size_t j = 0; j < in_m.cols(); ++j)
+                for (std::size_t i = 0; i < d_model_; ++i)
+                    out_m.data()[i * in_m.cols() + j] += pe_.at_unchecked(i, j);
+
+            bool req_grad = input.requires_grad();
+            Tensor out(out_m, req_grad);
+            
+            if (req_grad)
+            {
+                out.node()->children.push_back(input.node());
+                out.node()->backward_op = [out_node_w = std::weak_ptr<TensorNode>(out.node()),
+                                           in_node_w = std::weak_ptr<TensorNode>(input.node())]() {
+                    auto out = out_node_w.lock();
+                    if (!out || !out->grad) return;
+                    auto in = in_node_w.lock();
+                    if (!in || !in->requires_grad) return;
+                    
+                    in->accumulate_grad(*(out->grad));
+                };
+            }
+            return out;
+        }
+    };
+
 } // namespace nn
 
 #endif // NN_MODULE_H
