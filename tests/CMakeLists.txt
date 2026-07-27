@@ -126,4 +126,21 @@ if(BUILD_TESTING)
     foreach(name ${transformer_test_names})
         add_test(NAME transformer_${name} COMMAND test_transformer ${name})
     endforeach()
+    add_executable(test_gpt test_gpt.cpp)
+    target_link_libraries(test_gpt PRIVATE neuralnet::neuralnet)
+    target_include_directories(test_gpt PRIVATE ${PROJECT_SOURCE_DIR}/include)
+    if(MSVC)
+        target_compile_options(test_gpt PRIVATE /UNDEBUG)
+    else()
+        target_compile_options(test_gpt PRIVATE -UNDEBUG)
+    endif()
+
+    set(gpt_test_names
+        causal_self_attention_shape
+        causal_self_attention_masking
+        gpt_block_shape
+    )
+    foreach(name ${gpt_test_names})
+        add_test(NAME gpt_${name} COMMAND test_gpt ${name})
+    endforeach()
 endif()
