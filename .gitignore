@@ -60,3 +60,7 @@ bin/
 # Session / plan tracking (internal to Sisyphus workflow)
 .omo/
 .sisyphus/
+
+# Vendored upstream reference clone & local notes
+neuralnet.cpp/
+bug.md

@@ -129,21 +129,23 @@ namespace nn
     class Adam : public Optimizer
     {
     private:
+        std::size_t step_count_;
+        std::vector<Matrix> m_; // 一阶矩估计
+        std::vector<Matrix> v_; // 二阶矩估计
+
+    protected:
         double lr_;
         double beta1_;
         double beta2_;
         double eps_;
-        std::size_t step_count_;
         std::vector<std::reference_wrapper<Matrix>> params_;
         std::vector<std::reference_wrapper<Matrix>> grads_;
-        std::vector<Matrix> m_; // 一阶矩估计
-        std::vector<Matrix> v_; // 二阶矩估计
 
     public:
         Adam(std::vector<std::reference_wrapper<Matrix>> params,
              std::vector<std::reference_wrapper<Matrix>> grads,
              double lr = 0.001, double beta1 = 0.9, double beta2 = 0.999, double eps = 1e-8)
-            : lr_(lr), beta1_(beta1), beta2_(beta2), eps_(eps), step_count_(0),
+            : step_count_(0), lr_(lr), beta1_(beta1), beta2_(beta2), eps_(eps),
               params_(std::move(params)), grads_(std::move(grads))
         {
             if (params_.size() != grads_.size())
@@ -203,6 +205,40 @@ namespace nn
             }
         }
     };
+
+    // ── AdamW：解耦权重衰减（Decoupled Weight Decay，移植自上游）─────
+    // 与 Adam + L2 正则化的区别：
+    //   - L2:  g' = g + wd*p，用 g' 做 Adam 更新 → wd 受自适应学习率缩放
+    //   - AdamW: 直接 p *= (1-lr*wd)，梯度更新不受 wd 影响
+    //   → 衰减对所有参数等效，不因自适应学习率而被稀释；
+    //     transformer/GPT 训练的标准配置。
+    class AdamW : public Adam
+    {
+    private:
+        double wd_; // 权重衰减系数
+
+    public:
+        AdamW(std::vector<std::reference_wrapper<Matrix>> params,
+              std::vector<std::reference_wrapper<Matrix>> grads,
+              double lr = 0.001, double beta1 = 0.9, double beta2 = 0.999,
+              double eps = 1e-8, double weight_decay = 0.01)
+            : Adam(std::move(params), std::move(grads), lr, beta1, beta2, eps),
+              wd_(weight_decay) {}
+
+        void step() override
+        {
+            // 权重衰减解耦：先 p = (1-lr*wd)*p，再做标准 Adam 更新。
+            // 零梯度时 m/v 保持 0，Adam 增量为 0 → p_t = p_0*(1-lr*wd)^t。
+            if (wd_ != 0.0)
+            {
+                const double decay = 1.0 - lr_ * wd_;
+                for (auto &p_ref : params_)
+                    p_ref.get().scale_inplace(decay);
+            }
+            Adam::step();
+        }
+    };
+
 } // namespace nn
 
 #endif // OPTIMIZER_HPP
