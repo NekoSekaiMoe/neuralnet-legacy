@@ -47,14 +47,14 @@ This is a header-only C++17 neural network library. All code lives in `include/n
 - `matrix.h` — core Matrix class, all arithmetic and BLAS-like ops
 - `layer.h` — Layer base + all layer implementations (Linear, activations, BatchNorm, Dropout)
 - `loss.h` — MSELoss, CrossEntropyLoss
-- `optimizer.h` — SGD, SGD_w_Momentum, Adam
+- `optimizer.h` — SGD, SGD_w_Momentum, Adam, AdamW (decoupled weight decay)
 - `lr_scheduler.h` — StepLR, CosineAnnealingLR, ExponentialLR
 - `dataloader.h` — Dataset/TensorDataset/DataLoader
 - `model/model.h` — Model container with train/eval mode
 - `model/io.h` — Binary serialization (v1/v2 format, v1 backward-compatible)
 - `nn/nn.h` — Aggregate header that includes everything
 
-**Transformer components**: LayerNorm, Softmax, PositionalEncoding, MultiHeadAttention, FeedForward, GPTBlock, GPTModel, PatchEmbedding.
+**Transformer components**: LayerNorm, RMSNorm, Softmax, PositionalEncoding, MultiHeadAttention, FeedForward (GELU) / SwiGLUFeedForward, SwiGLU, GPTBlock, GPTModel, PatchEmbedding.
 
 **Test structure**: Tests use `<cassert>` (not a framework). Each test is a named function in test files (like `test_tensor.cpp`, `test_gpt.cpp`, `test_tokenizer.cpp`, `test_transformer.cpp`), dispatched by name via command-line argument. The CMake config forces `-UNDEBUG` so assertions remain active even in Release builds.
 
