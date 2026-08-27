@@ -35,7 +35,7 @@ This is a header-only C++17 neural network library. All code lives in `include/n
 
 **Data layout**: Column-major matrices — rows are feature dimensions, columns are batch samples. This convention is consistent throughout the library.
 
-**Execution policy**: Parallel computation uses `std::execution::par_unseq` via TBB. Configurable at compile time with `-DNN_EXEC_POLICY=std::execution::seq`. Defined in `nn/config.h`.
+**Execution policy**: Adaptive dispatch ("SmartPolicy", aligned with upstream neuralnet.cpp): element-wise ops call `nn::for_each / nn::transform / nn::transform_reduce / nn::for_range` (`nn/config.h`) — serial loop below `PARALLEL_THRESHOLD` (512K work units, overridable via `-DNN_PARALLEL_THRESHOLD=...`), `std::execution::par_unseq` (TBB) at or above it. GEMM/transpose block loops use `nn::for_blocks` (always parallel — each iteration computes a 64×64 output block). Compile-time escape hatch `-DNN_EXEC_POLICY=std::execution::seq` still forces the parallel branches serial.
 
 **Key design patterns**:
 - `nn::Model` uses a type-erased layer stack (`add<LayerType>(args...)`) with virtual dispatch through the `Layer` base class for forward/backward

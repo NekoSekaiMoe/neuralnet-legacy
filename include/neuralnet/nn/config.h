@@ -4,6 +4,7 @@
 #include <cstddef>
 #include <execution>
 #include <iterator>
+#include <numeric>
 
 // ── 执行策略 ────────────────────────────────────────────────────────────────
 // 默认并行+向量化；编译时可通过 -DNN_EXEC_POLICY=std::execution::seq 覆盖
@@ -12,7 +13,7 @@
 #endif
 
 // ── 缓存分块大小 ─────────────────────────────────────────────────────────────
-// 32×32×8 = 8 KB，安全装入大多数 CPU 的 L1 缓存
+// 64×64×8 字节 = 32 KB，装入多数 CPU 的 L1/L2 缓存
 // 矩阵乘法、转置等所有分块操作共用此值
 // 修改时需同步评估 b_block 栈占用（BLOCK_SIZE² × 8 字节）
 namespace nn
@@ -130,6 +131,118 @@ namespace nn
     {
         return it + n;
     }
+
+        // ── 自适应执行策略（SmartPolicy，对标上游 neuralnet.cpp）──────────
+        // std::execution 并行算法的线程池调度开销在中小矩阵上远超并行收益
+        //（实测 4096 元素时 par_unseq 比串行慢 ~6x，见 bug.md）。所有逐元素
+        // 运算改走下方 nn::for_each / nn::transform / nn::transform_reduce：
+        // 工作单元数 ≥ PARALLEL_THRESHOLD 才进入并行（仍受 NN_EXEC_POLICY
+        // 编译期覆盖控制），否则使用纯串行循环，零调度开销。
+#ifndef NN_PARALLEL_THRESHOLD
+#define NN_PARALLEL_THRESHOLD 524288 // 512K 元素；上游 32 核实测此值首次稳定获益
+#endif
+        inline constexpr std::size_t PARALLEL_THRESHOLD = NN_PARALLEL_THRESHOLD;
+
+        // ── 迭代器版：work = 总工作单元数（通常为元素数） ──────────────────
+        template <typename Iter, typename Fn>
+        inline void for_each(std::size_t work, Iter first, Iter last, Fn f)
+        {
+            if (work >= PARALLEL_THRESHOLD)
+                std::for_each(NN_EXEC_POLICY, first, last, std::move(f));
+            else
+                for (; first != last; ++first)
+                    f(*first);
+        }
+
+        template <typename InIter, typename OutIter, typename Fn>
+        inline void transform(std::size_t work, InIter first, InIter last,
+                              OutIter d_first, Fn f)
+        {
+            if (work >= PARALLEL_THRESHOLD)
+                std::transform(NN_EXEC_POLICY, first, last, d_first, std::move(f));
+            else
+                for (; first != last; ++first, ++d_first)
+                    *d_first = f(*first);
+        }
+
+        template <typename InIter1, typename InIter2, typename OutIter, typename Fn>
+        inline void transform(std::size_t work, InIter1 first1, InIter1 last1,
+                              InIter2 first2, OutIter d_first, Fn f)
+        {
+            if (work >= PARALLEL_THRESHOLD)
+                std::transform(NN_EXEC_POLICY, first1, last1, first2, d_first, std::move(f));
+            else
+                for (; first1 != last1; ++first1, ++first2, ++d_first)
+                    *d_first = f(*first1, *first2);
+        }
+
+        template <typename Iter, typename T, typename Reduce, typename Transform>
+        inline T transform_reduce(std::size_t work, Iter first, Iter last,
+                                  T init, Reduce reduce, Transform transform)
+        {
+            if (work >= PARALLEL_THRESHOLD)
+                return std::transform_reduce(NN_EXEC_POLICY, first, last, init, reduce, transform);
+            for (; first != last; ++first)
+                init = reduce(init, transform(*first));
+            return init;
+        }
+
+        template <typename InIter1, typename InIter2, typename T, typename Reduce, typename Transform>
+        inline T transform_reduce(std::size_t work, InIter1 first1, InIter1 last1,
+                                  InIter2 first2, T init, Reduce reduce, Transform transform)
+        {
+            if (work >= PARALLEL_THRESHOLD)
+                return std::transform_reduce(NN_EXEC_POLICY, first1, last1, first2,
+                                             init, reduce, transform);
+            for (; first1 != last1; ++first1, ++first2)
+                init = reduce(init, transform(*first1, *first2));
+            return init;
+        }
+
+        template <typename Iter, typename T>
+        inline T reduce(std::size_t work, Iter first, Iter last, T init)
+        {
+            if (work >= PARALLEL_THRESHOLD)
+                return std::reduce(NN_EXEC_POLICY, first, last, init);
+            for (; first != last; ++first)
+                init = init + *first;
+            return init;
+        }
+
+        template <typename Iter, typename T, typename BinOp>
+        inline T reduce(std::size_t work, Iter first, Iter last, T init, BinOp binop)
+        {
+            if (work >= PARALLEL_THRESHOLD)
+                return std::reduce(NN_EXEC_POLICY, first, last, init, binop);
+            for (; first != last; ++first)
+                init = binop(init, *first);
+            return init;
+        }
+
+        // ── 下标版：等价于旧式 counting_iterator 循环 ────────────────────
+        // 调用方声明的 work 是总工作量（如逐元素规模），不一定等于迭代次数 n。
+        template <typename Fn>
+        inline void for_range(std::size_t work, std::size_t n, Fn f)
+        {
+            if (work >= PARALLEL_THRESHOLD)
+                std::for_each(NN_EXEC_POLICY,
+                              counting_iterator<std::size_t>(0),
+                              counting_iterator<std::size_t>(n), std::move(f));
+            else
+                for (std::size_t i = 0; i < n; ++i)
+                    f(i);
+        }
+
+        // ── GEMM/转置块循环专用（对标上游 parallel_for_blocks）──────────
+        // 每个迭代处理一个 64×64 输出块（≥ BLOCK_SIZE² × K 次乘加），
+        // 计算密度高，恒定并行，不适用元素数阈值。
+        template <typename Fn>
+        inline void for_blocks(std::size_t n_blocks, Fn f)
+        {
+            std::for_each(NN_EXEC_POLICY,
+                          counting_iterator<std::size_t>(0),
+                          counting_iterator<std::size_t>(n_blocks), std::move(f));
+        }
 
 } // namespace nn
 

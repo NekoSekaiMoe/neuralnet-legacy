@@ -46,7 +46,7 @@ namespace nn
             {
                 auto &p = params_[i].get();
                 auto &g = grads_[i].get();
-                std::transform(NN_EXEC_POLICY,
+                nn::transform(p.size(),
                                p.data().begin(), p.data().end(),
                                g.data().begin(),
                                p.data().begin(),
@@ -105,9 +105,7 @@ namespace nn
                 auto &v_vec = v.data();
 
                 const std::size_t n = p_vec.size();
-                std::for_each(NN_EXEC_POLICY,
-                              counting_iterator<std::size_t>(0),
-                              counting_iterator<std::size_t>(n),
+                nn::for_range(n, n,
                               [&](std::size_t idx)
                               {
                                   v_vec[idx] = beta_ * v_vec[idx] + (1 - beta_) * g_vec[idx];
@@ -180,9 +178,7 @@ namespace nn
                 auto &m_vec = m.data();
                 auto &v_vec = v.data();
 
-                std::for_each(NN_EXEC_POLICY,
-                              counting_iterator<std::size_t>(0),
-                              counting_iterator<std::size_t>(n),
+                nn::for_range(n, n,
                               [&](std::size_t idx)
                               {
                                   // 更新一阶矩: m = beta1 * m + (1 - beta1) * g

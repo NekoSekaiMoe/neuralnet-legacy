@@ -496,9 +496,7 @@ namespace nn
             Matrix out_m(feat, batch);
             const Matrix &g = gamma_.data();
             const Matrix &b = beta_.data();
-            std::for_each(NN_EXEC_POLICY,
-                          counting_iterator<std::size_t>(0),
-                          counting_iterator<std::size_t>(feat * batch),
+            nn::for_range(feat * batch, feat * batch,
                           [&](std::size_t idx) {
                               std::size_t i = idx / batch;
                               out_m.data()[idx] = norm_m.data()[idx] * g.at_unchecked(i, 0) + b.at_unchecked(i, 0);

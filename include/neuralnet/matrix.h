@@ -145,9 +145,7 @@ namespace nn
             const std::size_t i_blocks = (rows_ + BLOCK_SIZE - 1) / BLOCK_SIZE;
             const std::size_t j_blocks = (cols_ + BLOCK_SIZE - 1) / BLOCK_SIZE;
 
-            std::for_each(NN_EXEC_POLICY,
-                          counting_iterator<std::size_t>(0),
-                          counting_iterator<std::size_t>(i_blocks * j_blocks),
+            nn::for_blocks(i_blocks * j_blocks,
                           [&](std::size_t block_idx) noexcept
                           {
                               const std::size_t ib = block_idx / j_blocks;
@@ -170,7 +168,7 @@ namespace nn
         {
             require_same_shape(*this, other, "addition dimension mismatch");
             Matrix result(rows_, cols_);
-            std::transform(NN_EXEC_POLICY, data_.begin(), data_.end(), other.data_.begin(),
+            nn::transform(size(), data_.begin(), data_.end(), other.data_.begin(),
                            result.data_.begin(), std::plus<>{});
             return result;
         }
@@ -179,7 +177,7 @@ namespace nn
         {
             require_same_shape(*this, other, "subtraction dimension mismatch");
             Matrix result(rows_, cols_);
-            std::transform(NN_EXEC_POLICY, data_.begin(), data_.end(), other.data_.begin(),
+            nn::transform(size(), data_.begin(), data_.end(), other.data_.begin(),
                            result.data_.begin(), std::minus<>{});
             return result;
         }
@@ -187,7 +185,7 @@ namespace nn
         [[nodiscard]] Matrix operator*(double scalar) const
         {
             Matrix result(rows_, cols_);
-            std::transform(NN_EXEC_POLICY, data_.begin(), data_.end(), result.data_.begin(),
+            nn::transform(size(), data_.begin(), data_.end(), result.data_.begin(),
                            [scalar](double value) noexcept { return value * scalar; });
             return result;
         }
@@ -213,9 +211,7 @@ namespace nn
             const std::size_t i_blocks = (M + BLOCK_SIZE - 1) / BLOCK_SIZE;
             const std::size_t j_blocks = (N + BLOCK_SIZE - 1) / BLOCK_SIZE;
 
-            std::for_each(NN_EXEC_POLICY,
-                          counting_iterator<std::size_t>(0),
-                          counting_iterator<std::size_t>(i_blocks * j_blocks),
+            nn::for_blocks(i_blocks * j_blocks,
                           [&](std::size_t block_idx)
                           {
                               const std::size_t i_block = block_idx / j_blocks;
@@ -281,9 +277,7 @@ namespace nn
             const std::size_t i_blocks = (M + BLOCK_SIZE - 1) / BLOCK_SIZE;
             const std::size_t j_blocks = (N + BLOCK_SIZE - 1) / BLOCK_SIZE;
 
-            std::for_each(NN_EXEC_POLICY,
-                          counting_iterator<std::size_t>(0),
-                          counting_iterator<std::size_t>(i_blocks * j_blocks),
+            nn::for_blocks(i_blocks * j_blocks,
                           [&](std::size_t block_idx)
                           {
                               const std::size_t i_block = block_idx / j_blocks;
@@ -340,9 +334,7 @@ namespace nn
             const std::size_t i_blocks = (M + BLOCK_SIZE - 1) / BLOCK_SIZE;
             const std::size_t j_blocks = (N + BLOCK_SIZE - 1) / BLOCK_SIZE;
 
-            std::for_each(NN_EXEC_POLICY,
-                          counting_iterator<std::size_t>(0),
-                          counting_iterator<std::size_t>(i_blocks * j_blocks),
+            nn::for_blocks(i_blocks * j_blocks,
                           [&](std::size_t block_idx)
                           {
                               const std::size_t i_block = block_idx / j_blocks;
@@ -394,7 +386,7 @@ namespace nn
 
         void scale_inplace(double scalar) noexcept
         {
-            std::for_each(NN_EXEC_POLICY, data_.begin(), data_.end(),
+            nn::for_each(size(), data_.begin(), data_.end(),
                           [scalar](double &value) noexcept { value *= scalar; });
         }
 
@@ -402,7 +394,7 @@ namespace nn
         void add_inplace(const Matrix &other) noexcept
         {
             if (rows_ != other.rows_ || cols_ != other.cols_) return;
-            std::transform(NN_EXEC_POLICY, data_.begin(), data_.end(), other.data_.begin(),
+            nn::transform(size(), data_.begin(), data_.end(), other.data_.begin(),
                            data_.begin(), std::plus<>{});
         }
 
@@ -410,7 +402,7 @@ namespace nn
         void subtract_inplace(const Matrix &other) noexcept
         {
             if (rows_ != other.rows_ || cols_ != other.cols_) return;
-            std::transform(NN_EXEC_POLICY, data_.begin(), data_.end(), other.data_.begin(),
+            nn::transform(size(), data_.begin(), data_.end(), other.data_.begin(),
                            data_.begin(), std::minus<>{});
         }
 
@@ -453,14 +445,14 @@ namespace nn
         }
 
         // ── Reduction 规约操作 (F8) ──────────────────────────────────────────────
-        // 全部基于 NN_EXEC_POLICY 并行；空矩阵返回值由各方法文档说明。
+        // 全部经 nn:: 自适应分派（小规模串行 / 大规模并行）；空矩阵返回值由各方法文档说明。
         // 存储布局：行主序（data_[row * cols_ + col]）。
 
         // Frobenius 范数：sqrt(sum(x^2))。空矩阵返回 0。
         [[nodiscard]] double norm() const noexcept
         {
-            const double sumsq = std::transform_reduce(
-                NN_EXEC_POLICY, data_.begin(), data_.end(),
+            const double sumsq = nn::transform_reduce(
+                size(), data_.begin(), data_.end(),
                 0.0, std::plus{},
                 [](double x) noexcept { return x * x; });
             return std::sqrt(sumsq);
@@ -469,8 +461,8 @@ namespace nn
         // 全元素求和。空矩阵返回 0。
         [[nodiscard]] double sum() const noexcept
         {
-            return std::reduce(NN_EXEC_POLICY, data_.begin(), data_.end(),
-                                0.0, std::plus{});
+            return nn::reduce(size(), data_.begin(), data_.end(),
+                              0.0, std::plus{});
         }
 
         // 全元素均值。空矩阵返回 0（避免 0/0）。
@@ -486,9 +478,7 @@ namespace nn
         {
             std::vector<double> result(cols_, 0.0);
             if (cols_ == 0) return result;
-            std::for_each(NN_EXEC_POLICY,
-                          counting_iterator<std::size_t>(0),
-                          counting_iterator<std::size_t>(cols_),
+            nn::for_range(size(), cols_,
                           [&](std::size_t j)
                           {
                               double s = 0.0;
@@ -506,9 +496,7 @@ namespace nn
         {
             std::vector<double> result(rows_, 0.0);
             if (rows_ == 0) return result;
-            std::for_each(NN_EXEC_POLICY,
-                          counting_iterator<std::size_t>(0),
-                          counting_iterator<std::size_t>(rows_),
+            nn::for_range(size(), rows_,
                           [&](std::size_t i)
                           {
                               const double *row_ptr = data_.data() + i * cols_;
@@ -526,9 +514,7 @@ namespace nn
             std::vector<double> result = rowwise_sum();
             if (cols_ == 0) return result;
             const double denom = static_cast<double>(cols_);
-            std::for_each(NN_EXEC_POLICY,
-                          counting_iterator<std::size_t>(0),
-                          counting_iterator<std::size_t>(rows_),
+            nn::for_range(rows_, rows_,
                           [&](std::size_t i) noexcept { result[i] /= denom; });
             return result;
         }
@@ -539,9 +525,7 @@ namespace nn
             std::vector<double> result = colwise_sum();
             if (rows_ == 0) return result;
             const double denom = static_cast<double>(rows_);
-            std::for_each(NN_EXEC_POLICY,
-                          counting_iterator<std::size_t>(0),
-                          counting_iterator<std::size_t>(cols_),
+            nn::for_range(cols_, cols_,
                           [&](std::size_t j) noexcept { result[j] /= denom; });
             return result;
         }
@@ -553,9 +537,7 @@ namespace nn
             std::vector<double> result(cols_, 0.0);
             if (cols_ == 0) return result;
             if (rows_ <= 1) return result;
-            std::for_each(NN_EXEC_POLICY,
-                          counting_iterator<std::size_t>(0),
-                          counting_iterator<std::size_t>(cols_),
+            nn::for_range(size(), cols_,
                           [&](std::size_t j)
                           {
                               const double m = mean[j];

@@ -25,8 +25,8 @@ namespace nn
     {
         // ── 计算 pre-clip 总范数 ──
         // sum(grad.norm()^2) over all grads
-        const double total_sq = std::transform_reduce(
-            NN_EXEC_POLICY,
+        const double total_sq = nn::transform_reduce(
+            grads.size(), // 迭代数=参数个数；每次迭代的 norm() 内部再自适应
             grads.begin(), grads.end(),
             0.0,
             std::plus<>{},
@@ -49,7 +49,7 @@ namespace nn
             for (auto &g_ref : grads)
             {
                 Matrix &g = g_ref.get();
-                std::transform(NN_EXEC_POLICY,
+                nn::transform(g.size(),
                                g.data().begin(), g.data().end(),
                                g.data().begin(),
                                [clip_coef](double v) noexcept { return v * clip_coef; });

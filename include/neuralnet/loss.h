@@ -41,8 +41,8 @@ namespace nn
             grad_input_ = Matrix(pred.rows(), pred.cols());
             const auto total = static_cast<double>(pred.size());
 
-            const double sum_sq = std::transform_reduce(
-                NN_EXEC_POLICY,
+            const double sum_sq = nn::transform_reduce(
+                pred.size(),
                 pred.data().begin(), pred.data().end(),
                 target.data().begin(),
                 0.0,
@@ -56,7 +56,7 @@ namespace nn
             const double loss = sum_sq / total;
             const double factor = 2.0 / total;
 
-            std::transform(NN_EXEC_POLICY,
+            nn::transform(pred.size(),
                            pred.data().begin(), pred.data().end(),
                            target.data().begin(),
                            grad_input_.data().begin(),

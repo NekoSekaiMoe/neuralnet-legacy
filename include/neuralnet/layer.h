@@ -114,9 +114,7 @@ namespace nn
             // the row contiguously in memory, with `bias_val` hoisted out of the
             // inner loop (one load per row instead of one per element).
             const std::size_t cols = result.cols();
-            std::for_each(NN_EXEC_POLICY,
-                          counting_iterator<std::size_t>(0),
-                          counting_iterator<std::size_t>(result.rows()),
+            nn::for_range(result.size(), result.rows(),
                           [&](std::size_t row) noexcept
                           {
                               const double bias_val = b_.at_unchecked(row, 0);
@@ -177,7 +175,7 @@ namespace nn
         {
             input_cache_ = input;
             Matrix result(input.rows(), input.cols());
-            std::transform(NN_EXEC_POLICY, input.data().begin(), input.data().end(),
+            nn::transform(input.size(), input.data().begin(), input.data().end(),
                            result.data().begin(), [](double value) noexcept
                            { return value > 0.0 ? value : 0.0; });
             return result;
@@ -191,7 +189,7 @@ namespace nn
             }
 
             Matrix grad_input(grad_output.rows(), grad_output.cols());
-            std::transform(NN_EXEC_POLICY,
+            nn::transform(input_cache_.size(),
                            input_cache_.data().begin(), input_cache_.data().end(),
                            grad_output.data().begin(),
                            grad_input.data().begin(),
@@ -220,7 +218,7 @@ namespace nn
         {
             input_cache_ = input;
             Matrix result(input.rows(), input.cols());
-            std::transform(NN_EXEC_POLICY, input.data().begin(), input.data().end(),
+            nn::transform(input.size(), input.data().begin(), input.data().end(),
                            result.data().begin(),
                            [this](double value) noexcept
                            { return value > 0.0 ? value : negative_slope_ * value; });
@@ -235,7 +233,7 @@ namespace nn
             }
 
             Matrix grad_input(grad_output.rows(), grad_output.cols());
-            std::transform(NN_EXEC_POLICY,
+            nn::transform(input_cache_.size(),
                            input_cache_.data().begin(), input_cache_.data().end(),
                            grad_output.data().begin(),
                            grad_input.data().begin(),
@@ -259,7 +257,7 @@ namespace nn
         Matrix forward(const Matrix &input) override
         {
             Matrix result(input.rows(), input.cols());
-            std::transform(NN_EXEC_POLICY, input.data().begin(), input.data().end(),
+            nn::transform(input.size(), input.data().begin(), input.data().end(),
                            result.data().begin(),
                            [](double value) noexcept
                            { return 1.0 / (1.0 + std::exp(-value)); });
@@ -275,7 +273,7 @@ namespace nn
             }
 
             Matrix grad_input(grad_output.rows(), grad_output.cols());
-            std::transform(NN_EXEC_POLICY,
+            nn::transform(output_cache_.size(),
                            output_cache_.data().begin(), output_cache_.data().end(),
                            grad_output.data().begin(),
                            grad_input.data().begin(),
@@ -297,7 +295,7 @@ namespace nn
         Matrix forward(const Matrix &input) override
         {
             Matrix result(input.rows(), input.cols());
-            std::transform(NN_EXEC_POLICY, input.data().begin(), input.data().end(),
+            nn::transform(input.size(), input.data().begin(), input.data().end(),
                            result.data().begin(),
                            [](double value) noexcept
                            { return std::tanh(value); });
@@ -313,7 +311,7 @@ namespace nn
             }
 
             Matrix grad_input(grad_output.rows(), grad_output.cols());
-            std::transform(NN_EXEC_POLICY,
+            nn::transform(output_cache_.size(),
                            output_cache_.data().begin(), output_cache_.data().end(),
                            grad_output.data().begin(),
                            grad_input.data().begin(),
@@ -353,7 +351,7 @@ namespace nn
         {
             input_cache_ = input;
             Matrix result(input.rows(), input.cols());
-            std::transform(NN_EXEC_POLICY, input.data().begin(), input.data().end(),
+            nn::transform(input.size(), input.data().begin(), input.data().end(),
                            result.data().begin(), gelu_fn);
             return result;
         }
@@ -366,7 +364,7 @@ namespace nn
             }
 
             Matrix grad_input(grad_output.rows(), grad_output.cols());
-            std::transform(NN_EXEC_POLICY,
+            nn::transform(input_cache_.size(),
                            input_cache_.data().begin(), input_cache_.data().end(),
                            grad_output.data().begin(),
                            grad_input.data().begin(),
@@ -411,13 +409,12 @@ namespace nn
             std::bernoulli_distribution dist(1.0 - p_);
             mask_ = Matrix(input.rows(), input.cols());
 
-            std::transform(NN_EXEC_POLICY, input.data().begin(), input.data().end(),
-                           mask_.data().begin(),
-                           [&](double /*value*/) noexcept -> double
-                           { return dist(rng_) ? scale : 0.0; });
+            // RNG 必须串行：mt19937 并发调用是数据竞争（UB），且串行保证可复现
+            for (std::size_t idx = 0; idx < input.size(); ++idx)
+                mask_.data()[idx] = dist(rng_) ? scale : 0.0;
 
             Matrix result(input.rows(), input.cols());
-            std::transform(NN_EXEC_POLICY,
+            nn::transform(input.size(),
                            input.data().begin(), input.data().end(),
                            mask_.data().begin(),
                            result.data().begin(),
@@ -439,7 +436,7 @@ namespace nn
             }
 
             Matrix grad_input(grad_output.rows(), grad_output.cols());
-            std::transform(NN_EXEC_POLICY,
+            nn::transform(grad_output.size(),
                            grad_output.data().begin(), grad_output.data().end(),
                            mask_.data().begin(),
                            grad_input.data().begin(),
@@ -481,9 +478,7 @@ namespace nn
         static std::vector<double> rowwise_sum(const Matrix &m)
         {
             std::vector<double> result(m.rows(), 0.0);
-            std::for_each(NN_EXEC_POLICY,
-                          counting_iterator<std::size_t>(0),
-                          counting_iterator<std::size_t>(m.rows()),
+            nn::for_range(m.size(), m.rows(),
                           [&](std::size_t i) noexcept
                           {
                               double s = 0.0;
@@ -500,9 +495,7 @@ namespace nn
             std::vector<double> result = rowwise_sum(m);
             if (m.cols() == 0) return result;
             const double denom = static_cast<double>(m.cols());
-            std::for_each(NN_EXEC_POLICY,
-                          counting_iterator<std::size_t>(0),
-                          counting_iterator<std::size_t>(m.rows()),
+            nn::for_range(m.rows(), m.rows(),
                           [&](std::size_t i) noexcept { result[i] /= denom; });
             return result;
         }
@@ -512,9 +505,7 @@ namespace nn
         {
             std::vector<double> result(m.rows(), 0.0);
             if (m.cols() == 0) return result;
-            std::for_each(NN_EXEC_POLICY,
-                          counting_iterator<std::size_t>(0),
-                          counting_iterator<std::size_t>(m.rows()),
+            nn::for_range(m.size(), m.rows(),
                           [&](std::size_t i)
                           {
                               const double m_i = mean[i];
@@ -612,13 +603,13 @@ namespace nn
                 }
 
                 // running_mean = (1 - momentum) * running_mean + momentum * batch_mean
-                std::transform(NN_EXEC_POLICY,
+                nn::transform(running_mean_.size(),
                                running_mean_.data().begin(), running_mean_.data().end(),
                                batch_mean_.data().begin(),
                                running_mean_.data().begin(),
                                [this](double rm, double bm) noexcept
                                { return (1.0 - momentum_) * rm + momentum_ * bm; });
-                std::transform(NN_EXEC_POLICY,
+                nn::transform(running_var_.size(),
                                running_var_.data().begin(), running_var_.data().end(),
                                batch_var_.data().begin(),
                                running_var_.data().begin(),
@@ -631,9 +622,7 @@ namespace nn
             const Matrix &mean_src = is_training_ ? batch_mean_ : running_mean_;
             const Matrix &var_src = is_training_ ? batch_var_ : running_var_;
             normalized_ = Matrix(num_features_, batch_size);
-            std::for_each(NN_EXEC_POLICY,
-                          counting_iterator<std::size_t>(0),
-                          counting_iterator<std::size_t>(input.size()),
+            nn::for_range(input.size(), input.size(),
                           [&](std::size_t idx)
                           {
                               const std::size_t i = idx / batch_size;
@@ -648,9 +637,7 @@ namespace nn
             }
 
             Matrix output(num_features_, batch_size);
-            std::for_each(NN_EXEC_POLICY,
-                          counting_iterator<std::size_t>(0),
-                          counting_iterator<std::size_t>(input.size()),
+            nn::for_range(input.size(), input.size(),
                           [&](std::size_t idx)
                           {
                               const std::size_t i = idx / batch_size;
@@ -701,9 +688,7 @@ namespace nn
             Matrix dx_hat(num_features_, batch_size);
             if (affine_)
             {
-                std::for_each(NN_EXEC_POLICY,
-                              counting_iterator<std::size_t>(0),
-                              counting_iterator<std::size_t>(grad_output.size()),
+                nn::for_range(grad_output.size(), grad_output.size(),
                               [&](std::size_t idx)
                               {
                                   const std::size_t i = idx / batch_size;
@@ -738,9 +723,7 @@ namespace nn
             const double scale = 1.0 / static_cast<double>(batch_size);
             const double N = static_cast<double>(batch_size);
             Matrix dx(num_features_, batch_size);
-            std::for_each(NN_EXEC_POLICY,
-                          counting_iterator<std::size_t>(0),
-                          counting_iterator<std::size_t>(dx.size()),
+            nn::for_range(dx.size(), dx.size(),
                           [&](std::size_t idx)
                           {
                               const std::size_t i = idx / batch_size;
@@ -872,9 +855,7 @@ namespace nn
             }
 
             Matrix output(feat, batch);
-            std::for_each(NN_EXEC_POLICY,
-                          counting_iterator<std::size_t>(0),
-                          counting_iterator<std::size_t>(feat * batch),
+            nn::for_range(feat * batch, feat * batch,
                           [&](std::size_t idx) {
                               std::size_t i = idx / batch;
                               output.data()[idx] = normalized_cache_.data()[idx]
