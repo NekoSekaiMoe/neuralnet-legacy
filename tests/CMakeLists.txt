@@ -64,6 +64,7 @@ if(BUILD_TESTING)
         sgd
         sgd_momentum
         adam
+        adamw
         step_lr
         cosine_lr
         exp_lr
@@ -123,6 +124,11 @@ if(BUILD_TESTING)
         layernorm_normalize
         layernorm_backward_shape
         layernorm_gradient_check
+        rmsnorm_forward_shape
+        rmsnorm_gradient_check
+        swiglu_forward
+        swiglu_gradient_check
+        swiglu_ffn_composite
         softmax_forward
         softmax_backward_shape
         positional_encoding_shape

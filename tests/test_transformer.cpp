@@ -160,6 +160,226 @@ static void test_layernorm_gradient_check()
     }
 }
 
+// ── RMSNorm（Matrix 版 Layer API）────────────────────────────────────────────
+
+static void test_rmsnorm_forward_shape()
+{
+    std::puts("  [RMSNorm] forward shape & normalization ...");
+
+    const std::size_t F = 4, B = 2;
+    nn::RMSNorm rms(F);
+    nn::Matrix x(F, B);
+    std::mt19937_64 rng(123);
+    std::normal_distribution<double> dist(0.0, 1.0);
+    for (auto &v : x.data())
+        v = dist(rng);
+
+    nn::Matrix out = rms.forward(x);
+    assert(out.rows() == F && out.cols() == B);
+
+    // γ 初始为 1：每列 RMS(normed)² = mean(x²)/(mean(x²)+ε) ≈ 1
+    for (std::size_t j = 0; j < B; ++j)
+    {
+        double ms = 0.0;
+        for (std::size_t i = 0; i < F; ++i)
+            ms += out.at_unchecked(i, j) * out.at_unchecked(i, j);
+        ms /= static_cast<double>(F);
+        assert(ms > 0.99 && ms <= 1.0);
+    }
+
+    // γ 行缩放：γ[1]=2 → 输出行 1 恰为 γ=1 时的两倍
+    auto params = rms.parameters();
+    nn::Matrix &gamma = params[0].get();
+    gamma.set_value_unchecked(1, 0, 2.0);
+    nn::Matrix out2 = rms.forward(x);
+    for (std::size_t j = 0; j < B; ++j)
+        assert(approx(out2.at_unchecked(1, j), 2.0 * out.at_unchecked(1, j)));
+
+    std::puts("  [RMSNorm] forward shape & normalization PASSED");
+}
+
+static void test_rmsnorm_gradient_check()
+{
+    std::puts("  [RMSNorm] gradient check (central difference) ...");
+
+    const std::size_t F = 5, B = 3;
+    nn::RMSNorm rms(F);
+    nn::Matrix in_m(F, B);
+    std::mt19937_64 rng(456);
+    std::normal_distribution<double> dist(0.0, 1.0);
+    for (auto &v : in_m.data())
+        v = dist(rng);
+
+    // 固定随机上游梯度 R，损失 L = Σ out⊙R → dL/dout = R
+    nn::Matrix R(F, B);
+    for (auto &v : R.data())
+        v = dist(rng);
+
+    auto loss_of = [&](const nn::Matrix &inp)
+    {
+        nn::Matrix o = rms.forward(inp);
+        double s = 0.0;
+        for (std::size_t k = 0; k < o.size(); ++k)
+            s += o.data()[k] * R.data()[k];
+        return s;
+    };
+
+    // 解析梯度（基于原始 in_m）
+    (void)rms.forward(in_m);
+    nn::Matrix grad_in = rms.backward(R);
+    const double eps = 1e-6;
+
+    // 1) 输入梯度
+    for (std::size_t i = 0; i < F; ++i)
+        for (std::size_t j = 0; j < B; ++j)
+        {
+            const double orig = in_m.at_unchecked(i, j);
+            in_m.set_value_unchecked(i, j, orig + eps);
+            const double lp = loss_of(in_m);
+            in_m.set_value_unchecked(i, j, orig - eps);
+            const double lm = loss_of(in_m);
+            in_m.set_value_unchecked(i, j, orig);
+            const double fd = (lp - lm) / (2.0 * eps);
+            assert(approx(fd, grad_in.at_unchecked(i, j), 1e-5));
+        }
+
+    // 2) γ 梯度（dgamma 由上面 backward 填充）
+    auto param_refs = rms.parameters();
+    auto grad_refs = rms.param_gradients();
+    nn::Matrix &gamma = param_refs[0].get();
+    const nn::Matrix &dgamma = grad_refs[0].get();
+    for (std::size_t r = 0; r < F; ++r)
+    {
+        const double orig = gamma.at_unchecked(r, 0);
+        gamma.set_value_unchecked(r, 0, orig + eps);
+        const double lp = loss_of(in_m);
+        gamma.set_value_unchecked(r, 0, orig - eps);
+        const double lm = loss_of(in_m);
+        gamma.set_value_unchecked(r, 0, orig);
+        const double fd = (lp - lm) / (2.0 * eps);
+        assert(approx(fd, dgamma.at_unchecked(r, 0), 1e-5));
+    }
+
+    std::puts("  [RMSNorm] gradient check PASSED");
+}
+
+// ── SwiGLU ──────────────────────────────────────────────────────────────────
+
+static void test_swiglu_forward()
+{
+    std::puts("  [SwiGLU] forward (hand-computed) ...");
+
+    nn::SwiGLU act(2); // d_ff = 2，输入 (4, 1)
+    nn::Matrix x(std::vector<double>{1.0, -1.0,   // gate
+                                     2.0, 0.5}, 4, 1); // up
+    nn::Matrix out = act.forward(x);
+    assert(out.rows() == 2 && out.cols() == 1);
+
+    // out = gate·σ(gate)·up
+    const double s1 = 1.0 / (1.0 + std::exp(-1.0));
+    assert(approx(out.at(0, 0), 1.0 * s1 * 2.0));
+    assert(approx(out.at(1, 0), -1.0 * (1.0 - s1) * 0.5)); // σ(-1) = 1-σ(1)
+
+    std::puts("  [SwiGLU] forward PASSED");
+}
+
+static void test_swiglu_gradient_check()
+{
+    std::puts("  [SwiGLU] gradient check (central difference) ...");
+
+    const std::size_t D = 4, B = 3; // 输入 (2D, B)
+    nn::SwiGLU act(D);
+    nn::Matrix in_m(2 * D, B);
+    std::mt19937_64 rng(789);
+    std::normal_distribution<double> dist(0.0, 1.0);
+    for (auto &v : in_m.data())
+        v = dist(rng);
+
+    nn::Matrix R(D, B);
+    for (auto &v : R.data())
+        v = dist(rng);
+
+    auto loss_of = [&](const nn::Matrix &inp)
+    {
+        nn::Matrix o = act.forward(inp);
+        double s = 0.0;
+        for (std::size_t k = 0; k < o.size(); ++k)
+            s += o.data()[k] * R.data()[k];
+        return s;
+    };
+
+    (void)act.forward(in_m);
+    nn::Matrix grad_in = act.backward(R);
+    assert(grad_in.rows() == 2 * D && grad_in.cols() == B);
+
+    const double eps = 1e-6;
+    for (std::size_t i = 0; i < 2 * D; ++i)
+        for (std::size_t j = 0; j < B; ++j)
+        {
+            const double orig = in_m.at_unchecked(i, j);
+            in_m.set_value_unchecked(i, j, orig + eps);
+            const double lp = loss_of(in_m);
+            in_m.set_value_unchecked(i, j, orig - eps);
+            const double lm = loss_of(in_m);
+            in_m.set_value_unchecked(i, j, orig);
+            const double fd = (lp - lm) / (2.0 * eps);
+            assert(approx(fd, grad_in.at_unchecked(i, j), 1e-5));
+        }
+
+    std::puts("  [SwiGLU] gradient check PASSED");
+}
+
+static void test_swiglu_ffn_composite()
+{
+    std::puts("  [SwiGLUFeedForward] composite forward & gradcheck ...");
+
+    const std::size_t d_model = 6, d_ff = 8, B = 2;
+    nn::SwiGLUFeedForward ffn(d_model, d_ff);
+    nn::Matrix in_m(d_model, B);
+    std::mt19937_64 rng(321);
+    std::normal_distribution<double> dist(0.0, 1.0);
+    for (auto &v : in_m.data())
+        v = dist(rng);
+
+    nn::Matrix out = ffn.forward(in_m);
+    assert(out.rows() == d_model && out.cols() == B);
+    // 参数量：W1(d_ff*2, d_model) + b1(2d_ff) + W2(d_model, d_ff) + b2(d_model)
+    assert(ffn.param_count() == 2 * d_ff * d_model + 2 * d_ff + d_model * d_ff + d_model);
+
+    nn::Matrix R(d_model, B);
+    for (auto &v : R.data())
+        v = dist(rng);
+
+    auto loss_of = [&](const nn::Matrix &inp)
+    {
+        nn::Matrix o = ffn.forward(inp);
+        double s = 0.0;
+        for (std::size_t k = 0; k < o.size(); ++k)
+            s += o.data()[k] * R.data()[k];
+        return s;
+    };
+
+    (void)ffn.forward(in_m);
+    nn::Matrix grad_in = ffn.backward(R);
+    assert(grad_in.rows() == d_model && grad_in.cols() == B);
+
+    const double eps = 1e-6;
+    for (std::size_t i = 0; i < d_model; ++i)
+        for (std::size_t j = 0; j < B; ++j)
+        {
+            const double orig = in_m.at_unchecked(i, j);
+            in_m.set_value_unchecked(i, j, orig + eps);
+            const double lp = loss_of(in_m);
+            in_m.set_value_unchecked(i, j, orig - eps);
+            const double lm = loss_of(in_m);
+            in_m.set_value_unchecked(i, j, orig);
+            const double fd = (lp - lm) / (2.0 * eps);
+            assert(approx(fd, grad_in.at_unchecked(i, j), 1e-4));
+        }
+
+    std::puts("  [SwiGLUFeedForward] composite forward & gradcheck PASSED");
+}
+
 // ── Softmax ─────────────────────────────────────────────────────────────────
 
 static void test_softmax_forward()
@@ -490,6 +710,11 @@ TestEntry tests[] = {
     {"layernorm_normalize",                test_layernorm_normalize},
     {"layernorm_backward_shape",           test_layernorm_backward_shape},
     {"layernorm_gradient_check",           test_layernorm_gradient_check},
+    {"rmsnorm_forward_shape",              test_rmsnorm_forward_shape},
+    {"rmsnorm_gradient_check",             test_rmsnorm_gradient_check},
+    {"swiglu_forward",                      test_swiglu_forward},
+    {"swiglu_gradient_check",               test_swiglu_gradient_check},
+    {"swiglu_ffn_composite",                test_swiglu_ffn_composite},
     {"softmax_forward",                    test_softmax_forward},
     {"softmax_backward_shape",             test_softmax_backward_shape},
     {"positional_encoding_shape",          test_positional_encoding_shape},

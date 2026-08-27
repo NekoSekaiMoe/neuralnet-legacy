@@ -914,6 +914,126 @@ namespace nn
         }
     };
 
+    // ── RMSNorm（Root Mean Square 归一化，LLaMA/Mistral 风格，移植自上游）──
+    // 与 LayerNorm 差异：不减均值、无 beta 偏置，仅按均方根归一化，
+    // 每层少 2 次列归约 + 1 次广播。公式（对标上游 compute_layer_mlp.hpp）：
+    //   forward:  mean_sq = (1/F)Σx²;  rms_inv = rsqrt(mean_sq + ε);
+    //             normed = x·rms_inv;  out = normed·γ
+    //   backward: gy = g·γ;  gy_n = gy⊙normed;  m = (1/F)Σ_f gy_n;
+    //             grad_x = (gy − m·normed)·rms_inv;  grad_γ = Σ_batch gy_n
+    class RMSNorm final : public Layer
+    {
+    private:
+        std::size_t normalized_shape_;
+        double eps_;
+        Matrix gamma_;   // (normalized_shape, 1)，初始化为 1（无 beta）
+        Matrix dgamma_;
+
+        // backward 缓存
+        Matrix normalized_cache_;   // (features, batch)
+        std::vector<double> rms_inv_cache_; // (batch)
+
+    public:
+        explicit RMSNorm(std::size_t normalized_shape, double eps = 1e-5)
+            : normalized_shape_(normalized_shape), eps_(eps),
+              gamma_(normalized_shape, 1, 1.0),
+              dgamma_(normalized_shape, 1, 0.0) {}
+
+        const char *name() const override { return "RMSNorm"; }
+        [[nodiscard]] std::size_t param_count() const noexcept override { return normalized_shape_; }
+
+        std::vector<std::reference_wrapper<Matrix>> parameters() override
+        {
+            return {std::ref(gamma_)};
+        }
+
+        std::vector<std::reference_wrapper<Matrix>> param_gradients() override
+        {
+            return {std::ref(dgamma_)};
+        }
+
+        Matrix forward(const Matrix &input) override
+        {
+            if (input.rows() != normalized_shape_)
+                throw std::invalid_argument("RMSNorm forward: input rows != normalized_shape");
+
+            const std::size_t feat = input.rows();
+            const std::size_t batch = input.cols();
+            const double inv_feat = 1.0 / static_cast<double>(feat);
+
+            rms_inv_cache_.resize(batch);
+            normalized_cache_ = Matrix(feat, batch);
+
+            for (std::size_t j = 0; j < batch; ++j)
+            {
+                double sum_sq = 0.0;
+                for (std::size_t i = 0; i < feat; ++i)
+                {
+                    const double x = input.at_unchecked(i, j);
+                    sum_sq += x * x;
+                }
+                const double rms_inv = 1.0 / std::sqrt(sum_sq * inv_feat + eps_);
+                rms_inv_cache_[j] = rms_inv;
+                for (std::size_t i = 0; i < feat; ++i)
+                    normalized_cache_.set_value_unchecked(i, j, input.at_unchecked(i, j) * rms_inv);
+            }
+
+            Matrix output(feat, batch);
+            nn::for_range(feat * batch, feat * batch,
+                          [&](std::size_t idx)
+                          {
+                              const std::size_t i = idx / batch;
+                              output.data()[idx] = normalized_cache_.data()[idx]
+                                  * gamma_.at_unchecked(i, 0);
+                          });
+            return output;
+        }
+
+        Matrix backward(const Matrix &grad_output) override
+        {
+            if (grad_output.rows() != normalized_shape_)
+                throw std::invalid_argument("RMSNorm backward: grad_output rows != normalized_shape");
+            if (normalized_cache_.rows() != normalized_shape_
+                || normalized_cache_.cols() != grad_output.cols())
+                throw std::invalid_argument("RMSNorm backward: forward cache shape mismatch");
+
+            const std::size_t feat = grad_output.rows();
+            const std::size_t batch = grad_output.cols();
+            const double inv_feat = 1.0 / static_cast<double>(feat);
+
+            // 行主序友好：按行同时累计 grad_γ 与每列的 m[j] = (1/F)Σ_i gy_n
+            dgamma_.zero();
+            std::vector<double> m_vec(batch, 0.0);
+            for (std::size_t i = 0; i < feat; ++i)
+            {
+                const double g_i = gamma_.at_unchecked(i, 0);
+                double dg = 0.0;
+                for (std::size_t j = 0; j < batch; ++j)
+                {
+                    const double gy_n = grad_output.at_unchecked(i, j) * g_i
+                                        * normalized_cache_.at_unchecked(i, j);
+                    dg += gy_n;
+                    m_vec[j] += gy_n;
+                }
+                dgamma_.set_value_unchecked(i, 0, dg);
+            }
+
+            // grad_x = (gy − m·normed)·rms_inv
+            Matrix grad_input(feat, batch);
+            nn::for_range(feat * batch, feat * batch,
+                          [&](std::size_t idx)
+                          {
+                              const std::size_t i = idx / batch;
+                              const std::size_t j = idx % batch;
+                              const double gy = grad_output.data()[idx]
+                                                * gamma_.at_unchecked(i, 0);
+                              grad_input.data()[idx] =
+                                  (gy - m_vec[j] * inv_feat * normalized_cache_.data()[idx])
+                                  * rms_inv_cache_[j];
+                          });
+            return grad_input;
+        }
+    };
 
     // ── Softmax ──────────────────────────────────────────────────────────────
     class Softmax final : public Layer
@@ -1260,6 +1380,125 @@ namespace nn
         Matrix backward(const Matrix &grad_output) override
         {
             return linear1_.backward(gelu_.backward(linear2_.backward(grad_output)));
+        }
+    };
+
+    // ── SwiGLU（SiLU 门控 FFN 激活，LLaMA 风格，移植自上游）────────────
+    // 输入 (2·d_ff, batch)：gate = 前 d_ff 行，up = 后 d_ff 行
+    //   forward:  s = σ(gate);  out = SiLU(gate) ⊙ up = gate·s·up
+    //   backward: grad_gate = g⊙up⊙s⊙(1 + gate⊙(1−s))
+    //             grad_up   = g⊙gate⊙s
+    //             两者拼回 (2·d_ff, batch)
+    class SwiGLU final : public Layer
+    {
+    private:
+        std::size_t d_ff_;
+        Matrix gate_cache_;    // (d_ff, batch)
+        Matrix sigmoid_cache_; // σ(gate)
+        Matrix up_cache_;      // (d_ff, batch)
+
+    public:
+        explicit SwiGLU(std::size_t d_ff) : d_ff_(d_ff) {}
+
+        const char *name() const override { return "SwiGLU"; }
+
+        Matrix forward(const Matrix &input) override
+        {
+            if (input.rows() != 2 * d_ff_)
+                throw std::invalid_argument("SwiGLU forward: input rows != 2*d_ff");
+
+            const std::size_t batch = input.cols();
+            gate_cache_ = input.row_slice(0, d_ff_);
+            up_cache_ = input.row_slice(d_ff_, d_ff_);
+            sigmoid_cache_ = Matrix(d_ff_, batch);
+
+            nn::transform(gate_cache_.size(),
+                          gate_cache_.data().begin(), gate_cache_.data().end(),
+                          sigmoid_cache_.data().begin(),
+                          [](double g) noexcept { return 1.0 / (1.0 + std::exp(-g)); });
+
+            Matrix output(d_ff_, batch);
+            nn::for_range(output.size(), output.size(),
+                          [&](std::size_t idx) noexcept
+                          {
+                              output.data()[idx] = gate_cache_.data()[idx]
+                                  * sigmoid_cache_.data()[idx] * up_cache_.data()[idx];
+                          });
+            return output;
+        }
+
+        Matrix backward(const Matrix &grad_output) override
+        {
+            if (grad_output.rows() != d_ff_)
+                throw std::invalid_argument("SwiGLU backward: grad_output rows != d_ff");
+            if (gate_cache_.rows() != d_ff_ || gate_cache_.cols() != grad_output.cols())
+                throw std::invalid_argument("SwiGLU backward: forward cache shape mismatch");
+
+            const std::size_t batch = grad_output.cols();
+            Matrix grad_gate(d_ff_, batch), grad_up(d_ff_, batch);
+
+            nn::for_range(grad_output.size(), grad_output.size(),
+                          [&](std::size_t idx) noexcept
+                          {
+                              const double g = grad_output.data()[idx];
+                              const double s = sigmoid_cache_.data()[idx];
+                              const double gate = gate_cache_.data()[idx];
+                              const double up = up_cache_.data()[idx];
+                              grad_gate.data()[idx] = g * up * s * (1.0 + gate * (1.0 - s));
+                              grad_up.data()[idx] = g * gate * s;
+                          });
+
+            Matrix grad_input(2 * d_ff_, batch);
+            grad_input.set_row_slice(0, grad_gate);
+            grad_input.set_row_slice(d_ff_, grad_up);
+            return grad_input;
+        }
+    };
+
+    // ── SwiGLUFeedForward（LLaMA 风格 FFN，移植自上游）──────────────────
+    // Linear(d_model → 2·d_ff) → SwiGLU → Linear(d_ff → d_model)
+    // 与 FeedForward（GELU 版）同构，可直接替换。
+    class SwiGLUFeedForward final : public Layer
+    {
+    private:
+        Linear linear1_;
+        SwiGLU swiglu_;
+        Linear linear2_;
+
+    public:
+        SwiGLUFeedForward(std::size_t d_model, std::size_t d_ff)
+            : linear1_(d_model, 2 * d_ff), swiglu_(d_ff), linear2_(d_ff, d_model) {}
+
+        const char *name() const override { return "SwiGLUFeedForward"; }
+        [[nodiscard]] std::size_t param_count() const noexcept override
+        {
+            return linear1_.param_count() + linear2_.param_count();
+        }
+
+        std::vector<std::reference_wrapper<Matrix>> parameters() override
+        {
+            auto p = linear1_.parameters();
+            auto p2 = linear2_.parameters();
+            p.insert(p.end(), p2.begin(), p2.end());
+            return p;
+        }
+
+        std::vector<std::reference_wrapper<Matrix>> param_gradients() override
+        {
+            auto g = linear1_.param_gradients();
+            auto g2 = linear2_.param_gradients();
+            g.insert(g.end(), g2.begin(), g2.end());
+            return g;
+        }
+
+        Matrix forward(const Matrix &input) override
+        {
+            return linear2_.forward(swiglu_.forward(linear1_.forward(input)));
+        }
+
+        Matrix backward(const Matrix &grad_output) override
+        {
+            return linear1_.backward(swiglu_.backward(linear2_.backward(grad_output)));
         }
     };
 
