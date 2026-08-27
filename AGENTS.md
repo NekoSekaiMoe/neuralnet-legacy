@@ -45,7 +45,7 @@ This is a header-only C++17 neural network library. All code lives in `include/n
 
 **Module layout**:
 - `matrix.h` — core Matrix class, all arithmetic and BLAS-like ops
-- `layer.h` — Layer base + all layer implementations (Linear, activations, BatchNorm, Dropout)
+- `layer.h` — Layer base + all layer implementations (Linear, activations, BatchNorm, Dropout, Conv2D/MaxPool2D)
 - `loss.h` — MSELoss, CrossEntropyLoss
 - `optimizer.h` — SGD, SGD_w_Momentum, Adam, AdamW (decoupled weight decay)
 - `lr_scheduler.h` — StepLR, CosineAnnealingLR, ExponentialLR

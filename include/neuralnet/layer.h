@@ -7,6 +7,7 @@
 #include <execution>
 #include <functional>
 #include <iostream>
+#include <limits>
 #include <numeric>
 #include <random>
 #include <stdexcept>
@@ -782,6 +783,316 @@ namespace nn
     public:
         using BatchNorm1d::BatchNorm1d;
         const char *name() const override { return "BatchNorm2d"; }
+    };
+
+    // ── Conv2D（im2col + GEMM，移植自上游 compute_layer_conv.hpp）──────
+    // 布局：输入/输出 (C*H*W, batch)，列 = batch 样本；
+    //       权重 W (C_out, C_in*k*k) + 偏置 b (C_out, 1)。
+    // forward:  col = im2col(x) (C_in*k*k, batch*OH*OW)
+    //           Z = W × col + b → 重排 (C_out*OH*OW, batch)
+    // backward: gZ = 重排(grad_out)；grad_W = gZ×colᵀ；grad_b = 行和(gZ)；
+    //           grad_col = Wᵀ×gZ → col2im 散射累加 → grad_x
+    // 梯度语义：替换（zero 后填），与 Linear 一致。
+    class Conv2D final : public Layer
+    {
+    private:
+        std::size_t in_channels_, out_channels_;
+        std::size_t kernel_, stride_, padding_;
+        std::size_t in_h_, in_w_;
+        std::size_t out_h_, out_w_;
+
+        Matrix W_, b_;
+        Matrix grad_W_, grad_b_;
+        Matrix col_cache_; // im2col 输出，供 backward
+
+        inline static thread_local std::mt19937_64 rng_{std::random_device{}()};
+
+        // im2col：input (C_in*H*W, batch) → col (C_in*k*k, batch*OH*OW)
+        // 逐输出位置（b, oh, ow）独立 → 安全并行；work = col 元素数
+        [[nodiscard]] Matrix im2col_(const Matrix &input, std::size_t batch) const
+        {
+            const std::size_t C_in = in_channels_, k = kernel_;
+            const std::size_t H_out = out_h_, W_out = out_w_;
+            Matrix col(C_in * k * k, batch * H_out * W_out);
+
+            nn::for_range(col.size(), batch * H_out * W_out,
+                          [&](std::size_t pos)
+                          {
+                              const std::size_t b = pos / (H_out * W_out);
+                              const std::size_t oh = (pos / W_out) % H_out;
+                              const std::size_t ow = pos % W_out;
+                              for (std::size_t ci = 0; ci < C_in; ++ci)
+                                  for (std::size_t kh = 0; kh < k; ++kh)
+                                      for (std::size_t kw = 0; kw < k; ++kw)
+                                      {
+                                          const long ih = static_cast<long>(oh * stride_ + kh)
+                                                          - static_cast<long>(padding_);
+                                          const long iw = static_cast<long>(ow * stride_ + kw)
+                                                          - static_cast<long>(padding_);
+                                          double v = 0.0; // 零填充
+                                          if (ih >= 0 && iw >= 0
+                                              && ih < static_cast<long>(in_h_)
+                                              && iw < static_cast<long>(in_w_))
+                                              v = input.at_unchecked(
+                                                  ci * in_h_ * in_w_ + ih * in_w_ + iw, b);
+                                          col.set_value_unchecked(ci * k * k + kh * k + kw, pos, v);
+                                      }
+                          });
+            return col;
+        }
+
+        // col2im：col (C_in*k*k, batch*OH*OW) → (C_in*H*W, batch)，散射累加。
+        // 同一 (b, ci) 内不同输出位置可能写同一输入格（stride < k 时窗口重叠），
+        // 故只在 (b, ci) 粒度并行（块间不相交），块内串行累加。
+        [[nodiscard]] Matrix col2im_(const Matrix &col, std::size_t batch) const
+        {
+            const std::size_t C_in = in_channels_, k = kernel_;
+            const std::size_t H_out = out_h_, W_out = out_w_;
+            Matrix out(C_in * in_h_ * in_w_, batch);
+
+            nn::for_range(col.size(), batch * C_in,
+                          [&](std::size_t bc)
+                          {
+                              const std::size_t b = bc / C_in;
+                              const std::size_t ci = bc % C_in;
+                              for (std::size_t oh = 0; oh < H_out; ++oh)
+                                  for (std::size_t ow = 0; ow < W_out; ++ow)
+                                      for (std::size_t kh = 0; kh < k; ++kh)
+                                          for (std::size_t kw = 0; kw < k; ++kw)
+                                          {
+                                              const long ih = static_cast<long>(oh * stride_ + kh)
+                                                              - static_cast<long>(padding_);
+                                              const long iw = static_cast<long>(ow * stride_ + kw)
+                                                              - static_cast<long>(padding_);
+                                              if (ih < 0 || iw < 0
+                                                  || ih >= static_cast<long>(in_h_)
+                                                  || iw >= static_cast<long>(in_w_))
+                                                  continue;
+                                              const std::size_t r = ci * k * k + kh * k + kw;
+                                              const std::size_t orow = ci * in_h_ * in_w_
+                                                                      + ih * in_w_ + iw;
+                                              out.set_value_unchecked(
+                                                  orow, b,
+                                                  out.at_unchecked(orow, b)
+                                                      + col.at_unchecked(r, b * H_out * W_out
+                                                                         + oh * W_out + ow));
+                                          }
+                          });
+            return out;
+        }
+
+        // 布局重排：Z (C_out, batch*OH*OW) → out (C_out*OH*OW, batch)
+        [[nodiscard]] Matrix cols_to_samples_(const Matrix &Z, std::size_t batch) const
+        {
+            const std::size_t area = out_h_ * out_w_;
+            Matrix out(out_channels_ * area, batch);
+            nn::for_range(out.size(), out.size(),
+                          [&](std::size_t idx)
+                          {
+                              const std::size_t r = idx / batch; // (co*area + p)
+                              const std::size_t b = idx % batch;
+                              const std::size_t co = r / area, p = r % area;
+                              out.data()[idx] = Z.at_unchecked(co, b * area + p);
+                          });
+            return out;
+        }
+
+        // 布局重排：out (C_out*OH*OW, batch) → Z (C_out, batch*OH*OW)
+        [[nodiscard]] Matrix samples_to_cols_(const Matrix &out, std::size_t batch) const
+        {
+            const std::size_t area = out_h_ * out_w_;
+            Matrix Z(out_channels_, batch * area);
+            nn::for_range(Z.size(), Z.size(),
+                          [&](std::size_t idx)
+                          {
+                              const std::size_t co = idx / (batch * area);
+                              const std::size_t j = idx % (batch * area);
+                              const std::size_t b = j / area, p = j % area;
+                              Z.data()[idx] = out.at_unchecked(co * area + p, b);
+                          });
+            return Z;
+        }
+
+    public:
+        Conv2D(std::size_t in_channels, std::size_t out_channels,
+               std::size_t kernel, std::size_t in_h, std::size_t in_w,
+               std::size_t stride = 1, std::size_t padding = 0)
+            : in_channels_(in_channels), out_channels_(out_channels),
+              kernel_(kernel), stride_(stride != 0 ? stride : 1), padding_(padding),
+              in_h_(in_h), in_w_(in_w),
+              W_(out_channels_, in_channels_ * kernel_ * kernel_),
+              b_(out_channels_, 1),
+              grad_W_(out_channels_, in_channels_ * kernel_ * kernel_),
+              grad_b_(out_channels_, 1)
+        {
+            // 守卫：kernel 过大时 (in + 2*pad - kernel) 无符号下溢 → 巨尺寸分配
+            if (kernel_ == 0 || in_h_ + 2 * padding_ < kernel_ || in_w_ + 2 * padding_ < kernel_)
+                throw std::invalid_argument("Conv2D: kernel 过大 (kernel > in + 2*padding)");
+            out_h_ = (in_h_ + 2 * padding_ - kernel_) / stride_ + 1;
+            out_w_ = (in_w_ + 2 * padding_ - kernel_) / stride_ + 1;
+
+            // He 风格均匀初始化（fan_in = C_in*k*k），与 Linear 的 Xavier 同风格
+            const std::size_t fan_in = in_channels_ * kernel_ * kernel_;
+            const double limit = std::sqrt(6.0 / static_cast<double>(fan_in + out_channels_));
+            std::uniform_real_distribution<double> dist(-limit, limit);
+            std::generate(W_.data().begin(), W_.data().end(), [&] { return dist(rng_); });
+            // b_ 零初始化（Matrix(rows, cols) 默认 0）
+        }
+
+        const char *name() const override { return "Conv2D"; }
+        [[nodiscard]] std::size_t param_count() const noexcept override
+        {
+            return W_.size() + b_.size();
+        }
+
+        std::vector<std::reference_wrapper<Matrix>> parameters() override
+        {
+            return {std::ref(W_), std::ref(b_)};
+        }
+
+        std::vector<std::reference_wrapper<Matrix>> param_gradients() override
+        {
+            return {std::ref(grad_W_), std::ref(grad_b_)};
+        }
+
+        Matrix forward(const Matrix &input) override
+        {
+            if (input.rows() != in_channels_ * in_h_ * in_w_)
+                throw std::invalid_argument("Conv2D forward: input rows != C_in*H*W");
+            const std::size_t batch = input.cols();
+
+            col_cache_ = im2col_(input, batch);
+
+            // Z = W × col → (C_out, batch*OH*OW)，逐行加偏置
+            Matrix Z = W_ * col_cache_;
+            {
+                const std::size_t zcols = Z.cols();
+                nn::for_range(Z.size(), Z.size(),
+                              [&](std::size_t idx)
+                              {
+                                  const std::size_t co = idx / zcols;
+                                  Z.data()[idx] += b_.at_unchecked(co, 0);
+                              });
+            }
+            return cols_to_samples_(Z, batch);
+        }
+
+        Matrix backward(const Matrix &grad_output) override
+        {
+            if (col_cache_.empty())
+                throw std::invalid_argument("Conv2D backward: forward not called");
+            const std::size_t batch = grad_output.cols();
+            if (grad_output.rows() != out_channels_ * out_h_ * out_w_)
+                throw std::invalid_argument("Conv2D backward: grad_output rows != C_out*OH*OW");
+
+            Matrix gZ = samples_to_cols_(grad_output, batch);
+
+            // grad_W = gZ × colᵀ（替换语义）；grad_b = gZ 行和
+            grad_W_ = gZ.matmul_NT(col_cache_);
+            const std::vector<double> gb = gZ.rowwise_sum();
+            for (std::size_t co = 0; co < out_channels_; ++co)
+                grad_b_.set_value_unchecked(co, 0, gb[co]);
+
+            // grad_col = Wᵀ × gZ → col2im 散射
+            Matrix grad_col = W_.matmul_TN(gZ);
+            return col2im_(grad_col, batch);
+        }
+    };
+
+    // ── MaxPool2D（记录 argmax，backward 散射；移植自上游）────────────
+    // 输入/输出 (C*H*W, batch)；Hp = (H-pool)/stride+1，Wp 同理。
+    // forward:  每 pool×pool 窗口取 max 并记录行索引；
+    // backward: 梯度散射回 argmax 位置（重叠窗口共享 argmax 时累加）。
+    class MaxPool2D final : public Layer
+    {
+    private:
+        std::size_t channels_, in_h_, in_w_;
+        std::size_t pool_, stride_;
+        std::size_t out_h_, out_w_;
+        std::vector<std::size_t> max_indices_; // (C*Hp*Wp, batch) 扁平 argmax 行索引
+
+    public:
+        MaxPool2D(std::size_t channels, std::size_t in_h, std::size_t in_w,
+                  std::size_t pool = 2, std::size_t stride = 0)
+            : channels_(channels), in_h_(in_h), in_w_(in_w),
+              pool_(pool), stride_(stride != 0 ? stride : (pool != 0 ? pool : 1))
+        {
+            if (pool_ == 0 || in_h_ < pool_ || in_w_ < pool_)
+                throw std::invalid_argument("MaxPool2D: pool 窗口大于输入尺寸");
+            out_h_ = (in_h_ - pool_) / stride_ + 1;
+            out_w_ = (in_w_ - pool_) / stride_ + 1;
+        }
+
+        const char *name() const override { return "MaxPool2D"; }
+
+        Matrix forward(const Matrix &input) override
+        {
+            if (input.rows() != channels_ * in_h_ * in_w_)
+                throw std::invalid_argument("MaxPool2D forward: input rows != C*H*W");
+            const std::size_t batch = input.cols();
+            const std::size_t out_area = out_h_ * out_w_;
+
+            Matrix out(channels_ * out_area, batch);
+            max_indices_.assign(channels_ * out_area * batch, 0);
+
+            // 逐窗口独立 → 安全并行；work = 输出元素数 × pool²
+            nn::for_range(out.size() * pool_ * pool_, out.size(),
+                          [&](std::size_t oidx)
+                          {
+                              const std::size_t b = oidx % batch;
+                              const std::size_t orow = oidx / batch;
+                              const std::size_t c = orow / out_area;
+                              const std::size_t p = orow % out_area;
+                              const std::size_t oh = p / out_w_, ow = p % out_w_;
+
+                              double best = -std::numeric_limits<double>::infinity();
+                              std::size_t best_idx = 0;
+                              for (std::size_t dh = 0; dh < pool_; ++dh)
+                                  for (std::size_t dw = 0; dw < pool_; ++dw)
+                                  {
+                                      const std::size_t r = c * in_h_ * in_w_
+                                          + (oh * stride_ + dh) * in_w_
+                                          + (ow * stride_ + dw);
+                                      const double v = input.at_unchecked(r, b);
+                                      if (v > best)
+                                      {
+                                          best = v;
+                                          best_idx = r;
+                                      }
+                                  }
+                              out.data()[oidx] = best;
+                              max_indices_[b * channels_ * out_area + orow] = best_idx;
+                          });
+            return out;
+        }
+
+        Matrix backward(const Matrix &grad_output) override
+        {
+            const std::size_t batch = grad_output.cols();
+            const std::size_t out_area = out_h_ * out_w_;
+            if (grad_output.rows() != channels_ * out_area)
+                throw std::invalid_argument("MaxPool2D backward: grad_output rows mismatch");
+            if (max_indices_.size() != channels_ * out_area * batch)
+                throw std::invalid_argument("MaxPool2D backward: forward not called");
+
+            // 同一 (b, c) 内重叠窗口可能散射到同一行 → 仅 (b, c) 粒度并行，块内串行累加
+            Matrix gin(channels_ * in_h_ * in_w_, batch);
+            nn::for_range(gin.size(), batch * channels_,
+                          [&](std::size_t bc)
+                          {
+                              const std::size_t b = bc / channels_;
+                              const std::size_t c = bc % channels_;
+                              for (std::size_t p = 0; p < out_area; ++p)
+                              {
+                                  const std::size_t orow = c * out_area + p;
+                                  const std::size_t idx = max_indices_[b * channels_ * out_area + orow];
+                                  gin.set_value_unchecked(
+                                      idx, b,
+                                      gin.at_unchecked(idx, b) + grad_output.at_unchecked(orow, b));
+                              }
+                          });
+            return gin;
+        }
     };
 
     // ── LayerNorm ────────────────────────────────────────────────────────────
