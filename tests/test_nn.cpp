@@ -424,11 +424,27 @@ static void test_mse_loss()
     std::puts("  [MSELoss] forward & backward PASSED");
 }
 
+/**
+ * @brief Verifies CrossEntropyLoss forward values, backward gradients, batching semantics, and numerical stability.
+ */
 static void test_cross_entropy_loss()
 {
     std::puts("  [CrossEntropyLoss] forward & backward ...");
 
     nn::CrossEntropyLoss loss;
+    {
+        bool threw = false;
+        try
+        {
+            (void)loss.forward(nn::Matrix(3, 0), nn::Matrix(3, 0));
+        }
+        catch (const std::invalid_argument &)
+        {
+            threw = true;
+        }
+        assert(threw);
+    }
+
     // 3 类，batch=1，真实标签 = 类 2
     nn::Matrix logits(std::vector<double>{0.1, 0.2, 0.7}, 3, 1);
     std::vector<std::size_t> labels = {2};
@@ -436,14 +452,81 @@ static void test_cross_entropy_loss()
 
     double val = loss.forward(logits, target_onehot);
     assert(val > 0.0); // loss 为正
+    // 精确数值：-log softmax[2] = -(0.7 - max - log(Σ exp(l-max)))
+    {
+        const double m = 0.7;
+        const double s = std::exp(0.1 - m) + std::exp(0.2 - m) + std::exp(0.7 - m);
+        const double expect = -(0.7 - m - std::log(s));
+        assert(std::abs(val - expect) < 1e-12);
+    }
 
     auto &grad = loss.backward();
     assert(grad.rows() == 3);
     assert(grad.cols() == 1);
-    // 梯度 = softmax(logits) - target_onehot
-    // softmax(0.7) ≈ 0.475, 所以 grad[2] ≈ 0.475 - 1.0 = -0.525
+    // 梯度 = (softmax(logits) - target_onehot) / batch
     assert(grad.at(2, 0) < 0.0); // 对正确类别梯度应为负
     assert(grad.at(0, 0) > 0.0); // 对错误类别梯度应为正
+
+    // ── 均值梯度语义：grad == (softmax - target) / batch，与手算 softmax 对齐 ──
+    {
+        nn::Matrix lg2(std::vector<double>{0.1, 0.2, 0.7,
+                                           0.3, -0.4, 1.2}, 3, 2);
+        std::vector<std::size_t> lab2 = {2, 0};
+        nn::Matrix tgt2 = nn::one_hot(lab2, 3);
+        nn::CrossEntropyLoss l2;
+        (void)l2.forward(lg2, tgt2);
+        const auto &g2 = l2.backward();
+        for (std::size_t i = 0; i < 2; ++i)
+        {
+            double m = lg2.at(0, i);
+            for (std::size_t c = 1; c < 3; ++c)
+                m = std::max(m, lg2.at(c, i));
+            double s = 0.0;
+            for (std::size_t c = 0; c < 3; ++c)
+                s += std::exp(lg2.at(c, i) - m);
+            for (std::size_t c = 0; c < 3; ++c)
+            {
+                const double sm = std::exp(lg2.at(c, i) - m) / s;
+                const double expect = (sm - tgt2.at(c, i)) / 2.0; // batch=2
+                assert(std::abs(g2.at(c, i) - expect) < 1e-12);
+            }
+        }
+    }
+
+    // ── 类数 > 128 回归：旧实现 std::array<double,128> 栈越界写 ──
+    {
+        const std::size_t C = 8796, B = 4; // GPT 例程实际 vocab 规模
+        nn::Matrix big(C, B);
+        for (std::size_t i = 0; i < B; ++i)
+            big.set_value_unchecked(i * 1973 % C, i, 3.0);
+        std::vector<std::size_t> lab = {500, 1, 8000, 8795};
+        nn::Matrix tgt = nn::one_hot(lab, C);
+        nn::CrossEntropyLoss l3;
+        const double lv3 = l3.forward(big, tgt);
+        assert(std::isfinite(lv3));
+        const auto &g3 = l3.backward();
+        assert(g3.rows() == C && g3.cols() == B);
+        for (std::size_t i = 0; i < B; ++i)
+        {
+            double sum = 0.0;
+            for (std::size_t c = 0; c < C; ++c)
+                sum += g3.at(c, i);
+            assert(std::abs(sum) < 1e-9); // softmax 梯度每列和为 0
+        }
+    }
+
+    // ── 极负 logits 稳定性：旧形式 log(softmax)→-inf，与 target=0 相乘得 NaN ──
+    {
+        nn::Matrix lg(std::vector<double>{-800.0, 0.0}, 2, 1);
+        nn::Matrix tgt = nn::one_hot({1}, 2);
+        nn::CrossEntropyLoss l4;
+        const double lv = l4.forward(lg, tgt);
+        assert(std::isfinite(lv));
+        const auto &g4 = l4.backward();
+        assert(std::isfinite(g4.at(0, 0)));
+        assert(std::abs(g4.at(0, 0)) < 1e-100); // softmax[-800] 下溢为 0，梯度 ≈ 0，无 NaN
+        assert(std::abs(g4.at(1, 0)) < 1e-12);   // 正确类别 softmax ≈ 1，梯度 ≈ 0
+    }
 
     std::puts("  [CrossEntropyLoss] forward & backward PASSED");
 }
@@ -496,7 +579,9 @@ static void test_sgd_momentum()
 
 // ══════════════════════════════════════════════════════════════════════════════
 // Adam 测试
-// ══════════════════════════════════════════════════════════════════════════════
+/**
+ * @brief Verifies Adam parameter updates and gradient clearing.
+ */
 static void test_adam()
 {
     std::puts("  [Adam] step ...");
@@ -519,6 +604,60 @@ static void test_adam()
     assert(approx(g.at(1, 0), 0.0));
 
     std::puts("  [Adam] step PASSED");
+}
+
+/**
+ * @brief Verifies AdamW decoupled weight decay behavior.
+ *
+ * Tests equivalence to Adam when weight decay is zero, pure decay with zero
+ * gradients, and the expected order of weight decay and the Adam update.
+ */
+static void test_adamw()
+{
+    std::puts("  [AdamW] decoupled weight decay ...");
+
+    // 1) wd=0 时与 Adam 逐步 bit-exact 一致
+    {
+        nn::Matrix w1(std::vector<double>{1.0, -2.0, 0.5}, 3, 1);
+        nn::Matrix w2 = w1;
+        nn::Matrix g(std::vector<double>{0.3, -0.7, 0.0}, 3, 1);
+
+        nn::Adam opt_a({std::ref(w1)}, {std::ref(g)}, 0.05);
+        nn::AdamW opt_w({std::ref(w2)}, {std::ref(g)}, 0.05, 0.9, 0.999, 1e-8, /*wd=*/0.0);
+        for (int s = 0; s < 10; ++s)
+        {
+            opt_a.step();
+            opt_w.step();
+        }
+        for (std::size_t r = 0; r < 3; ++r)
+            assert(w1.at(r, 0) == w2.at(r, 0));
+    }
+
+    // 2) 零梯度纯衰减：p_t = p_0 * (1-lr*wd)^t（衰减与 Adam 增量解耦的直接证据）
+    {
+        nn::Matrix w(std::vector<double>{2.0, -1.0}, 2, 1);
+        nn::Matrix g(2, 1); // 全零梯度
+        const double lr = 0.1, wd = 0.5;
+        nn::AdamW opt({std::ref(w)}, {std::ref(g)}, lr, 0.9, 0.999, 1e-8, wd);
+        for (int s = 0; s < 8; ++s)
+            opt.step();
+        const double expect = 2.0 * std::pow(1.0 - lr * wd, 8.0);
+        assert(std::abs(w.at(0, 0) - expect) < 1e-15);
+        assert(std::abs(w.at(1, 0) + 0.5 * expect) < 1e-15);
+    }
+
+    // 3) 一步手算：先 p*=(1-lr*wd) 再 Adam 增量（增量只依赖 g，不受 wd 影响）
+    {
+        nn::Matrix w(std::vector<double>{1.0}, 1, 1);
+        nn::Matrix g(std::vector<double>{1.0}, 1, 1);
+        nn::AdamW opt({std::ref(w)}, {std::ref(g)}, 0.1, 0.9, 0.999, 1e-8, 0.1);
+        opt.step();
+        // decay=0.99；m_hat=1, v_hat=1 → p = 0.99 - 0.1/(1+1e-8)
+        const double expect = 0.99 - 0.1 / (1.0 + 1e-8);
+        assert(std::abs(w.at(0, 0) - expect) < 1e-15);
+    }
+
+    std::puts("  [AdamW] decoupled weight decay PASSED");
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
@@ -2063,6 +2202,7 @@ static const test_entry all_tests[] = {
     {"sgd",                     test_sgd},
     {"sgd_momentum",            test_sgd_momentum},
     {"adam",                    test_adam},
+    {"adamw",                   test_adamw},
     {"step_lr",                 test_step_lr},
     {"cosine_lr",               test_cosine_lr},
     {"exp_lr",                  test_exp_lr},

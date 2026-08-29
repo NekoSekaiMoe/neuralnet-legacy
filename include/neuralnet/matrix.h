@@ -102,6 +102,23 @@ namespace nn
             return result;
         }
 
+        /**
+         * Replaces the matrix contents with nested row data.
+         * @param new_data Non-empty rectangular matrix data.
+         * @throws std::invalid_argument If the input is empty or rows have different lengths.
+         */
+        
+        /**
+         * Creates a matrix with rows and columns exchanged.
+         * @returns A transposed copy of the matrix.
+         */
+        
+        /**
+         * Adds another matrix element-wise.
+         * @param other Matrix to add.
+         * @returns A matrix containing the element-wise sum.
+         * @throws std::invalid_argument If the matrices have different dimensions.
+         */
         void set_data(const std::vector<std::vector<double>> &new_data)
         {
             if (new_data.empty())
@@ -145,9 +162,7 @@ namespace nn
             const std::size_t i_blocks = (rows_ + BLOCK_SIZE - 1) / BLOCK_SIZE;
             const std::size_t j_blocks = (cols_ + BLOCK_SIZE - 1) / BLOCK_SIZE;
 
-            std::for_each(NN_EXEC_POLICY,
-                          counting_iterator<std::size_t>(0),
-                          counting_iterator<std::size_t>(i_blocks * j_blocks),
+            nn::for_blocks(i_blocks * j_blocks,
                           [&](std::size_t block_idx) noexcept
                           {
                               const std::size_t ib = block_idx / j_blocks;
@@ -170,7 +185,7 @@ namespace nn
         {
             require_same_shape(*this, other, "addition dimension mismatch");
             Matrix result(rows_, cols_);
-            std::transform(NN_EXEC_POLICY, data_.begin(), data_.end(), other.data_.begin(),
+            nn::transform(size(), data_.begin(), data_.end(), other.data_.begin(),
                            result.data_.begin(), std::plus<>{});
             return result;
         }
@@ -179,7 +194,7 @@ namespace nn
         {
             require_same_shape(*this, other, "subtraction dimension mismatch");
             Matrix result(rows_, cols_);
-            std::transform(NN_EXEC_POLICY, data_.begin(), data_.end(), other.data_.begin(),
+            nn::transform(size(), data_.begin(), data_.end(), other.data_.begin(),
                            result.data_.begin(), std::minus<>{});
             return result;
         }
@@ -187,7 +202,7 @@ namespace nn
         [[nodiscard]] Matrix operator*(double scalar) const
         {
             Matrix result(rows_, cols_);
-            std::transform(NN_EXEC_POLICY, data_.begin(), data_.end(), result.data_.begin(),
+            nn::transform(size(), data_.begin(), data_.end(), result.data_.begin(),
                            [scalar](double value) noexcept { return value * scalar; });
             return result;
         }
@@ -213,9 +228,7 @@ namespace nn
             const std::size_t i_blocks = (M + BLOCK_SIZE - 1) / BLOCK_SIZE;
             const std::size_t j_blocks = (N + BLOCK_SIZE - 1) / BLOCK_SIZE;
 
-            std::for_each(NN_EXEC_POLICY,
-                          counting_iterator<std::size_t>(0),
-                          counting_iterator<std::size_t>(i_blocks * j_blocks),
+            nn::for_blocks(i_blocks * j_blocks,
                           [&](std::size_t block_idx)
                           {
                               const std::size_t i_block = block_idx / j_blocks;
@@ -265,6 +278,16 @@ namespace nn
         // 等价于 (*this) * other.transpose() 但跳过显式 transpose 内存分配。
         // 形状：this = (M, K)，other = (N, K)，result = (M, N)。
         // 访问模式：A 行连续 + B 行连续（B^T 的列就是 B 的行），无需 b_block 转置。
+        /**
+         * @brief Matrix multiplication with transpose: this * other^T.
+         *
+         * Computes matrix product without explicit transpose memory allocation.
+         * Equivalent to (*this) * other.transpose() but more efficient.
+         *
+         * @param other Matrix to transpose and multiply (N, K).
+         * @return Result matrix (M, N) where this is (M, K).
+         * @throws std::invalid_argument if this->cols() != other.cols().
+         */
         [[nodiscard]] Matrix matmul_NT(const Matrix &other) const
         {
             if (cols_ != other.cols_)
@@ -281,9 +304,7 @@ namespace nn
             const std::size_t i_blocks = (M + BLOCK_SIZE - 1) / BLOCK_SIZE;
             const std::size_t j_blocks = (N + BLOCK_SIZE - 1) / BLOCK_SIZE;
 
-            std::for_each(NN_EXEC_POLICY,
-                          counting_iterator<std::size_t>(0),
-                          counting_iterator<std::size_t>(i_blocks * j_blocks),
+            nn::for_blocks(i_blocks * j_blocks,
                           [&](std::size_t block_idx)
                           {
                               const std::size_t i_block = block_idx / j_blocks;
@@ -324,6 +345,13 @@ namespace nn
         // 形状：this = (K, M)，other = (K, N)，result = (M, N)。
         // 访问模式：A 列连续（this^T 的行）+ B 列连续。把 A 的 (K_block × M_block)
         // 子块和 B 的 (K_block × N_block) 子块加载到栈数组，在内核里按 k 累加。
+        /**
+                           * Computes the product of this matrix's transpose and another matrix.
+                           *
+                           * @param other Matrix whose row count matches this matrix's row count.
+                           * @return A matrix with this matrix's column count as rows and other.cols() as columns.
+                           * @throws std::invalid_argument If the matrices have different row counts.
+                           */
         [[nodiscard]] Matrix matmul_TN(const Matrix &other) const
         {
             if (rows_ != other.rows_)
@@ -340,9 +368,7 @@ namespace nn
             const std::size_t i_blocks = (M + BLOCK_SIZE - 1) / BLOCK_SIZE;
             const std::size_t j_blocks = (N + BLOCK_SIZE - 1) / BLOCK_SIZE;
 
-            std::for_each(NN_EXEC_POLICY,
-                          counting_iterator<std::size_t>(0),
-                          counting_iterator<std::size_t>(i_blocks * j_blocks),
+            nn::for_blocks(i_blocks * j_blocks,
                           [&](std::size_t block_idx)
                           {
                               const std::size_t i_block = block_idx / j_blocks;
@@ -392,34 +418,55 @@ namespace nn
             return result;
         }
 
+        /**
+         * @brief Scales all elements in-place by a scalar.
+         * @param scalar Scaling factor.
+         */
         void scale_inplace(double scalar) noexcept
         {
-            std::for_each(NN_EXEC_POLICY, data_.begin(), data_.end(),
+            nn::for_each(size(), data_.begin(), data_.end(),
                           [scalar](double &value) noexcept { value *= scalar; });
         }
 
         // 逐元素加法 inplace
+        /**
+         * Adds the corresponding elements of another matrix to this matrix.
+         * @param other Matrix whose elements are added; it must have the same dimensions.
+         */
         void add_inplace(const Matrix &other) noexcept
         {
             if (rows_ != other.rows_ || cols_ != other.cols_) return;
-            std::transform(NN_EXEC_POLICY, data_.begin(), data_.end(), other.data_.begin(),
+            nn::transform(size(), data_.begin(), data_.end(), other.data_.begin(),
                            data_.begin(), std::plus<>{});
         }
 
         // 逐元素减法 inplace
+        /**
+         * @brief Subtracts another matrix element-wise in-place.
+         * @param other Matrix to subtract (must have same shape, otherwise no-op).
+         */
         void subtract_inplace(const Matrix &other) noexcept
         {
             if (rows_ != other.rows_ || cols_ != other.cols_) return;
-            std::transform(NN_EXEC_POLICY, data_.begin(), data_.end(), other.data_.begin(),
+            nn::transform(size(), data_.begin(), data_.end(), other.data_.begin(),
                            data_.begin(), std::minus<>{});
         }
 
         // 填充零
+        /**
+         * @brief Fills the matrix with zeros.
+         */
         void zero() noexcept
         {
             std::fill(data_.begin(), data_.end(), 0.0);
         }
 
+        /**
+         * Changes the matrix dimensions and resizes its storage.
+         *
+         * @param rows Number of rows.
+         * @param cols Number of columns.
+         */
         void resize(std::size_t rows, std::size_t cols)
         {
             if (rows_ == rows && cols_ == cols) return;
@@ -430,6 +477,13 @@ namespace nn
             cols_ = cols;
         }
 
+        /**
+         * @brief Extracts a contiguous slice of rows.
+         * @param start_row Starting row index.
+         * @param num_rows Number of rows to extract.
+         * @return New matrix containing the specified rows.
+         * @throws std::out_of_range if slice exceeds matrix bounds.
+         */
         [[nodiscard]] Matrix row_slice(std::size_t start_row, std::size_t num_rows) const
         {
             if (start_row > rows_ || num_rows > rows_ - start_row)
@@ -441,6 +495,14 @@ namespace nn
             return result;
         }
 
+        /**
+         * Copies the rows of a matrix into this matrix starting at the specified row.
+         *
+         * @param start_row The first destination row.
+         * @param slice Matrix containing the rows to copy.
+         * @throws std::out_of_range If the rows do not fit within this matrix.
+         * @throws std::invalid_argument If the matrices have different column counts.
+         */
         void set_row_slice(std::size_t start_row, const Matrix &slice)
         {
             if (start_row > rows_ || slice.rows_ > rows_ - start_row)
@@ -453,14 +515,27 @@ namespace nn
         }
 
         // ── Reduction 规约操作 (F8) ──────────────────────────────────────────────
-        // 全部基于 NN_EXEC_POLICY 并行；空矩阵返回值由各方法文档说明。
+        // 全部经 nn:: 自适应分派（小规模串行 / 大规模并行）；空矩阵返回值由各方法文档说明。
         // 存储布局：行主序（data_[row * cols_ + col]）。
 
-        // Frobenius 范数：sqrt(sum(x^2))。空矩阵返回 0。
+        /**
+         * Computes the Frobenius norm of the matrix.
+         * @returns The square root of the sum of squared elements, or 0 for an empty matrix.
+         */
+        
+        /**
+         * Computes the sum of all matrix elements.
+         * @returns The sum of the elements, or 0 for an empty matrix.
+         */
+        
+        /**
+         * Computes the mean of all matrix elements.
+         * @returns The arithmetic mean of the elements, or 0 for an empty matrix.
+         */
         [[nodiscard]] double norm() const noexcept
         {
-            const double sumsq = std::transform_reduce(
-                NN_EXEC_POLICY, data_.begin(), data_.end(),
+            const double sumsq = nn::transform_reduce(
+                size(), data_.begin(), data_.end(),
                 0.0, std::plus{},
                 [](double x) noexcept { return x * x; });
             return std::sqrt(sumsq);
@@ -469,8 +544,8 @@ namespace nn
         // 全元素求和。空矩阵返回 0。
         [[nodiscard]] double sum() const noexcept
         {
-            return std::reduce(NN_EXEC_POLICY, data_.begin(), data_.end(),
-                                0.0, std::plus{});
+            return nn::reduce(size(), data_.begin(), data_.end(),
+                              0.0, std::plus{});
         }
 
         // 全元素均值。空矩阵返回 0（避免 0/0）。
@@ -486,9 +561,7 @@ namespace nn
         {
             std::vector<double> result(cols_, 0.0);
             if (cols_ == 0) return result;
-            std::for_each(NN_EXEC_POLICY,
-                          counting_iterator<std::size_t>(0),
-                          counting_iterator<std::size_t>(cols_),
+            nn::for_range(size(), cols_,
                           [&](std::size_t j)
                           {
                               double s = 0.0;
@@ -506,9 +579,7 @@ namespace nn
         {
             std::vector<double> result(rows_, 0.0);
             if (rows_ == 0) return result;
-            std::for_each(NN_EXEC_POLICY,
-                          counting_iterator<std::size_t>(0),
-                          counting_iterator<std::size_t>(rows_),
+            nn::for_range(size(), rows_,
                           [&](std::size_t i)
                           {
                               const double *row_ptr = data_.data() + i * cols_;
@@ -526,9 +597,7 @@ namespace nn
             std::vector<double> result = rowwise_sum();
             if (cols_ == 0) return result;
             const double denom = static_cast<double>(cols_);
-            std::for_each(NN_EXEC_POLICY,
-                          counting_iterator<std::size_t>(0),
-                          counting_iterator<std::size_t>(rows_),
+            nn::for_range(rows_, rows_,
                           [&](std::size_t i) noexcept { result[i] /= denom; });
             return result;
         }
@@ -539,9 +608,7 @@ namespace nn
             std::vector<double> result = colwise_sum();
             if (rows_ == 0) return result;
             const double denom = static_cast<double>(rows_);
-            std::for_each(NN_EXEC_POLICY,
-                          counting_iterator<std::size_t>(0),
-                          counting_iterator<std::size_t>(cols_),
+            nn::for_range(cols_, cols_,
                           [&](std::size_t j) noexcept { result[j] /= denom; });
             return result;
         }
@@ -553,9 +620,7 @@ namespace nn
             std::vector<double> result(cols_, 0.0);
             if (cols_ == 0) return result;
             if (rows_ <= 1) return result;
-            std::for_each(NN_EXEC_POLICY,
-                          counting_iterator<std::size_t>(0),
-                          counting_iterator<std::size_t>(cols_),
+            nn::for_range(size(), cols_,
                           [&](std::size_t j)
                           {
                               const double m = mean[j];

@@ -64,6 +64,7 @@ if(BUILD_TESTING)
         sgd
         sgd_momentum
         adam
+        adamw
         step_lr
         cosine_lr
         exp_lr
@@ -123,6 +124,11 @@ if(BUILD_TESTING)
         layernorm_normalize
         layernorm_backward_shape
         layernorm_gradient_check
+        rmsnorm_forward_shape
+        rmsnorm_gradient_check
+        swiglu_forward
+        swiglu_gradient_check
+        swiglu_ffn_composite
         softmax_forward
         softmax_backward_shape
         positional_encoding_shape
@@ -145,6 +151,28 @@ if(BUILD_TESTING)
     foreach(name ${transformer_test_names})
         add_test(NAME transformer_${name} COMMAND test_transformer ${name})
     endforeach()
+
+    add_executable(test_conv test_conv.cpp)
+    target_link_libraries(test_conv PRIVATE neuralnet::neuralnet)
+    target_include_directories(test_conv PRIVATE ${PROJECT_SOURCE_DIR}/include)
+    if(MSVC)
+        target_compile_options(test_conv PRIVATE /UNDEBUG)
+    else()
+        target_compile_options(test_conv PRIVATE -UNDEBUG)
+    endif()
+
+    set(conv_test_names
+        conv2d_forward_hand
+        conv2d_im2col_basis
+        conv2d_gradient_check
+        maxpool2d_forward
+        maxpool2d_backward
+        conv_relu_pool_composite
+    )
+    foreach(name ${conv_test_names})
+        add_test(NAME conv_${name} COMMAND test_conv ${name})
+    endforeach()
+
     add_executable(test_gpt test_gpt.cpp)
     target_link_libraries(test_gpt PRIVATE neuralnet::neuralnet)
     target_include_directories(test_gpt PRIVATE ${PROJECT_SOURCE_DIR}/include)

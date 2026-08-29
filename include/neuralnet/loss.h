@@ -9,16 +9,43 @@
 #include <neuralnet/nn/config.h>
 #include <neuralnet/matrix.h>
 
-namespace nn
+/**
+     * Computes the mean squared error between predictions and targets.
+     *
+     * @param pred Predicted values.
+     * @param target Ground-truth values.
+     * @return Mean squared error.
+     * @throws std::invalid_argument If the matrices have different shapes or are empty.
+     */
+    namespace nn
 {
+    /**
+     * @brief Abstract base class for loss functions.
+     */
     class Loss
     {
     public:
         virtual ~Loss() = default;
+        /**
+         * @brief Computes the loss between predictions and targets.
+         * @param pred Predicted values.
+         * @param target Target (ground truth) values.
+         * @return Loss value.
+         */
         virtual double forward(const Matrix &pred, const Matrix &target) = 0;
+        /**
+         * @brief Returns gradient with respect to input.
+         * @return Gradient matrix.
+         */
         virtual const Matrix &backward() const = 0;
     };
 
+    /**
+     * @brief Mean Squared Error loss function.
+     *
+     * Computes: loss = mean((pred - target)^2).
+     * Gradient: 2 * (pred - target) / n.
+     */
     class MSELoss : public Loss
     {
     private:
@@ -41,8 +68,8 @@ namespace nn
             grad_input_ = Matrix(pred.rows(), pred.cols());
             const auto total = static_cast<double>(pred.size());
 
-            const double sum_sq = std::transform_reduce(
-                NN_EXEC_POLICY,
+            const double sum_sq = nn::transform_reduce(
+                pred.size(),
                 pred.data().begin(), pred.data().end(),
                 target.data().begin(),
                 0.0,
@@ -56,7 +83,7 @@ namespace nn
             const double loss = sum_sq / total;
             const double factor = 2.0 / total;
 
-            std::transform(NN_EXEC_POLICY,
+            nn::transform(pred.size(),
                            pred.data().begin(), pred.data().end(),
                            target.data().begin(),
                            grad_input_.data().begin(),
@@ -71,6 +98,13 @@ namespace nn
         [[nodiscard]] const Matrix &backward() const noexcept { return grad_input_; }
     };
 
+    /**
+ * Computes the mean cross-entropy loss for one-hot encoded classification targets.
+ *
+ * @param logits Model outputs arranged as (classes, batch).
+ * @param target_onehot One-hot encoded targets with the same shape as logits.
+ * @return Mean cross-entropy loss across the batch.
+ */
     class CrossEntropyLoss : public Loss
     {
     private:
@@ -79,61 +113,76 @@ namespace nn
     public:
         CrossEntropyLoss() = default;
 
+        // 数值稳定的 log_softmax 重写（对标上游 compute_loss.hpp）：
+        //   log_softmax = (logits - col_max) - log(Σ exp(logits - col_max))
+        // 1) 去除旧实现的 std::array<double,128> 栈缓冲（类数>128 时栈越界写，
+        //    GPT 例程 vocab=8796 每 step 越界 ~69KB，UB）
+        // 2) loss 直接由 log_softmax 计算：避免 log(softmax) 在极负 logits 下
+        //    变 -inf、与 target=0 相乘得 0*(-inf)=NaN
+        // 3) 梯度 = (softmax - target) / batch：与均值损失定义一致
+        //    （旧实现漏掉 1/batch，与 SGD/动量/裁剪的尺度约定不一致）
+        /**
+     * Computes the mean cross-entropy loss for a batch of logits and one-hot targets.
+     *
+     * @param logits Model outputs arranged as classes by batch.
+     * @param target_onehot One-hot target values matching the dimensions of {@p logits}.
+     * @return The mean cross-entropy loss across the batch.
+     * @throws std::invalid_argument If the target dimensions do not match the logits dimensions or the logits are empty.
+     */
         [[nodiscard]] double forward(const Matrix &logits, const Matrix &target_onehot)
         {
             const std::size_t classes = logits.rows();
             const std::size_t batch = logits.cols();
+            if (target_onehot.rows() != classes || target_onehot.cols() != batch)
+                throw std::invalid_argument("cross entropy loss: target shape mismatch");
+            if (logits.empty())
+                throw std::invalid_argument("cross entropy loss cannot be computed on empty logits");
             grad_input_ = Matrix(classes, batch);
 
-            double total_loss = 0.0;
+            // 列（样本）间独立的 scratch：shifted 矩阵与每列 loss，写入互不相交
+            Matrix shifted(classes, batch);
+            std::vector<double> loss_cols(batch, 0.0);
 
-            for (std::size_t i = 0; i < batch; ++i)
+            nn::for_range(classes * batch, batch, [&](std::size_t i)
             {
-                // 数值稳定的 softmax
+                // 1) 列最大值（数值稳定性）
                 double max_val = logits.at_unchecked(0, i);
                 for (std::size_t c = 1; c < classes; ++c)
                 {
                     const double val = logits.at_unchecked(c, i);
                     if (val > max_val) max_val = val;
                 }
-                
-                // 预分配 exp_vals 避免重复分配
-                std::array<double, 128> exp_vals_storage{}; // 栈上分配，支持最多 128 类
-                double* exp_vals = exp_vals_storage.data();
-                
+
+                // 2) shifted = logits - col_max；同步累加 Σexp
                 double sum_exp = 0.0;
                 for (std::size_t c = 0; c < classes; ++c)
                 {
-                    const double e = std::exp(logits.at_unchecked(c, i) - max_val);
-                    exp_vals[c] = e;
-                    sum_exp += e;
+                    const double s = logits.at_unchecked(c, i) - max_val;
+                    shifted.set_value_unchecked(c, i, s);
+                    sum_exp += std::exp(s);
                 }
+                const double log_denom = std::log(sum_exp); // sum_exp ≥ 1，必有限
 
-                // 找到真实类别
-                std::size_t true_class = 0;
+                // 3) 每类：loss -= target·log_softmax；grad = (softmax-target)/batch
+                double col_loss = 0.0;
                 for (std::size_t c = 0; c < classes; ++c)
                 {
-                    if (target_onehot.at_unchecked(c, i) > 0.5)
-                    {
-                        true_class = c;
-                        break;
-                    }
+                    const double log_sm = shifted.at_unchecked(c, i) - log_denom;
+                    const double t = target_onehot.at_unchecked(c, i);
+                    col_loss -= t * log_sm;
+                    const double softmax_c = std::exp(shifted.at_unchecked(c, i)) / sum_exp;
+                    grad_input_.set_value_unchecked(c, i, softmax_c - t);
                 }
+                loss_cols[i] = col_loss;
+            });
 
-                // loss = -log(softmax[true_class])
-                const double prob_true = exp_vals[true_class] / sum_exp;
-                total_loss += -std::log(prob_true);
+            const double inv_batch = 1.0 / static_cast<double>(batch);
+            double total_loss = 0.0;
+            for (double l : loss_cols)
+                total_loss += l;
+            grad_input_.scale_inplace(inv_batch);
 
-                // 梯度：softmax - target
-                for (std::size_t c = 0; c < classes; ++c)
-                {
-                    const double softmax_c = exp_vals[c] / sum_exp;
-                    grad_input_.set_value_unchecked(c, i,
-                                                    softmax_c - target_onehot.at_unchecked(c, i));
-                }
-            }
-
-            return total_loss / static_cast<double>(batch);
+            return total_loss * inv_batch;
         }
 
         [[nodiscard]] const Matrix &backward() const noexcept { return grad_input_; }

@@ -7,6 +7,7 @@
 #include <execution>
 #include <functional>
 #include <iostream>
+#include <limits>
 #include <numeric>
 #include <random>
 #include <stdexcept>
@@ -18,13 +19,34 @@
 
 namespace nn
 {
+    /**
+     * @brief Abstract base class for neural network layers.
+     */
     class Layer
     {
     public:
         virtual ~Layer() = default;
+        /**
+         * @brief Performs forward pass computation.
+         * @param input Input matrix.
+         * @return Output matrix.
+         */
         virtual Matrix forward(const Matrix &input) = 0;
+        /**
+         * @brief Performs backward pass computation.
+         * @param grad_output Gradient with respect to output.
+         * @return Gradient with respect to input.
+         */
         virtual Matrix backward(const Matrix &grad_output) = 0;
+        /**
+ * @brief Provides access to trainable parameters.
+ * @return References to trainable parameter matrices.
+ */
         virtual std::vector<std::reference_wrapper<Matrix>> parameters() { return {}; }
+        /**
+ * @brief Provides references to the layer's parameter gradients.
+ * @return A vector of references to parameter gradient matrices.
+ */
         virtual std::vector<std::reference_wrapper<Matrix>> param_gradients() { return {}; }
         
         // 添加参数更新辅助方法，避免虚函数调用开销
@@ -98,6 +120,12 @@ namespace nn
 
         const char *name() const override { return "Linear"; }
 
+        /**
+         * Computes the linear transformation for the input.
+         * @param input Input feature matrix.
+         * @returns The transformed matrix with the layer bias added.
+         * @throws std::invalid_argument If the input feature count does not match the layer.
+         */
         Matrix forward(const Matrix &input) override
         {
             if (input.rows() != W_.cols())
@@ -114,9 +142,7 @@ namespace nn
             // the row contiguously in memory, with `bias_val` hoisted out of the
             // inner loop (one load per row instead of one per element).
             const std::size_t cols = result.cols();
-            std::for_each(NN_EXEC_POLICY,
-                          counting_iterator<std::size_t>(0),
-                          counting_iterator<std::size_t>(result.rows()),
+            nn::for_range(result.size(), result.rows(),
                           [&](std::size_t row) noexcept
                           {
                               const double bias_val = b_.at_unchecked(row, 0);
@@ -173,16 +199,27 @@ namespace nn
     public:
         const char *name() const override { return "ReLU"; }
 
+        /**
+         * Applies the rectified linear activation element-wise.
+         *
+         * @returns A matrix with negative values replaced by zero.
+         */
         Matrix forward(const Matrix &input) override
         {
             input_cache_ = input;
             Matrix result(input.rows(), input.cols());
-            std::transform(NN_EXEC_POLICY, input.data().begin(), input.data().end(),
+            nn::transform(input.size(), input.data().begin(), input.data().end(),
                            result.data().begin(), [](double value) noexcept
                            { return value > 0.0 ? value : 0.0; });
             return result;
         }
 
+        /**
+         * Computes the input gradient for the ReLU activation.
+         *
+         * @param grad_output Gradient propagated from the subsequent layer.
+         * @returns The gradient propagated through positive input values.
+         */
         Matrix backward(const Matrix &grad_output) override
         {
             if (input_cache_.rows() != grad_output.rows() || input_cache_.cols() != grad_output.cols())
@@ -191,7 +228,7 @@ namespace nn
             }
 
             Matrix grad_input(grad_output.rows(), grad_output.cols());
-            std::transform(NN_EXEC_POLICY,
+            nn::transform(input_cache_.size(),
                            input_cache_.data().begin(), input_cache_.data().end(),
                            grad_output.data().begin(),
                            grad_input.data().begin(),
@@ -216,17 +253,29 @@ namespace nn
 
         const char *name() const override { return "LeakyReLU"; }
 
+        /**
+         * Applies the leaky rectified linear activation element-wise.
+         * @param input Input matrix to activate.
+         * @returns Matrix containing the activated values.
+         */
         Matrix forward(const Matrix &input) override
         {
             input_cache_ = input;
             Matrix result(input.rows(), input.cols());
-            std::transform(NN_EXEC_POLICY, input.data().begin(), input.data().end(),
+            nn::transform(input.size(), input.data().begin(), input.data().end(),
                            result.data().begin(),
                            [this](double value) noexcept
                            { return value > 0.0 ? value : negative_slope_ * value; });
             return result;
         }
 
+        /**
+         * Computes the gradient propagated through the LeakyReLU activation.
+         *
+         * @param grad_output Gradient with respect to the layer output.
+         * @returns Gradient with respect to the layer input.
+         * @throws std::invalid_argument If the gradient shape differs from the cached input shape.
+         */
         Matrix backward(const Matrix &grad_output) override
         {
             if (input_cache_.rows() != grad_output.rows() || input_cache_.cols() != grad_output.cols())
@@ -235,7 +284,7 @@ namespace nn
             }
 
             Matrix grad_input(grad_output.rows(), grad_output.cols());
-            std::transform(NN_EXEC_POLICY,
+            nn::transform(input_cache_.size(),
                            input_cache_.data().begin(), input_cache_.data().end(),
                            grad_output.data().begin(),
                            grad_input.data().begin(),
@@ -256,10 +305,16 @@ namespace nn
     public:
         const char *name() const override { return "Sigmoid"; }
 
+        /**
+         * Applies the sigmoid activation element-wise.
+         *
+         * @param input Values to activate.
+         * @returns The sigmoid-transformed values.
+         */
         Matrix forward(const Matrix &input) override
         {
             Matrix result(input.rows(), input.cols());
-            std::transform(NN_EXEC_POLICY, input.data().begin(), input.data().end(),
+            nn::transform(input.size(), input.data().begin(), input.data().end(),
                            result.data().begin(),
                            [](double value) noexcept
                            { return 1.0 / (1.0 + std::exp(-value)); });
@@ -267,6 +322,12 @@ namespace nn
             return result;
         }
 
+        /**
+         * Computes the gradient of the sigmoid activation with respect to its input.
+         * @param grad_output Gradient propagated from the following layer.
+         * @returns The gradient propagated to the input.
+         * @throws std::invalid_argument If the gradient shape differs from the cached output shape.
+         */
         Matrix backward(const Matrix &grad_output) override
         {
             if (output_cache_.rows() != grad_output.rows() || output_cache_.cols() != grad_output.cols())
@@ -275,7 +336,7 @@ namespace nn
             }
 
             Matrix grad_input(grad_output.rows(), grad_output.cols());
-            std::transform(NN_EXEC_POLICY,
+            nn::transform(output_cache_.size(),
                            output_cache_.data().begin(), output_cache_.data().end(),
                            grad_output.data().begin(),
                            grad_input.data().begin(),
@@ -294,10 +355,16 @@ namespace nn
     public:
         const char *name() const override { return "Tanh"; }
 
+        /**
+         * Applies the hyperbolic tangent activation element-wise.
+         *
+         * @param input Values to activate.
+         * @returns The activated values, with each element transformed by the hyperbolic tangent.
+         */
         Matrix forward(const Matrix &input) override
         {
             Matrix result(input.rows(), input.cols());
-            std::transform(NN_EXEC_POLICY, input.data().begin(), input.data().end(),
+            nn::transform(input.size(), input.data().begin(), input.data().end(),
                            result.data().begin(),
                            [](double value) noexcept
                            { return std::tanh(value); });
@@ -305,6 +372,12 @@ namespace nn
             return result;
         }
 
+        /**
+         * Computes the input gradient for the cached hyperbolic tangent output.
+         *
+         * @param grad_output Gradient propagated from the subsequent layer.
+         * @returns The gradient propagated to the input.
+         */
         Matrix backward(const Matrix &grad_output) override
         {
             if (output_cache_.rows() != grad_output.rows() || output_cache_.cols() != grad_output.cols())
@@ -313,7 +386,7 @@ namespace nn
             }
 
             Matrix grad_input(grad_output.rows(), grad_output.cols());
-            std::transform(NN_EXEC_POLICY,
+            nn::transform(output_cache_.size(),
                            output_cache_.data().begin(), output_cache_.data().end(),
                            grad_output.data().begin(),
                            grad_input.data().begin(),
@@ -349,15 +422,25 @@ namespace nn
     public:
         const char *name() const override { return "GELU"; }
 
+        /**
+         * Applies the Gaussian Error Linear Unit activation to the input.
+         * @param input Values to activate.
+         * @returns A matrix containing the GELU-activated values.
+         */
         Matrix forward(const Matrix &input) override
         {
             input_cache_ = input;
             Matrix result(input.rows(), input.cols());
-            std::transform(NN_EXEC_POLICY, input.data().begin(), input.data().end(),
+            nn::transform(input.size(), input.data().begin(), input.data().end(),
                            result.data().begin(), gelu_fn);
             return result;
         }
 
+        /**
+         * Computes the gradient of the GELU activation with respect to its input.
+         * @param grad_output Gradient propagated from the subsequent layer.
+         * @returns The gradient propagated to the preceding layer.
+         */
         Matrix backward(const Matrix &grad_output) override
         {
             if (input_cache_.rows() != grad_output.rows() || input_cache_.cols() != grad_output.cols())
@@ -366,7 +449,7 @@ namespace nn
             }
 
             Matrix grad_input(grad_output.rows(), grad_output.cols());
-            std::transform(NN_EXEC_POLICY,
+            nn::transform(input_cache_.size(),
                            input_cache_.data().begin(), input_cache_.data().end(),
                            grad_output.data().begin(),
                            grad_input.data().begin(),
@@ -400,6 +483,11 @@ namespace nn
 
         void on_mode_change(bool training) noexcept override { training_ = training; }
 
+        /**
+         * Applies inverted dropout during training.
+         * @param input Values to regularize.
+         * @returns The masked and scaled input during training, or the unchanged input otherwise.
+         */
         Matrix forward(const Matrix &input) override
         {
             if (!training_ || p_ == 0.0)
@@ -411,13 +499,12 @@ namespace nn
             std::bernoulli_distribution dist(1.0 - p_);
             mask_ = Matrix(input.rows(), input.cols());
 
-            std::transform(NN_EXEC_POLICY, input.data().begin(), input.data().end(),
-                           mask_.data().begin(),
-                           [&](double /*value*/) noexcept -> double
-                           { return dist(rng_) ? scale : 0.0; });
+            // RNG 必须串行：mt19937 并发调用是数据竞争（UB），且串行保证可复现
+            for (std::size_t idx = 0; idx < input.size(); ++idx)
+                mask_.data()[idx] = dist(rng_) ? scale : 0.0;
 
             Matrix result(input.rows(), input.cols());
-            std::transform(NN_EXEC_POLICY,
+            nn::transform(input.size(),
                            input.data().begin(), input.data().end(),
                            mask_.data().begin(),
                            result.data().begin(),
@@ -426,6 +513,12 @@ namespace nn
             return result;
         }
 
+        /**
+         * Propagates gradients through the dropout layer.
+         * @param grad_output Gradient received from the subsequent layer.
+         * @returns The input gradient, with the dropout mask applied during training or unchanged when dropout is inactive.
+         * @throws std::invalid_argument If the gradient shape does not match the cached dropout mask.
+         */
         Matrix backward(const Matrix &grad_output) override
         {
             if (!training_ || p_ == 0.0)
@@ -439,7 +532,7 @@ namespace nn
             }
 
             Matrix grad_input(grad_output.rows(), grad_output.cols());
-            std::transform(NN_EXEC_POLICY,
+            nn::transform(grad_output.size(),
                            grad_output.data().begin(), grad_output.data().end(),
                            mask_.data().begin(),
                            grad_input.data().begin(),
@@ -454,7 +547,16 @@ namespace nn
     // 训练：用 batch mean/var 归一化 + 动量更新 running stats。
     // 推理：用 running mean/var 归一化。
     // 可选 affine：归一化后再做 gamma*x_hat + beta 仿射。
-    // BN2d 复用本类：把 (C, N*H*W) 视为 (C, batch)，forward 完全相同。
+    /**
+         * Normalizes feature rows across the batch and optionally applies learnable
+         * scale and bias parameters.
+         *
+         * @param num_features Number of feature rows in each input.
+         * @param eps Small value added to variance for numerical stability.
+         * @param momentum Weight assigned to each batch's statistics when updating
+         * running statistics.
+         * @param affine Whether to apply learnable scale and bias parameters.
+         */
     class BatchNorm1d : public Layer
     {
     private:
@@ -470,7 +572,15 @@ namespace nn
         Matrix running_mean_; // (num_features, 1), init=0
         Matrix running_var_;  // (num_features, 1), init=1
         int64_t num_batches_tracked_{0};
-        bool is_training_{true};
+        /**
+             * Initializes a one-dimensional batch normalization layer.
+             *
+             * @param num_features Number of input features.
+             * @param eps Small value added to the variance for numerical stability.
+             * @param momentum Weight assigned to the current batch when updating running statistics.
+             * @param affine Whether to apply learnable scaling and bias parameters.
+             */
+            bool is_training_{true};
 
         Matrix input_cache_;
         Matrix batch_mean_;   // (num_features, 1)
@@ -481,9 +591,7 @@ namespace nn
         static std::vector<double> rowwise_sum(const Matrix &m)
         {
             std::vector<double> result(m.rows(), 0.0);
-            std::for_each(NN_EXEC_POLICY,
-                          counting_iterator<std::size_t>(0),
-                          counting_iterator<std::size_t>(m.rows()),
+            nn::for_range(m.size(), m.rows(),
                           [&](std::size_t i) noexcept
                           {
                               double s = 0.0;
@@ -500,9 +608,7 @@ namespace nn
             std::vector<double> result = rowwise_sum(m);
             if (m.cols() == 0) return result;
             const double denom = static_cast<double>(m.cols());
-            std::for_each(NN_EXEC_POLICY,
-                          counting_iterator<std::size_t>(0),
-                          counting_iterator<std::size_t>(m.rows()),
+            nn::for_range(m.rows(), m.rows(),
                           [&](std::size_t i) noexcept { result[i] /= denom; });
             return result;
         }
@@ -512,9 +618,7 @@ namespace nn
         {
             std::vector<double> result(m.rows(), 0.0);
             if (m.cols() == 0) return result;
-            std::for_each(NN_EXEC_POLICY,
-                          counting_iterator<std::size_t>(0),
-                          counting_iterator<std::size_t>(m.rows()),
+            nn::for_range(m.size(), m.rows(),
                           [&](std::size_t i)
                           {
                               const double m_i = mean[i];
@@ -612,13 +716,13 @@ namespace nn
                 }
 
                 // running_mean = (1 - momentum) * running_mean + momentum * batch_mean
-                std::transform(NN_EXEC_POLICY,
+                nn::transform(running_mean_.size(),
                                running_mean_.data().begin(), running_mean_.data().end(),
                                batch_mean_.data().begin(),
                                running_mean_.data().begin(),
                                [this](double rm, double bm) noexcept
                                { return (1.0 - momentum_) * rm + momentum_ * bm; });
-                std::transform(NN_EXEC_POLICY,
+                nn::transform(running_var_.size(),
                                running_var_.data().begin(), running_var_.data().end(),
                                batch_var_.data().begin(),
                                running_var_.data().begin(),
@@ -631,9 +735,7 @@ namespace nn
             const Matrix &mean_src = is_training_ ? batch_mean_ : running_mean_;
             const Matrix &var_src = is_training_ ? batch_var_ : running_var_;
             normalized_ = Matrix(num_features_, batch_size);
-            std::for_each(NN_EXEC_POLICY,
-                          counting_iterator<std::size_t>(0),
-                          counting_iterator<std::size_t>(input.size()),
+            nn::for_range(input.size(), input.size(),
                           [&](std::size_t idx)
                           {
                               const std::size_t i = idx / batch_size;
@@ -648,9 +750,7 @@ namespace nn
             }
 
             Matrix output(num_features_, batch_size);
-            std::for_each(NN_EXEC_POLICY,
-                          counting_iterator<std::size_t>(0),
-                          counting_iterator<std::size_t>(input.size()),
+            nn::for_range(input.size(), input.size(),
                           [&](std::size_t idx)
                           {
                               const std::size_t i = idx / batch_size;
@@ -701,9 +801,7 @@ namespace nn
             Matrix dx_hat(num_features_, batch_size);
             if (affine_)
             {
-                std::for_each(NN_EXEC_POLICY,
-                              counting_iterator<std::size_t>(0),
-                              counting_iterator<std::size_t>(grad_output.size()),
+                nn::for_range(grad_output.size(), grad_output.size(),
                               [&](std::size_t idx)
                               {
                                   const std::size_t i = idx / batch_size;
@@ -738,9 +836,7 @@ namespace nn
             const double scale = 1.0 / static_cast<double>(batch_size);
             const double N = static_cast<double>(batch_size);
             Matrix dx(num_features_, batch_size);
-            std::for_each(NN_EXEC_POLICY,
-                          counting_iterator<std::size_t>(0),
-                          counting_iterator<std::size_t>(dx.size()),
+            nn::for_range(dx.size(), dx.size(),
                           [&](std::size_t idx)
                           {
                               const std::size_t i = idx / batch_size;
@@ -793,12 +889,399 @@ namespace nn
 
     // ── BatchNorm2d ──────────────────────────────────────────────────────────
     // 把 (C, N*H*W) 视为 (C, batch) —— BN1d::forward 已接受该形状。
-    // 因此无需 override forward/backward；只重写 name() 用于日志/汇总。
+    /**
+     * Identifies the layer as a two-dimensional batch-normalization layer.
+     *
+     * @returns The layer name, `"BatchNorm2d"`.
+     */
     class BatchNorm2d : public BatchNorm1d
     {
     public:
         using BatchNorm1d::BatchNorm1d;
         const char *name() const override { return "BatchNorm2d"; }
+    };
+
+    // ── Conv2D（im2col + GEMM，移植自上游 compute_layer_conv.hpp）──────
+    // 布局：输入/输出 (C*H*W, batch)，列 = batch 样本；
+    //       权重 W (C_out, C_in*k*k) + 偏置 b (C_out, 1)。
+    // forward:  col = im2col(x) (C_in*k*k, batch*OH*OW)
+    //           Z = W × col + b → 重排 (C_out*OH*OW, batch)
+    // backward: gZ = 重排(grad_out)；grad_W = gZ×colᵀ；grad_b = 行和(gZ)；
+    //           grad_col = Wᵀ×gZ → col2im 散射累加 → grad_x
+    // 梯度语义：替换（zero 后填），与 Linear 一致。
+    /**
+     * @brief 2D convolution layer using im2col + GEMM algorithm.
+     *
+     * Implements spatial convolution with configurable kernel size, stride, and padding.
+     * Layout: input/output shape is (C*H*W, batch), weights are (C_out, C_in*k*k).
+     * Uses im2col transformation followed by matrix multiplication for efficiency.
+     */
+    class Conv2D final : public Layer
+    {
+    private:
+        std::size_t in_channels_, out_channels_;
+        std::size_t kernel_, stride_, padding_;
+        std::size_t in_h_, in_w_;
+        std::size_t out_h_, out_w_;
+
+        Matrix W_, b_;
+        Matrix grad_W_, grad_b_;
+        Matrix col_cache_; /**
+ * Thread-local random number generator for stochastic layer operations.
+ */
+
+        inline static thread_local std::mt19937_64 rng_{std::random_device{}()};
+
+        // im2col：input (C_in*H*W, batch) → col (C_in*k*k, batch*OH*OW)
+        /**
+                           * Converts batched image data into column-form patches for convolution.
+                           *
+                           * @param input Flattened input images arranged by channel, height, width, and batch.
+                           * @param batch Number of images in the batch.
+                           * @return Matrix containing one flattened convolution window per output position, with zero padding outside the input boundaries.
+                           */
+        [[nodiscard]] Matrix im2col_(const Matrix &input, std::size_t batch) const
+        {
+            const std::size_t C_in = in_channels_, k = kernel_;
+            const std::size_t H_out = out_h_, W_out = out_w_;
+            Matrix col(C_in * k * k, batch * H_out * W_out);
+
+            nn::for_range(col.size(), batch * H_out * W_out,
+                          [&](std::size_t pos)
+                          {
+                              const std::size_t b = pos / (H_out * W_out);
+                              const std::size_t oh = (pos / W_out) % H_out;
+                              const std::size_t ow = pos % W_out;
+                              for (std::size_t ci = 0; ci < C_in; ++ci)
+                                  for (std::size_t kh = 0; kh < k; ++kh)
+                                      for (std::size_t kw = 0; kw < k; ++kw)
+                                      {
+                                          const long ih = static_cast<long>(oh * stride_ + kh)
+                                                          - static_cast<long>(padding_);
+                                          const long iw = static_cast<long>(ow * stride_ + kw)
+                                                          - static_cast<long>(padding_);
+                                          double v = 0.0; // 零填充
+                                          if (ih >= 0 && iw >= 0
+                                              && ih < static_cast<long>(in_h_)
+                                              && iw < static_cast<long>(in_w_))
+                                              v = input.at_unchecked(
+                                                  ci * in_h_ * in_w_ + ih * in_w_ + iw, b);
+                                          col.set_value_unchecked(ci * k * k + kh * k + kw, pos, v);
+                                      }
+                          });
+            return col;
+        }
+
+        // col2im：col (C_in*k*k, batch*OH*OW) → (C_in*H*W, batch)，散射累加。
+        // 同一 (b, ci) 内不同输出位置可能写同一输入格（stride < k 时窗口重叠），
+        /**
+         * Reconstructs batched image-shaped values from their column representation.
+         *
+         * @param col Column representation of the values to reconstruct.
+         * @param batch Number of samples in the batch.
+         * @returns Reconstructed values with one flattened image per batch sample.
+         */
+        [[nodiscard]] Matrix col2im_(const Matrix &col, std::size_t batch) const
+        {
+            const std::size_t C_in = in_channels_, k = kernel_;
+            const std::size_t H_out = out_h_, W_out = out_w_;
+            Matrix out(C_in * in_h_ * in_w_, batch);
+
+            nn::for_range(col.size(), batch * C_in,
+                          [&](std::size_t bc)
+                          {
+                              const std::size_t b = bc / C_in;
+                              const std::size_t ci = bc % C_in;
+                              for (std::size_t oh = 0; oh < H_out; ++oh)
+                                  for (std::size_t ow = 0; ow < W_out; ++ow)
+                                      for (std::size_t kh = 0; kh < k; ++kh)
+                                          for (std::size_t kw = 0; kw < k; ++kw)
+                                          {
+                                              const long ih = static_cast<long>(oh * stride_ + kh)
+                                                              - static_cast<long>(padding_);
+                                              const long iw = static_cast<long>(ow * stride_ + kw)
+                                                              - static_cast<long>(padding_);
+                                              if (ih < 0 || iw < 0
+                                                  || ih >= static_cast<long>(in_h_)
+                                                  || iw >= static_cast<long>(in_w_))
+                                                  continue;
+                                              const std::size_t r = ci * k * k + kh * k + kw;
+                                              const std::size_t orow = ci * in_h_ * in_w_
+                                                                      + ih * in_w_ + iw;
+                                              out.set_value_unchecked(
+                                                  orow, b,
+                                                  out.at_unchecked(orow, b)
+                                                      + col.at_unchecked(r, b * H_out * W_out
+                                                                         + oh * W_out + ow));
+                                          }
+                          });
+            return out;
+        }
+
+        /**
+         * Rearranges convolution outputs from channel-major layout into sample-major layout.
+         * @param Z Convolution output matrix with columns grouped by batch sample and spatial position.
+         * @param batch Number of samples in the batch.
+         * @returns Matrix arranged with all output channels and spatial positions per sample.
+         */
+        [[nodiscard]] Matrix cols_to_samples_(const Matrix &Z, std::size_t batch) const
+        {
+            const std::size_t area = out_h_ * out_w_;
+            Matrix out(out_channels_ * area, batch);
+            nn::for_range(out.size(), out.size(),
+                          [&](std::size_t idx)
+                          {
+                              const std::size_t r = idx / batch; // (co*area + p)
+                              const std::size_t b = idx % batch;
+                              const std::size_t co = r / area, p = r % area;
+                              out.data()[idx] = Z.at_unchecked(co, b * area + p);
+                          });
+            return out;
+        }
+
+        /**
+         * Rearranges convolution outputs by grouping spatial positions within each batch.
+         * @param out Output matrix arranged as `(channels * height * width, batch)`.
+         * @param batch Number of input samples.
+         * @returns Matrix arranged as `(channels, batch * height * width)`.
+         */
+        [[nodiscard]] Matrix samples_to_cols_(const Matrix &out, std::size_t batch) const
+        {
+            const std::size_t area = out_h_ * out_w_;
+            Matrix Z(out_channels_, batch * area);
+            nn::for_range(Z.size(), Z.size(),
+                          [&](std::size_t idx)
+                          {
+                              const std::size_t co = idx / (batch * area);
+                              const std::size_t j = idx % (batch * area);
+                              const std::size_t b = j / area, p = j % area;
+                              Z.data()[idx] = out.at_unchecked(co * area + p, b);
+                          });
+            return Z;
+        }
+
+    public:
+        Conv2D(std::size_t in_channels, std::size_t out_channels,
+               std::size_t kernel, std::size_t in_h, std::size_t in_w,
+               std::size_t stride = 1, std::size_t padding = 0)
+            : in_channels_(in_channels), out_channels_(out_channels),
+              kernel_(kernel), stride_(stride != 0 ? stride : 1), padding_(padding),
+              in_h_(in_h), in_w_(in_w),
+              W_(out_channels_, in_channels_ * kernel_ * kernel_),
+              b_(out_channels_, 1),
+              grad_W_(out_channels_, in_channels_ * kernel_ * kernel_),
+              grad_b_(out_channels_, 1)
+        {
+            // 守卫：kernel 过大时 (in + 2*pad - kernel) 无符号下溢 → 巨尺寸分配
+            if (kernel_ == 0 || in_h_ + 2 * padding_ < kernel_ || in_w_ + 2 * padding_ < kernel_)
+                throw std::invalid_argument("Conv2D: kernel 过大 (kernel > in + 2*padding)");
+            out_h_ = (in_h_ + 2 * padding_ - kernel_) / stride_ + 1;
+            out_w_ = (in_w_ + 2 * padding_ - kernel_) / stride_ + 1;
+
+            // He 风格均匀初始化（fan_in = C_in*k*k），与 Linear 的 Xavier 同风格
+            const std::size_t fan_in = in_channels_ * kernel_ * kernel_;
+            const double limit = std::sqrt(6.0 / static_cast<double>(fan_in + out_channels_));
+            std::uniform_real_distribution<double> dist(-limit, limit);
+            std::generate(W_.data().begin(), W_.data().end(), [&] { return dist(rng_); });
+            // b_ 零初始化（Matrix(rows, cols) 默认 0）
+        }
+
+        /**
+ * Identifies the layer type.
+ *
+ * @return The layer name, "Conv2D".
+ */
+const char *name() const override { return "Conv2D"; }
+        [[nodiscard]] std::size_t param_count() const noexcept override
+        {
+            return W_.size() + b_.size();
+        }
+
+        std::vector<std::reference_wrapper<Matrix>> parameters() override
+        {
+            return {std::ref(W_), std::ref(b_)};
+        }
+
+        std::vector<std::reference_wrapper<Matrix>> param_gradients() override
+        {
+            return {std::ref(grad_W_), std::ref(grad_b_)};
+        }
+
+        /**
+         * Computes the convolution output for a batch of flattened images.
+         *
+         * @param input Batch of flattened images with dimensions
+         *              {@code in_channels * in_h * in_w} by batch size.
+         * @returns Convolution results with dimensions
+         *          {@code out_channels * out_h * out_w} by batch size.
+         * @throws std::invalid_argument If the input feature count is invalid.
+         */
+        Matrix forward(const Matrix &input) override
+        {
+            if (input.rows() != in_channels_ * in_h_ * in_w_)
+                throw std::invalid_argument("Conv2D forward: input rows != C_in*H*W");
+            const std::size_t batch = input.cols();
+
+            col_cache_ = im2col_(input, batch);
+
+            // Z = W × col → (C_out, batch*OH*OW)，逐行加偏置
+            Matrix Z = W_ * col_cache_;
+            {
+                const std::size_t zcols = Z.cols();
+                nn::for_range(Z.size(), Z.size(),
+                              [&](std::size_t idx)
+                              {
+                                  const std::size_t co = idx / zcols;
+                                  Z.data()[idx] += b_.at_unchecked(co, 0);
+                              });
+            }
+            return cols_to_samples_(Z, batch);
+        }
+
+        /**
+         * Computes parameter gradients and propagates gradients to the convolution input.
+         *
+         * @param grad_output Gradient of the loss with respect to the layer output.
+         * @returns Gradient of the loss with respect to the layer input.
+         * @throws std::invalid_argument If forward() has not been called or grad_output has an invalid shape.
+         */
+        Matrix backward(const Matrix &grad_output) override
+        {
+            if (col_cache_.empty())
+                throw std::invalid_argument("Conv2D backward: forward not called");
+            const std::size_t batch = grad_output.cols();
+            if (grad_output.rows() != out_channels_ * out_h_ * out_w_)
+                throw std::invalid_argument("Conv2D backward: grad_output rows != C_out*OH*OW");
+
+            Matrix gZ = samples_to_cols_(grad_output, batch);
+
+            // grad_W = gZ × colᵀ（替换语义）；grad_b = gZ 行和
+            grad_W_ = gZ.matmul_NT(col_cache_);
+            const std::vector<double> gb = gZ.rowwise_sum();
+            for (std::size_t co = 0; co < out_channels_; ++co)
+                grad_b_.set_value_unchecked(co, 0, gb[co]);
+
+            // grad_col = Wᵀ × gZ → col2im 散射
+            Matrix grad_col = W_.matmul_TN(gZ);
+            return col2im_(grad_col, batch);
+        }
+    };
+
+    // ── MaxPool2D（记录 argmax，backward 散射；移植自上游）────────────
+    // 输入/输出 (C*H*W, batch)；Hp = (H-pool)/stride+1，Wp 同理。
+    // forward:  每 pool×pool 窗口取 max 并记录行索引；
+    // backward: 梯度散射回 argmax 位置（重叠窗口共享 argmax 时累加）。
+    /**
+     * @brief 2D max pooling layer with argmax tracking for backpropagation.
+     *
+     * Downsamples spatial dimensions by taking the maximum value in each pooling window.
+     * Layout: input/output shape is (C*H*W, batch).
+     * Output dimensions: out_h = (in_h - pool) / stride + 1, same for width.
+     * Gradient flows back only to the max element in each window.
+     */
+    class MaxPool2D final : public Layer
+    {
+    private:
+        std::size_t channels_, in_h_, in_w_;
+        std::size_t pool_, stride_;
+        std::size_t out_h_, out_w_;
+        std::vector<std::size_t> max_indices_; // (C*Hp*Wp, batch) 扁平 argmax 行索引
+
+    public:
+        MaxPool2D(std::size_t channels, std::size_t in_h, std::size_t in_w,
+                  std::size_t pool = 2, std::size_t stride = 0)
+            : channels_(channels), in_h_(in_h), in_w_(in_w),
+              pool_(pool), stride_(stride != 0 ? stride : (pool != 0 ? pool : 1))
+        {
+            if (pool_ == 0 || in_h_ < pool_ || in_w_ < pool_)
+                throw std::invalid_argument("MaxPool2D: pool 窗口大于输入尺寸");
+            out_h_ = (in_h_ - pool_) / stride_ + 1;
+            out_w_ = (in_w_ - pool_) / stride_ + 1;
+        }
+
+        const char *name() const override { return "MaxPool2D"; }
+
+        /**
+                           * Applies max pooling to each channel of a batched flattened image tensor.
+                           *
+                           * @param input Input matrix shaped `(channels * input_height * input_width, batch)`.
+                           * @returns Pooled output shaped `(channels * output_height * output_width, batch)`.
+                           * @throws std::invalid_argument If the input row count does not match the configured image shape.
+                           */
+                          Matrix forward(const Matrix &input) override
+        {
+            if (input.rows() != channels_ * in_h_ * in_w_)
+                throw std::invalid_argument("MaxPool2D forward: input rows != C*H*W");
+            const std::size_t batch = input.cols();
+            const std::size_t out_area = out_h_ * out_w_;
+
+            Matrix out(channels_ * out_area, batch);
+            max_indices_.assign(channels_ * out_area * batch, 0);
+
+            // 逐窗口独立 → 安全并行；work = 输出元素数 × pool²
+            nn::for_range(out.size() * pool_ * pool_, out.size(),
+                          [&](std::size_t oidx)
+                          {
+                              const std::size_t b = oidx % batch;
+                              const std::size_t orow = oidx / batch;
+                              const std::size_t c = orow / out_area;
+                              const std::size_t p = orow % out_area;
+                              const std::size_t oh = p / out_w_, ow = p % out_w_;
+
+                              double best = -std::numeric_limits<double>::infinity();
+                              std::size_t best_idx = 0;
+                              for (std::size_t dh = 0; dh < pool_; ++dh)
+                                  for (std::size_t dw = 0; dw < pool_; ++dw)
+                                  {
+                                      const std::size_t r = c * in_h_ * in_w_
+                                          + (oh * stride_ + dh) * in_w_
+                                          + (ow * stride_ + dw);
+                                      const double v = input.at_unchecked(r, b);
+                                      if (v > best)
+                                      {
+                                          best = v;
+                                          best_idx = r;
+                                      }
+                                  }
+                              out.data()[oidx] = best;
+                              max_indices_[b * channels_ * out_area + orow] = best_idx;
+                          });
+            return out;
+        }
+
+        /**
+         * Propagates gradients through the max-pooling operation.
+         *
+         * @param grad_output Gradients with respect to the pooled output.
+         * @returns Gradients with respect to the input, accumulated at the selected maxima.
+         */
+        Matrix backward(const Matrix &grad_output) override
+        {
+            const std::size_t batch = grad_output.cols();
+            const std::size_t out_area = out_h_ * out_w_;
+            if (grad_output.rows() != channels_ * out_area)
+                throw std::invalid_argument("MaxPool2D backward: grad_output rows mismatch");
+            if (max_indices_.size() != channels_ * out_area * batch)
+                throw std::invalid_argument("MaxPool2D backward: forward not called");
+
+            // 同一 (b, c) 内重叠窗口可能散射到同一行 → 仅 (b, c) 粒度并行，块内串行累加
+            Matrix gin(channels_ * in_h_ * in_w_, batch);
+            nn::for_range(gin.size(), batch * channels_,
+                          [&](std::size_t bc)
+                          {
+                              const std::size_t b = bc / channels_;
+                              const std::size_t c = bc % channels_;
+                              for (std::size_t p = 0; p < out_area; ++p)
+                              {
+                                  const std::size_t orow = c * out_area + p;
+                                  const std::size_t idx = max_indices_[b * channels_ * out_area + orow];
+                                  gin.set_value_unchecked(
+                                      idx, b,
+                                      gin.at_unchecked(idx, b) + grad_output.at_unchecked(orow, b));
+                              }
+                          });
+            return gin;
+        }
     };
 
     // ── LayerNorm ────────────────────────────────────────────────────────────
@@ -836,6 +1319,13 @@ namespace nn
             return {std::ref(dgamma_), std::ref(dbeta_)};
         }
 
+        /**
+         * Normalizes each input sample across its feature dimension and applies learnable scale and bias.
+         *
+         * @param input Input matrix with one sample per column and `normalized_shape_` rows.
+         * @returns The normalized and affine-transformed samples.
+         * @throws std::invalid_argument If the input row count does not match the normalized shape.
+         */
         Matrix forward(const Matrix &input) override
         {
             if (input.rows() != normalized_shape_)
@@ -872,9 +1362,7 @@ namespace nn
             }
 
             Matrix output(feat, batch);
-            std::for_each(NN_EXEC_POLICY,
-                          counting_iterator<std::size_t>(0),
-                          counting_iterator<std::size_t>(feat * batch),
+            nn::for_range(feat * batch, feat * batch,
                           [&](std::size_t idx) {
                               std::size_t i = idx / batch;
                               output.data()[idx] = normalized_cache_.data()[idx]
@@ -883,6 +1371,13 @@ namespace nn
             return output;
         }
 
+        /**
+         * Computes input gradients and parameter gradients for the layer-normalized samples.
+         *
+         * @param grad_output Gradient propagated from the subsequent layer.
+         * @returns The gradient with respect to the layer input.
+         * @throws std::invalid_argument If the gradient or cached forward-pass shape is invalid.
+         */
         Matrix backward(const Matrix &grad_output) override
         {
             if (grad_output.rows() != normalized_shape_)
@@ -933,6 +1428,142 @@ namespace nn
         }
     };
 
+    // ── RMSNorm（Root Mean Square 归一化，LLaMA/Mistral 风格，移植自上游）──
+    // 与 LayerNorm 差异：不减均值、无 beta 偏置，仅按均方根归一化，
+    // 每层少 2 次列归约 + 1 次广播。公式（对标上游 compute_layer_mlp.hpp）：
+    //   forward:  mean_sq = (1/F)Σx²;  rms_inv = rsqrt(mean_sq + ε);
+    //             normed = x·rms_inv;  out = normed·γ
+    //   backward: gy = g·γ;  gy_n = gy⊙normed;  m = (1/F)Σ_f gy_n;
+    //             grad_x = (gy − m·normed)·rms_inv;  grad_γ = Σ_batch gy_n
+    /**
+     * @brief Root Mean Square Layer Normalization (LLaMA/Mistral style).
+     *
+     * Simpler than LayerNorm: no mean subtraction, no beta bias parameter.
+     * Normalizes by RMS: out = (x / sqrt(mean(x^2) + eps)) * gamma.
+     * More efficient than LayerNorm (fewer reductions and broadcasts).
+     * Commonly used in modern LLMs like LLaMA and Mistral.
+     */
+    class RMSNorm final : public Layer
+    {
+    private:
+        std::size_t normalized_shape_;
+        double eps_;
+        Matrix gamma_;   // (normalized_shape, 1)，初始化为 1（无 beta）
+        Matrix dgamma_;
+
+        // backward 缓存
+        Matrix normalized_cache_;   // (features, batch)
+        std::vector<double> rms_inv_cache_; // (batch)
+
+    public:
+        explicit RMSNorm(std::size_t normalized_shape, double eps = 1e-5)
+            : normalized_shape_(normalized_shape), eps_(eps),
+              gamma_(normalized_shape, 1, 1.0),
+              dgamma_(normalized_shape, 1, 0.0) {}
+
+        const char *name() const override { return "RMSNorm"; }
+        [[nodiscard]] std::size_t param_count() const noexcept override { return normalized_shape_; }
+
+        std::vector<std::reference_wrapper<Matrix>> parameters() override
+        {
+            return {std::ref(gamma_)};
+        }
+
+        std::vector<std::reference_wrapper<Matrix>> param_gradients() override
+        {
+            return {std::ref(dgamma_)};
+        }
+
+        Matrix forward(const Matrix &input) override
+        {
+            if (input.rows() != normalized_shape_)
+                throw std::invalid_argument("RMSNorm forward: input rows != normalized_shape");
+
+            const std::size_t feat = input.rows();
+            const std::size_t batch = input.cols();
+            const double inv_feat = 1.0 / static_cast<double>(feat);
+
+            rms_inv_cache_.resize(batch);
+            normalized_cache_ = Matrix(feat, batch);
+
+            for (std::size_t j = 0; j < batch; ++j)
+            {
+                double sum_sq = 0.0;
+                for (std::size_t i = 0; i < feat; ++i)
+                {
+                    const double x = input.at_unchecked(i, j);
+                    sum_sq += x * x;
+                }
+                const double rms_inv = 1.0 / std::sqrt(sum_sq * inv_feat + eps_);
+                rms_inv_cache_[j] = rms_inv;
+                for (std::size_t i = 0; i < feat; ++i)
+                    normalized_cache_.set_value_unchecked(i, j, input.at_unchecked(i, j) * rms_inv);
+            }
+
+            Matrix output(feat, batch);
+            nn::for_range(feat * batch, feat * batch,
+                          [&](std::size_t idx)
+                          {
+                              const std::size_t i = idx / batch;
+                              output.data()[idx] = normalized_cache_.data()[idx]
+                                  * gamma_.at_unchecked(i, 0);
+                          });
+            return output;
+        }
+
+        /**
+         * Computes gradients for the RMS normalization layer.
+         *
+         * @param grad_output Gradient propagated from the subsequent layer.
+         * @returns The gradient with respect to the layer input.
+         * @throws std::invalid_argument If the gradient or cached forward-pass shape is invalid.
+         */
+        Matrix backward(const Matrix &grad_output) override
+        {
+            if (grad_output.rows() != normalized_shape_)
+                throw std::invalid_argument("RMSNorm backward: grad_output rows != normalized_shape");
+            if (normalized_cache_.rows() != normalized_shape_
+                || normalized_cache_.cols() != grad_output.cols())
+                throw std::invalid_argument("RMSNorm backward: forward cache shape mismatch");
+
+            const std::size_t feat = grad_output.rows();
+            const std::size_t batch = grad_output.cols();
+            const double inv_feat = 1.0 / static_cast<double>(feat);
+
+            // 行主序友好：按行同时累计 grad_γ 与每列的 m[j] = (1/F)Σ_i gy_n
+            dgamma_.zero();
+            std::vector<double> m_vec(batch, 0.0);
+            for (std::size_t i = 0; i < feat; ++i)
+            {
+                const double g_i = gamma_.at_unchecked(i, 0);
+                double dg = 0.0;
+                for (std::size_t j = 0; j < batch; ++j)
+                {
+                    const double grad = grad_output.at_unchecked(i, j);
+                    const double normalized = normalized_cache_.at_unchecked(i, j);
+                    dg += grad * normalized;
+                    const double gy_n = grad * g_i * normalized;
+                    m_vec[j] += gy_n;
+                }
+                dgamma_.set_value_unchecked(i, 0, dg);
+            }
+
+            // grad_x = (gy − m·normed)·rms_inv
+            Matrix grad_input(feat, batch);
+            nn::for_range(feat * batch, feat * batch,
+                          [&](std::size_t idx)
+                          {
+                              const std::size_t i = idx / batch;
+                              const std::size_t j = idx % batch;
+                              const double gy = grad_output.data()[idx]
+                                                * gamma_.at_unchecked(i, 0);
+                              grad_input.data()[idx] =
+                                  (gy - m_vec[j] * inv_feat * normalized_cache_.data()[idx])
+                                  * rms_inv_cache_[j];
+                          });
+            return grad_input;
+        }
+    };
 
     // ── Softmax ──────────────────────────────────────────────────────────────
     class Softmax final : public Layer
@@ -1276,9 +1907,172 @@ namespace nn
             return linear2_.forward(gelu_.forward(linear1_.forward(input)));
         }
 
+        /**
+         * Computes the gradient propagated through the feed-forward network.
+         * @param grad_output Gradient of the loss with respect to the layer output.
+         * @returns Gradient of the loss with respect to the layer input.
+         */
         Matrix backward(const Matrix &grad_output) override
         {
             return linear1_.backward(gelu_.backward(linear2_.backward(grad_output)));
+        }
+    };
+
+    // ── SwiGLU（SiLU 门控 FFN 激活，LLaMA 风格，移植自上游）────────────
+    // 输入 (2·d_ff, batch)：gate = 前 d_ff 行，up = 后 d_ff 行
+    //   forward:  s = σ(gate);  out = SiLU(gate) ⊙ up = gate·s·up
+    //   backward: grad_gate = g⊙up⊙s⊙(1 + gate⊙(1−s))
+    //             grad_up   = g⊙gate⊙s
+    //             两者拼回 (2·d_ff, batch)
+    /**
+     * @brief Swish-Gated Linear Unit activation (LLaMA-style).
+     *
+     * Gated activation function: out = SiLU(gate) * up, where SiLU(x) = x * sigmoid(x).
+     * Input shape: (2*d_ff, batch), split into gate (first d_ff rows) and up (last d_ff rows).
+     * Output shape: (d_ff, batch).
+     * Used in modern LLMs as a drop-in replacement for GELU in FFN blocks.
+     */
+    class SwiGLU final : public Layer
+    {
+    private:
+        std::size_t d_ff_;
+        Matrix gate_cache_;    // (d_ff, batch)
+        Matrix sigmoid_cache_; // σ(gate)
+        Matrix up_cache_;      // (d_ff, batch)
+
+    public:
+        explicit SwiGLU(std::size_t d_ff) : d_ff_(d_ff) {}
+
+        const char *name() const override { return "SwiGLU"; }
+
+        /**
+         * Computes the gated linear unit activation for the input.
+         *
+         * @param input Input containing gate and up components with 2*d_ff_ rows.
+         * @returns The gated activation with d_ff_ rows.
+         * @throws std::invalid_argument If the input does not have 2*d_ff_ rows.
+         */
+        Matrix forward(const Matrix &input) override
+        {
+            if (input.rows() != 2 * d_ff_)
+                throw std::invalid_argument("SwiGLU forward: input rows != 2*d_ff");
+
+            const std::size_t batch = input.cols();
+            gate_cache_ = input.row_slice(0, d_ff_);
+            up_cache_ = input.row_slice(d_ff_, d_ff_);
+            sigmoid_cache_ = Matrix(d_ff_, batch);
+
+            nn::transform(gate_cache_.size(),
+                          gate_cache_.data().begin(), gate_cache_.data().end(),
+                          sigmoid_cache_.data().begin(),
+                          [](double g) noexcept { return 1.0 / (1.0 + std::exp(-g)); });
+
+            Matrix output(d_ff_, batch);
+            nn::for_range(output.size(), output.size(),
+                          [&](std::size_t idx) noexcept
+                          {
+                              output.data()[idx] = gate_cache_.data()[idx]
+                                  * sigmoid_cache_.data()[idx] * up_cache_.data()[idx];
+                          });
+            return output;
+        }
+
+        /**
+         * Computes gradients for the gate and up portions of the input.
+         * @param grad_output Gradient propagated from the following layer.
+         * @returns Gradients concatenated for the gate and up input portions.
+         */
+        Matrix backward(const Matrix &grad_output) override
+        {
+            if (grad_output.rows() != d_ff_)
+                throw std::invalid_argument("SwiGLU backward: grad_output rows != d_ff");
+            if (gate_cache_.rows() != d_ff_ || gate_cache_.cols() != grad_output.cols())
+                throw std::invalid_argument("SwiGLU backward: forward cache shape mismatch");
+
+            const std::size_t batch = grad_output.cols();
+            Matrix grad_gate(d_ff_, batch), grad_up(d_ff_, batch);
+
+            nn::for_range(grad_output.size(), grad_output.size(),
+                          [&](std::size_t idx) noexcept
+                          {
+                              const double g = grad_output.data()[idx];
+                              const double s = sigmoid_cache_.data()[idx];
+                              const double gate = gate_cache_.data()[idx];
+                              const double up = up_cache_.data()[idx];
+                              grad_gate.data()[idx] = g * up * s * (1.0 + gate * (1.0 - s));
+                              grad_up.data()[idx] = g * gate * s;
+                          });
+
+            Matrix grad_input(2 * d_ff_, batch);
+            grad_input.set_row_slice(0, grad_gate);
+            grad_input.set_row_slice(d_ff_, grad_up);
+            return grad_input;
+        }
+    };
+
+    // ── SwiGLUFeedForward（LLaMA 风格 FFN，移植自上游）──────────────────
+    // Linear(d_model → 2·d_ff) → SwiGLU → Linear(d_ff → d_model)
+    // 与 FeedForward（GELU 版）同构，可直接替换。
+    /**
+     * @brief Feed-forward network with SwiGLU activation (LLaMA-style).
+     *
+     * Architecture: Linear(d_model -> 2*d_ff) -> SwiGLU -> Linear(d_ff -> d_model).
+     * Drop-in replacement for FeedForward (which uses GELU).
+     * Commonly used in LLaMA and similar modern transformer architectures.
+     */
+    class SwiGLUFeedForward final : public Layer
+    {
+    private:
+        Linear linear1_;
+        SwiGLU swiglu_;
+        Linear linear2_;
+
+    public:
+        SwiGLUFeedForward(std::size_t d_model, std::size_t d_ff)
+            : linear1_(d_model, 2 * d_ff), swiglu_(d_ff), linear2_(d_ff, d_model) {}
+
+        const char *name() const override { return "SwiGLUFeedForward"; }
+        [[nodiscard]] std::size_t param_count() const noexcept override
+        {
+            return linear1_.param_count() + linear2_.param_count();
+        }
+
+        std::vector<std::reference_wrapper<Matrix>> parameters() override
+        {
+            auto p = linear1_.parameters();
+            auto p2 = linear2_.parameters();
+            p.insert(p.end(), p2.begin(), p2.end());
+            return p;
+        }
+
+        std::vector<std::reference_wrapper<Matrix>> param_gradients() override
+        {
+            auto g = linear1_.param_gradients();
+            auto g2 = linear2_.param_gradients();
+            g.insert(g.end(), g2.begin(), g2.end());
+            return g;
+        }
+
+        /**
+         * Projects the input through the SwiGLU feed-forward network.
+         *
+         * @param input Input feature matrix.
+         * @returns The transformed output matrix.
+         */
+        Matrix forward(const Matrix &input) override
+        {
+            return linear2_.forward(swiglu_.forward(linear1_.forward(input)));
+        }
+
+        /**
+         * Propagates gradients through the feed-forward network.
+         *
+         * @param grad_output Gradient from the subsequent layer.
+         * @return Gradient with respect to the network input.
+         */
+        Matrix backward(const Matrix &grad_output) override
+        {
+            return linear1_.backward(swiglu_.backward(linear2_.backward(grad_output)));
         }
     };
 

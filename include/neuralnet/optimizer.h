@@ -13,14 +13,28 @@
 namespace nn
 {
 
+    /**
+     * @brief Abstract base class for optimizers.
+     */
     class Optimizer
     {
     public:
         virtual ~Optimizer() = default;
+        /**
+         * @brief Performs a single optimization step (parameter update).
+         */
         virtual void step() = 0;
+        /**
+         * @brief Zeros all parameter gradients.
+         */
         virtual void zero_grad() = 0;
     };
 
+    /**
+     * @brief Stochastic Gradient Descent optimizer.
+     *
+     * Updates parameters using: param = param - learning_rate * grad.
+     */
     class SGD : public Optimizer
     {
     private:
@@ -40,13 +54,16 @@ namespace nn
             }
         }
 
+        /**
+         * Updates each parameter using its corresponding gradient and learning rate.
+         */
         void step() override
         {
             for (std::size_t i = 0; i < params_.size(); ++i)
             {
                 auto &p = params_[i].get();
                 auto &g = grads_[i].get();
-                std::transform(NN_EXEC_POLICY,
+                nn::transform(p.size(),
                                p.data().begin(), p.data().end(),
                                g.data().begin(),
                                p.data().begin(),
@@ -55,7 +72,10 @@ namespace nn
             }
         }
 
-        void zero_grad() override
+        /**
+             * Clears all gradient matrices by setting their elements to zero.
+             */
+            void zero_grad() override
         {
             for (auto &g_ref : grads_)
             {
@@ -65,6 +85,13 @@ namespace nn
         }
     };
 
+    /**
+     * @brief SGD with momentum optimizer.
+     *
+     * Maintains exponentially weighted moving average of gradients.
+     * Updates: velocity = beta * velocity + (1 - beta) * grad,
+     *          param = param - learning_rate * velocity.
+     */
     class SGD_w_Momentum : public Optimizer
     {
     private:
@@ -105,9 +132,7 @@ namespace nn
                 auto &v_vec = v.data();
 
                 const std::size_t n = p_vec.size();
-                std::for_each(NN_EXEC_POLICY,
-                              counting_iterator<std::size_t>(0),
-                              counting_iterator<std::size_t>(n),
+                nn::for_range(n, n,
                               [&](std::size_t idx)
                               {
                                   v_vec[idx] = beta_ * v_vec[idx] + (1 - beta_) * g_vec[idx];
@@ -116,7 +141,10 @@ namespace nn
             }
         }
 
-        void zero_grad() override
+        /**
+             * Clears all parameter gradients.
+             */
+            void zero_grad() override
         {
             for (auto &g_ref : grads_)
             {
@@ -128,24 +156,32 @@ namespace nn
 
     // ── Adam 优化器 ────────────────────────────────────────────────────────────
     // Adam: A Method for Stochastic Optimization (Kingma & Ba, 2015)
+    /**
+     * @brief Adam optimizer with adaptive learning rates.
+     *
+     * Maintains first and second moment estimates with bias correction.
+     * Reference: Kingma & Ba, "Adam: A Method for Stochastic Optimization" (2015).
+     */
     class Adam : public Optimizer
     {
     private:
+        std::size_t step_count_;
+        std::vector<Matrix> m_; // 一阶矩估计
+        std::vector<Matrix> v_; // 二阶矩估计
+
+    protected:
         double lr_;
         double beta1_;
         double beta2_;
         double eps_;
-        std::size_t step_count_;
         std::vector<std::reference_wrapper<Matrix>> params_;
         std::vector<std::reference_wrapper<Matrix>> grads_;
-        std::vector<Matrix> m_; // 一阶矩估计
-        std::vector<Matrix> v_; // 二阶矩估计
 
     public:
         Adam(std::vector<std::reference_wrapper<Matrix>> params,
              std::vector<std::reference_wrapper<Matrix>> grads,
              double lr = 0.001, double beta1 = 0.9, double beta2 = 0.999, double eps = 1e-8)
-            : lr_(lr), beta1_(beta1), beta2_(beta2), eps_(eps), step_count_(0),
+            : step_count_(0), lr_(lr), beta1_(beta1), beta2_(beta2), eps_(eps),
               params_(std::move(params)), grads_(std::move(grads))
         {
             if (params_.size() != grads_.size())
@@ -180,9 +216,7 @@ namespace nn
                 auto &m_vec = m.data();
                 auto &v_vec = v.data();
 
-                std::for_each(NN_EXEC_POLICY,
-                              counting_iterator<std::size_t>(0),
-                              counting_iterator<std::size_t>(n),
+                nn::for_range(n, n,
                               [&](std::size_t idx)
                               {
                                   // 更新一阶矩: m = beta1 * m + (1 - beta1) * g
@@ -198,7 +232,10 @@ namespace nn
             }
         }
 
-        void zero_grad() override
+        /**
+             * Clears all parameter gradients by setting their elements to zero.
+             */
+            void zero_grad() override
         {
             for (auto &g_ref : grads_)
             {
@@ -207,6 +244,48 @@ namespace nn
             }
         }
     };
+
+    // ── AdamW：解耦权重衰减（Decoupled Weight Decay，移植自上游）─────
+    // 与 Adam + L2 正则化的区别：
+    //   - L2:  g' = g + wd*p，用 g' 做 Adam 更新 → wd 受自适应学习率缩放
+    //   - AdamW: 直接 p *= (1-lr*wd)，梯度更新不受 wd 影响
+    //   → 衰减对所有参数等效，不因自适应学习率而被稀释；
+    //     transformer/GPT 训练的标准配置。
+    /**
+     * @brief AdamW optimizer with decoupled weight decay.
+     *
+     * Unlike Adam with L2 regularization, weight decay is applied directly to parameters
+     * (p *= (1 - lr*wd)) rather than being added to gradients. This prevents weight decay
+     * from being diluted by adaptive learning rates, making it more effective.
+     * Standard optimizer choice for training transformers and GPT models.
+     */
+    class AdamW : public Adam
+    {
+    private:
+        double wd_; // 权重衰减系数
+
+    public:
+        AdamW(std::vector<std::reference_wrapper<Matrix>> params,
+              std::vector<std::reference_wrapper<Matrix>> grads,
+              double lr = 0.001, double beta1 = 0.9, double beta2 = 0.999,
+              double eps = 1e-8, double weight_decay = 0.01)
+            : Adam(std::move(params), std::move(grads), lr, beta1, beta2, eps),
+              wd_(weight_decay) {}
+
+        void step() override
+        {
+            // 权重衰减解耦：先 p = (1-lr*wd)*p，再做标准 Adam 更新。
+            // 零梯度时 m/v 保持 0，Adam 增量为 0 → p_t = p_0*(1-lr*wd)^t。
+            if (wd_ != 0.0)
+            {
+                const double decay = 1.0 - lr_ * wd_;
+                for (auto &p_ref : params_)
+                    p_ref.get().scale_inplace(decay);
+            }
+            Adam::step();
+        }
+    };
+
 } // namespace nn
 
 #endif // OPTIMIZER_HPP
