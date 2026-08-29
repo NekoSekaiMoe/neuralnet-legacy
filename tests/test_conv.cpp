@@ -9,12 +9,22 @@
 #include <stdexcept>
 #include <vector>
 
+/**
+ * @brief Compares two floating-point values within a specified tolerance.
+ *
+ * @param a First value.
+ * @param b Second value.
+ * @param tol Maximum allowed absolute difference.
+ * @return `true` if the absolute difference between the values is less than `tol`, `false` otherwise.
+ */
 static bool approx(double a, double b, double tol = 1e-6)
 {
     return std::fabs(a - b) < tol;
 }
 
-// ── Conv2D ─────────────────────────────────────────────────────────────────
+/**
+ * @brief Verifies hand-computed Conv2D forward results with and without bias.
+ */
 
 static void test_conv2d_forward_hand()
 {
@@ -52,6 +62,9 @@ static void test_conv2d_forward_hand()
     std::puts("  [Conv2D] forward PASSED");
 }
 
+/**
+ * @brief Verifies padded Conv2D im2col basis extraction against expected input elements.
+ */
 static void test_conv2d_im2col_basis()
 {
     std::puts("  [Conv2D] im2col basis extraction (with padding) ...");
@@ -91,6 +104,9 @@ static void test_conv2d_im2col_basis()
     std::puts("  [Conv2D] im2col basis extraction PASSED");
 }
 
+/**
+ * @brief Verifies Conv2D input and parameter gradients using central differences.
+ */
 static void test_conv2d_gradient_check()
 {
     std::puts("  [Conv2D] gradient check (central difference) ...");
@@ -167,7 +183,9 @@ static void test_conv2d_gradient_check()
     std::puts("  [Conv2D] gradient check PASSED");
 }
 
-// ── MaxPool2D ──────────────────────────────────────────────────────────────
+/**
+ * @brief Verifies MaxPool2D forward propagation for non-overlapping and overlapping windows.
+ */
 
 static void test_maxpool2d_forward()
 {
@@ -202,6 +220,9 @@ static void test_maxpool2d_forward()
     std::puts("  [MaxPool2D] forward PASSED");
 }
 
+/**
+ * @brief Verifies MaxPool2D backward gradient scattering for non-overlapping and overlapping windows.
+ */
 static void test_maxpool2d_backward()
 {
     std::puts("  [MaxPool2D] backward scatter ...");
@@ -259,7 +280,9 @@ static void test_maxpool2d_backward()
     std::puts("  [MaxPool2D] backward scatter PASSED");
 }
 
-// ── 组合 ───────────────────────────────────────────────────────────────────
+/**
+ * @brief Verifies output and gradient shapes through a Conv2D, ReLU, and MaxPool2D pipeline.
+ */
 
 static void test_conv_relu_pool_composite()
 {
@@ -298,6 +321,11 @@ static void test_conv_relu_pool_composite()
 
 #include "test_runner.h"
 
+/**
+ * @brief Runs the Conv2D, MaxPool2D, and composite pipeline tests.
+ *
+ * @return int Test runner status code.
+ */
 int main(int argc, char *argv[])
 {
     const TestEntry tests[] = {

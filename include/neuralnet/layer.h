@@ -39,14 +39,14 @@ namespace nn
          */
         virtual Matrix backward(const Matrix &grad_output) = 0;
         /**
-         * @brief Returns trainable parameters.
-         * @return Vector of parameter matrix references.
-         */
+ * @brief Provides access to trainable parameters.
+ * @return References to trainable parameter matrices.
+ */
         virtual std::vector<std::reference_wrapper<Matrix>> parameters() { return {}; }
         /**
-         * @brief Returns parameter gradients.
-         * @return Vector of gradient matrix references.
-         */
+ * @brief Provides references to the layer's parameter gradients.
+ * @return A vector of references to parameter gradient matrices.
+ */
         virtual std::vector<std::reference_wrapper<Matrix>> param_gradients() { return {}; }
         
         // 添加参数更新辅助方法，避免虚函数调用开销
@@ -120,6 +120,12 @@ namespace nn
 
         const char *name() const override { return "Linear"; }
 
+        /**
+         * Computes the linear transformation for the input.
+         * @param input Input feature matrix.
+         * @returns The transformed matrix with the layer bias added.
+         * @throws std::invalid_argument If the input feature count does not match the layer.
+         */
         Matrix forward(const Matrix &input) override
         {
             if (input.rows() != W_.cols())
@@ -193,6 +199,11 @@ namespace nn
     public:
         const char *name() const override { return "ReLU"; }
 
+        /**
+         * Applies the rectified linear activation element-wise.
+         *
+         * @returns A matrix with negative values replaced by zero.
+         */
         Matrix forward(const Matrix &input) override
         {
             input_cache_ = input;
@@ -203,6 +214,12 @@ namespace nn
             return result;
         }
 
+        /**
+         * Computes the input gradient for the ReLU activation.
+         *
+         * @param grad_output Gradient propagated from the subsequent layer.
+         * @returns The gradient propagated through positive input values.
+         */
         Matrix backward(const Matrix &grad_output) override
         {
             if (input_cache_.rows() != grad_output.rows() || input_cache_.cols() != grad_output.cols())
@@ -236,6 +253,11 @@ namespace nn
 
         const char *name() const override { return "LeakyReLU"; }
 
+        /**
+         * Applies the leaky rectified linear activation element-wise.
+         * @param input Input matrix to activate.
+         * @returns Matrix containing the activated values.
+         */
         Matrix forward(const Matrix &input) override
         {
             input_cache_ = input;
@@ -247,6 +269,13 @@ namespace nn
             return result;
         }
 
+        /**
+         * Computes the gradient propagated through the LeakyReLU activation.
+         *
+         * @param grad_output Gradient with respect to the layer output.
+         * @returns Gradient with respect to the layer input.
+         * @throws std::invalid_argument If the gradient shape differs from the cached input shape.
+         */
         Matrix backward(const Matrix &grad_output) override
         {
             if (input_cache_.rows() != grad_output.rows() || input_cache_.cols() != grad_output.cols())
@@ -276,6 +305,12 @@ namespace nn
     public:
         const char *name() const override { return "Sigmoid"; }
 
+        /**
+         * Applies the sigmoid activation element-wise.
+         *
+         * @param input Values to activate.
+         * @returns The sigmoid-transformed values.
+         */
         Matrix forward(const Matrix &input) override
         {
             Matrix result(input.rows(), input.cols());
@@ -287,6 +322,12 @@ namespace nn
             return result;
         }
 
+        /**
+         * Computes the gradient of the sigmoid activation with respect to its input.
+         * @param grad_output Gradient propagated from the following layer.
+         * @returns The gradient propagated to the input.
+         * @throws std::invalid_argument If the gradient shape differs from the cached output shape.
+         */
         Matrix backward(const Matrix &grad_output) override
         {
             if (output_cache_.rows() != grad_output.rows() || output_cache_.cols() != grad_output.cols())
@@ -314,6 +355,12 @@ namespace nn
     public:
         const char *name() const override { return "Tanh"; }
 
+        /**
+         * Applies the hyperbolic tangent activation element-wise.
+         *
+         * @param input Values to activate.
+         * @returns The activated values, with each element transformed by the hyperbolic tangent.
+         */
         Matrix forward(const Matrix &input) override
         {
             Matrix result(input.rows(), input.cols());
@@ -325,6 +372,12 @@ namespace nn
             return result;
         }
 
+        /**
+         * Computes the input gradient for the cached hyperbolic tangent output.
+         *
+         * @param grad_output Gradient propagated from the subsequent layer.
+         * @returns The gradient propagated to the input.
+         */
         Matrix backward(const Matrix &grad_output) override
         {
             if (output_cache_.rows() != grad_output.rows() || output_cache_.cols() != grad_output.cols())
@@ -369,6 +422,11 @@ namespace nn
     public:
         const char *name() const override { return "GELU"; }
 
+        /**
+         * Applies the Gaussian Error Linear Unit activation to the input.
+         * @param input Values to activate.
+         * @returns A matrix containing the GELU-activated values.
+         */
         Matrix forward(const Matrix &input) override
         {
             input_cache_ = input;
@@ -378,6 +436,11 @@ namespace nn
             return result;
         }
 
+        /**
+         * Computes the gradient of the GELU activation with respect to its input.
+         * @param grad_output Gradient propagated from the subsequent layer.
+         * @returns The gradient propagated to the preceding layer.
+         */
         Matrix backward(const Matrix &grad_output) override
         {
             if (input_cache_.rows() != grad_output.rows() || input_cache_.cols() != grad_output.cols())
@@ -420,6 +483,11 @@ namespace nn
 
         void on_mode_change(bool training) noexcept override { training_ = training; }
 
+        /**
+         * Applies inverted dropout during training.
+         * @param input Values to regularize.
+         * @returns The masked and scaled input during training, or the unchanged input otherwise.
+         */
         Matrix forward(const Matrix &input) override
         {
             if (!training_ || p_ == 0.0)
@@ -445,6 +513,12 @@ namespace nn
             return result;
         }
 
+        /**
+         * Propagates gradients through the dropout layer.
+         * @param grad_output Gradient received from the subsequent layer.
+         * @returns The input gradient, with the dropout mask applied during training or unchanged when dropout is inactive.
+         * @throws std::invalid_argument If the gradient shape does not match the cached dropout mask.
+         */
         Matrix backward(const Matrix &grad_output) override
         {
             if (!training_ || p_ == 0.0)
@@ -473,7 +547,16 @@ namespace nn
     // 训练：用 batch mean/var 归一化 + 动量更新 running stats。
     // 推理：用 running mean/var 归一化。
     // 可选 affine：归一化后再做 gamma*x_hat + beta 仿射。
-    // BN2d 复用本类：把 (C, N*H*W) 视为 (C, batch)，forward 完全相同。
+    /**
+         * Normalizes feature rows across the batch and optionally applies learnable
+         * scale and bias parameters.
+         *
+         * @param num_features Number of feature rows in each input.
+         * @param eps Small value added to variance for numerical stability.
+         * @param momentum Weight assigned to each batch's statistics when updating
+         * running statistics.
+         * @param affine Whether to apply learnable scale and bias parameters.
+         */
     class BatchNorm1d : public Layer
     {
     private:
@@ -489,7 +572,15 @@ namespace nn
         Matrix running_mean_; // (num_features, 1), init=0
         Matrix running_var_;  // (num_features, 1), init=1
         int64_t num_batches_tracked_{0};
-        bool is_training_{true};
+        /**
+             * Initializes a one-dimensional batch normalization layer.
+             *
+             * @param num_features Number of input features.
+             * @param eps Small value added to the variance for numerical stability.
+             * @param momentum Weight assigned to the current batch when updating running statistics.
+             * @param affine Whether to apply learnable scaling and bias parameters.
+             */
+            bool is_training_{true};
 
         Matrix input_cache_;
         Matrix batch_mean_;   // (num_features, 1)
@@ -798,7 +889,11 @@ namespace nn
 
     // ── BatchNorm2d ──────────────────────────────────────────────────────────
     // 把 (C, N*H*W) 视为 (C, batch) —— BN1d::forward 已接受该形状。
-    // 因此无需 override forward/backward；只重写 name() 用于日志/汇总。
+    /**
+     * Identifies the layer as a two-dimensional batch-normalization layer.
+     *
+     * @returns The layer name, `"BatchNorm2d"`.
+     */
     class BatchNorm2d : public BatchNorm1d
     {
     public:
@@ -831,12 +926,20 @@ namespace nn
 
         Matrix W_, b_;
         Matrix grad_W_, grad_b_;
-        Matrix col_cache_; // im2col 输出，供 backward
+        Matrix col_cache_; /**
+ * Thread-local random number generator for stochastic layer operations.
+ */
 
         inline static thread_local std::mt19937_64 rng_{std::random_device{}()};
 
         // im2col：input (C_in*H*W, batch) → col (C_in*k*k, batch*OH*OW)
-        // 逐输出位置（b, oh, ow）独立 → 安全并行；work = col 元素数
+        /**
+                           * Converts batched image data into column-form patches for convolution.
+                           *
+                           * @param input Flattened input images arranged by channel, height, width, and batch.
+                           * @param batch Number of images in the batch.
+                           * @return Matrix containing one flattened convolution window per output position, with zero padding outside the input boundaries.
+                           */
         [[nodiscard]] Matrix im2col_(const Matrix &input, std::size_t batch) const
         {
             const std::size_t C_in = in_channels_, k = kernel_;
@@ -871,7 +974,13 @@ namespace nn
 
         // col2im：col (C_in*k*k, batch*OH*OW) → (C_in*H*W, batch)，散射累加。
         // 同一 (b, ci) 内不同输出位置可能写同一输入格（stride < k 时窗口重叠），
-        // 故只在 (b, ci) 粒度并行（块间不相交），块内串行累加。
+        /**
+         * Reconstructs batched image-shaped values from their column representation.
+         *
+         * @param col Column representation of the values to reconstruct.
+         * @param batch Number of samples in the batch.
+         * @returns Reconstructed values with one flattened image per batch sample.
+         */
         [[nodiscard]] Matrix col2im_(const Matrix &col, std::size_t batch) const
         {
             const std::size_t C_in = in_channels_, k = kernel_;
@@ -909,7 +1018,12 @@ namespace nn
             return out;
         }
 
-        // 布局重排：Z (C_out, batch*OH*OW) → out (C_out*OH*OW, batch)
+        /**
+         * Rearranges convolution outputs from channel-major layout into sample-major layout.
+         * @param Z Convolution output matrix with columns grouped by batch sample and spatial position.
+         * @param batch Number of samples in the batch.
+         * @returns Matrix arranged with all output channels and spatial positions per sample.
+         */
         [[nodiscard]] Matrix cols_to_samples_(const Matrix &Z, std::size_t batch) const
         {
             const std::size_t area = out_h_ * out_w_;
@@ -925,7 +1039,12 @@ namespace nn
             return out;
         }
 
-        // 布局重排：out (C_out*OH*OW, batch) → Z (C_out, batch*OH*OW)
+        /**
+         * Rearranges convolution outputs by grouping spatial positions within each batch.
+         * @param out Output matrix arranged as `(channels * height * width, batch)`.
+         * @param batch Number of input samples.
+         * @returns Matrix arranged as `(channels, batch * height * width)`.
+         */
         [[nodiscard]] Matrix samples_to_cols_(const Matrix &out, std::size_t batch) const
         {
             const std::size_t area = out_h_ * out_w_;
@@ -967,7 +1086,12 @@ namespace nn
             // b_ 零初始化（Matrix(rows, cols) 默认 0）
         }
 
-        const char *name() const override { return "Conv2D"; }
+        /**
+ * Identifies the layer type.
+ *
+ * @return The layer name, "Conv2D".
+ */
+const char *name() const override { return "Conv2D"; }
         [[nodiscard]] std::size_t param_count() const noexcept override
         {
             return W_.size() + b_.size();
@@ -983,6 +1107,15 @@ namespace nn
             return {std::ref(grad_W_), std::ref(grad_b_)};
         }
 
+        /**
+         * Computes the convolution output for a batch of flattened images.
+         *
+         * @param input Batch of flattened images with dimensions
+         *              {@code in_channels * in_h * in_w} by batch size.
+         * @returns Convolution results with dimensions
+         *          {@code out_channels * out_h * out_w} by batch size.
+         * @throws std::invalid_argument If the input feature count is invalid.
+         */
         Matrix forward(const Matrix &input) override
         {
             if (input.rows() != in_channels_ * in_h_ * in_w_)
@@ -1005,6 +1138,13 @@ namespace nn
             return cols_to_samples_(Z, batch);
         }
 
+        /**
+         * Computes parameter gradients and propagates gradients to the convolution input.
+         *
+         * @param grad_output Gradient of the loss with respect to the layer output.
+         * @returns Gradient of the loss with respect to the layer input.
+         * @throws std::invalid_argument If forward() has not been called or grad_output has an invalid shape.
+         */
         Matrix backward(const Matrix &grad_output) override
         {
             if (col_cache_.empty())
@@ -1061,7 +1201,14 @@ namespace nn
 
         const char *name() const override { return "MaxPool2D"; }
 
-        Matrix forward(const Matrix &input) override
+        /**
+                           * Applies max pooling to each channel of a batched flattened image tensor.
+                           *
+                           * @param input Input matrix shaped `(channels * input_height * input_width, batch)`.
+                           * @returns Pooled output shaped `(channels * output_height * output_width, batch)`.
+                           * @throws std::invalid_argument If the input row count does not match the configured image shape.
+                           */
+                          Matrix forward(const Matrix &input) override
         {
             if (input.rows() != channels_ * in_h_ * in_w_)
                 throw std::invalid_argument("MaxPool2D forward: input rows != C*H*W");
@@ -1102,6 +1249,12 @@ namespace nn
             return out;
         }
 
+        /**
+         * Propagates gradients through the max-pooling operation.
+         *
+         * @param grad_output Gradients with respect to the pooled output.
+         * @returns Gradients with respect to the input, accumulated at the selected maxima.
+         */
         Matrix backward(const Matrix &grad_output) override
         {
             const std::size_t batch = grad_output.cols();
@@ -1166,6 +1319,13 @@ namespace nn
             return {std::ref(dgamma_), std::ref(dbeta_)};
         }
 
+        /**
+         * Normalizes each input sample across its feature dimension and applies learnable scale and bias.
+         *
+         * @param input Input matrix with one sample per column and `normalized_shape_` rows.
+         * @returns The normalized and affine-transformed samples.
+         * @throws std::invalid_argument If the input row count does not match the normalized shape.
+         */
         Matrix forward(const Matrix &input) override
         {
             if (input.rows() != normalized_shape_)
@@ -1211,6 +1371,13 @@ namespace nn
             return output;
         }
 
+        /**
+         * Computes input gradients and parameter gradients for the layer-normalized samples.
+         *
+         * @param grad_output Gradient propagated from the subsequent layer.
+         * @returns The gradient with respect to the layer input.
+         * @throws std::invalid_argument If the gradient or cached forward-pass shape is invalid.
+         */
         Matrix backward(const Matrix &grad_output) override
         {
             if (grad_output.rows() != normalized_shape_)
@@ -1344,6 +1511,13 @@ namespace nn
             return output;
         }
 
+        /**
+         * Computes gradients for the RMS normalization layer.
+         *
+         * @param grad_output Gradient propagated from the subsequent layer.
+         * @returns The gradient with respect to the layer input.
+         * @throws std::invalid_argument If the gradient or cached forward-pass shape is invalid.
+         */
         Matrix backward(const Matrix &grad_output) override
         {
             if (grad_output.rows() != normalized_shape_)
@@ -1732,6 +1906,11 @@ namespace nn
             return linear2_.forward(gelu_.forward(linear1_.forward(input)));
         }
 
+        /**
+         * Computes the gradient propagated through the feed-forward network.
+         * @param grad_output Gradient of the loss with respect to the layer output.
+         * @returns Gradient of the loss with respect to the layer input.
+         */
         Matrix backward(const Matrix &grad_output) override
         {
             return linear1_.backward(gelu_.backward(linear2_.backward(grad_output)));
@@ -1765,6 +1944,13 @@ namespace nn
 
         const char *name() const override { return "SwiGLU"; }
 
+        /**
+         * Computes the gated linear unit activation for the input.
+         *
+         * @param input Input containing gate and up components with 2*d_ff_ rows.
+         * @returns The gated activation with d_ff_ rows.
+         * @throws std::invalid_argument If the input does not have 2*d_ff_ rows.
+         */
         Matrix forward(const Matrix &input) override
         {
             if (input.rows() != 2 * d_ff_)
@@ -1790,6 +1976,11 @@ namespace nn
             return output;
         }
 
+        /**
+         * Computes gradients for the gate and up portions of the input.
+         * @param grad_output Gradient propagated from the following layer.
+         * @returns Gradients concatenated for the gate and up input portions.
+         */
         Matrix backward(const Matrix &grad_output) override
         {
             if (grad_output.rows() != d_ff_)
@@ -1861,11 +2052,23 @@ namespace nn
             return g;
         }
 
+        /**
+         * Projects the input through the SwiGLU feed-forward network.
+         *
+         * @param input Input feature matrix.
+         * @returns The transformed output matrix.
+         */
         Matrix forward(const Matrix &input) override
         {
             return linear2_.forward(swiglu_.forward(linear1_.forward(input)));
         }
 
+        /**
+         * Propagates gradients through the feed-forward network.
+         *
+         * @param grad_output Gradient from the subsequent layer.
+         * @return Gradient with respect to the network input.
+         */
         Matrix backward(const Matrix &grad_output) override
         {
             return linear1_.backward(swiglu_.backward(linear2_.backward(grad_output)));

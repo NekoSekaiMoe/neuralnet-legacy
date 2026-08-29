@@ -29,11 +29,25 @@ namespace nn
         virtual bool has_state() const { return false; }
     };
 
-    // Sequential container for Modules
+    /**
+     * Applies an ordered sequence of modules to an input tensor.
+     *
+     * Modules added to the container receive mode changes, and their parameters
+     * are exposed through the container.
+     *
+     * @throws std::runtime_error If the container has no modules when forward execution is requested.
+     */
     class Sequential : public Module
     {
     private:
         std::vector<std::unique_ptr<Module>> modules_;
+        /**
+         * Adds a module to the end of the sequence.
+         *
+         * @tparam ModuleType Type of module to construct and add.
+         * @param args Arguments forwarded to the module constructor.
+         * @return This sequence.
+         */
         bool is_training_{true};
 
     public:

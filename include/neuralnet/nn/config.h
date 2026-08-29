@@ -175,7 +175,15 @@ namespace nn
          * @param f Unary function to apply to each element.
          */
         template <typename Iter, typename Fn>
-        inline void for_each(std::size_t work, Iter first, Iter last, Fn f)
+        inline /**
+         * Applies a function to each element in a range.
+         *
+         * @param work Estimated amount of work used to select the execution strategy.
+         * @param first Iterator to the first element in the range.
+         * @param last Iterator past the last element in the range.
+         * @param f Function applied to each element.
+         */
+        void for_each(std::size_t work, Iter first, Iter last, Fn f)
         {
             if (work >= PARALLEL_THRESHOLD)
                 std::for_each(NN_EXEC_POLICY, first, last, std::move(f));
@@ -194,7 +202,16 @@ namespace nn
          * @param f Unary transformation function.
          */
         template <typename InIter, typename OutIter, typename Fn>
-        inline void transform(std::size_t work, InIter first, InIter last,
+        inline /**
+         * Applies a unary transformation to each element in an input range.
+         *
+         * @param work Estimated amount of work used to select the execution strategy.
+         * @param first Beginning of the input range.
+         * @param last End of the input range.
+         * @param d_first Beginning of the destination range.
+         * @param f Transformation applied to each input element.
+         */
+        void transform(std::size_t work, InIter first, InIter last,
                               OutIter d_first, Fn f)
         {
             if (work >= PARALLEL_THRESHOLD)
@@ -215,7 +232,17 @@ namespace nn
          * @param f Binary transformation function.
          */
         template <typename InIter1, typename InIter2, typename OutIter, typename Fn>
-        inline void transform(std::size_t work, InIter1 first1, InIter1 last1,
+        inline /**
+         * Applies a binary operation to corresponding elements of two input ranges.
+         *
+         * @param work Estimated number of elements to process.
+         * @param first1 Beginning of the first input range.
+         * @param last1 End of the first input range.
+         * @param first2 Beginning of the second input range.
+         * @param d_first Beginning of the destination range.
+         * @param f Binary operation applied to corresponding input elements.
+         */
+        void transform(std::size_t work, InIter1 first1, InIter1 last1,
                               InIter2 first2, OutIter d_first, Fn f)
         {
             if (work >= PARALLEL_THRESHOLD)
@@ -237,7 +264,17 @@ namespace nn
          * @return Reduced result.
          */
         template <typename Iter, typename T, typename Reduce, typename Transform>
-        inline T transform_reduce(std::size_t work, Iter first, Iter last,
+        inline /**
+         * Applies a transformation to each element and combines the results into an accumulated value.
+         * @param work Estimated amount of work used to select the execution strategy.
+         * @param first Beginning of the input range.
+         * @param last End of the input range.
+         * @param init Initial accumulated value.
+         * @param reduce Binary operation that combines the accumulated value with each transformed element.
+         * @param transform Unary operation applied to each input element.
+         * @returns The accumulated result.
+         */
+        T transform_reduce(std::size_t work, Iter first, Iter last,
                                   T init, Reduce reduce, Transform transform)
         {
             if (work >= PARALLEL_THRESHOLD)
@@ -260,7 +297,19 @@ namespace nn
          * @return Reduced result.
          */
         template <typename InIter1, typename InIter2, typename T, typename Reduce, typename Transform>
-        inline T transform_reduce(std::size_t work, InIter1 first1, InIter1 last1,
+        inline /**
+         * Combines corresponding elements from two input ranges into an accumulated result.
+         *
+         * @param work Estimated number of elements to process.
+         * @param first1 Beginning of the first input range.
+         * @param last1 End of the first input range.
+         * @param first2 Beginning of the second input range.
+         * @param init Initial accumulated value.
+         * @param reduce Operation that combines the accumulated value with each transformed element.
+         * @param transform Operation that produces a value from corresponding elements in the input ranges.
+         * @return The accumulated result.
+         */
+        T transform_reduce(std::size_t work, InIter1 first1, InIter1 last1,
                                   InIter2 first2, T init, Reduce reduce, Transform transform)
         {
             if (work >= PARALLEL_THRESHOLD)
@@ -281,7 +330,15 @@ namespace nn
          * @return Reduced result using addition.
          */
         template <typename Iter, typename T>
-        inline T reduce(std::size_t work, Iter first, Iter last, T init)
+        inline /**
+         * Reduces a range of values by adding them to an initial value.
+         * @param work Estimated number of work units used to select the execution strategy.
+         * @param first Beginning of the range.
+         * @param last End of the range.
+         * @param init Initial value for the reduction.
+         * @return The accumulated value.
+         */
+        T reduce(std::size_t work, Iter first, Iter last, T init)
         {
             if (work >= PARALLEL_THRESHOLD)
                 return std::reduce(NN_EXEC_POLICY, first, last, init);
@@ -301,7 +358,16 @@ namespace nn
          * @return Reduced result.
          */
         template <typename Iter, typename T, typename BinOp>
-        inline T reduce(std::size_t work, Iter first, Iter last, T init, BinOp binop)
+        inline /**
+         * Reduces a range of values into an accumulated result.
+         * @param work Estimated number of work units used to select the execution strategy.
+         * @param first Beginning of the input range.
+         * @param last End of the input range.
+         * @param init Initial accumulated value.
+         * @param binop Binary operation used to combine the accumulated value with each element.
+         * @return The accumulated result.
+         */
+        T reduce(std::size_t work, Iter first, Iter last, T init, BinOp binop)
         {
             if (work >= PARALLEL_THRESHOLD)
                 return std::reduce(NN_EXEC_POLICY, first, last, init, binop);
@@ -322,7 +388,13 @@ namespace nn
          * @param f Function taking index i as parameter.
          */
         template <typename Fn>
-        inline void for_range(std::size_t work, std::size_t n, Fn f)
+        inline /**
+         * Applies a function to each index in the range [0, n).
+         * @param work Estimated amount of work used to select the execution strategy.
+         * @param n Number of indices to process.
+         * @param f Function applied to each index.
+         */
+        void for_range(std::size_t work, std::size_t n, Fn f)
         {
             if (work >= PARALLEL_THRESHOLD)
                 std::for_each(NN_EXEC_POLICY,
@@ -347,7 +419,13 @@ namespace nn
          * @param f Function taking block index as parameter.
          */
         template <typename Fn>
-        inline void for_blocks(std::size_t n_blocks, Fn f)
+        inline /**
+         * Applies a function to each block index in the range [0, n_blocks).
+         *
+         * @param n_blocks Number of blocks to process.
+         * @param f Function to apply to each block index.
+         */
+        void for_blocks(std::size_t n_blocks, Fn f)
         {
             std::for_each(NN_EXEC_POLICY,
                           counting_iterator<std::size_t>(0),

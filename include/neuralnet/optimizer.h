@@ -54,6 +54,9 @@ namespace nn
             }
         }
 
+        /**
+         * Updates each parameter using its corresponding gradient and learning rate.
+         */
         void step() override
         {
             for (std::size_t i = 0; i < params_.size(); ++i)
@@ -69,7 +72,10 @@ namespace nn
             }
         }
 
-        void zero_grad() override
+        /**
+             * Clears all gradient matrices by setting their elements to zero.
+             */
+            void zero_grad() override
         {
             for (auto &g_ref : grads_)
             {
@@ -135,7 +141,10 @@ namespace nn
             }
         }
 
-        void zero_grad() override
+        /**
+             * Clears all parameter gradients.
+             */
+            void zero_grad() override
         {
             for (auto &g_ref : grads_)
             {
@@ -223,7 +232,10 @@ namespace nn
             }
         }
 
-        void zero_grad() override
+        /**
+             * Clears all parameter gradients by setting their elements to zero.
+             */
+            void zero_grad() override
         {
             for (auto &g_ref : grads_)
             {

@@ -160,7 +160,9 @@ static void test_layernorm_gradient_check()
     }
 }
 
-// ── RMSNorm（Matrix 版 Layer API）────────────────────────────────────────────
+/**
+ * @brief Verifies RMSNorm output dimensions, normalization, and parameter scaling.
+ */
 
 static void test_rmsnorm_forward_shape()
 {
@@ -198,6 +200,9 @@ static void test_rmsnorm_forward_shape()
     std::puts("  [RMSNorm] forward shape & normalization PASSED");
 }
 
+/**
+ * @brief Verifies RMSNorm input and scale-parameter gradients using central finite differences.
+ */
 static void test_rmsnorm_gradient_check()
 {
     std::puts("  [RMSNorm] gradient check (central difference) ...");
@@ -329,6 +334,9 @@ static void test_swiglu_gradient_check()
     std::puts("  [SwiGLU] gradient check PASSED");
 }
 
+/**
+ * @brief Verifies composite SwiGLU feed-forward output dimensions and input gradients.
+ */
 static void test_swiglu_ffn_composite()
 {
     std::puts("  [SwiGLUFeedForward] composite forward & gradcheck ...");

@@ -424,6 +424,9 @@ static void test_mse_loss()
     std::puts("  [MSELoss] forward & backward PASSED");
 }
 
+/**
+ * @brief Verifies CrossEntropyLoss forward values, backward gradients, batching semantics, and numerical stability.
+ */
 static void test_cross_entropy_loss()
 {
     std::puts("  [CrossEntropyLoss] forward & backward ...");
@@ -563,7 +566,9 @@ static void test_sgd_momentum()
 
 // ══════════════════════════════════════════════════════════════════════════════
 // Adam 测试
-// ══════════════════════════════════════════════════════════════════════════════
+/**
+ * @brief Verifies Adam parameter updates and gradient clearing.
+ */
 static void test_adam()
 {
     std::puts("  [Adam] step ...");
@@ -588,6 +593,12 @@ static void test_adam()
     std::puts("  [Adam] step PASSED");
 }
 
+/**
+ * @brief Verifies AdamW decoupled weight decay behavior.
+ *
+ * Tests equivalence to Adam when weight decay is zero, pure decay with zero
+ * gradients, and the expected order of weight decay and the Adam update.
+ */
 static void test_adamw()
 {
     std::puts("  [AdamW] decoupled weight decay ...");

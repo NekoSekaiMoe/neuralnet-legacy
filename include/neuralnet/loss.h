@@ -9,7 +9,15 @@
 #include <neuralnet/nn/config.h>
 #include <neuralnet/matrix.h>
 
-namespace nn
+/**
+     * Computes the mean squared error between predictions and targets.
+     *
+     * @param pred Predicted values.
+     * @param target Ground-truth values.
+     * @return Mean squared error.
+     * @throws std::invalid_argument If the matrices have different shapes or are empty.
+     */
+    namespace nn
 {
     /**
      * @brief Abstract base class for loss functions.
@@ -91,11 +99,12 @@ namespace nn
     };
 
     /**
-     * @brief Cross-entropy loss for multi-class classification.
-     *
-     * Computes numerically stable cross-entropy using log_softmax.
-     * Expects one-hot encoded targets.
-     */
+ * Computes the mean cross-entropy loss for one-hot encoded classification targets.
+ *
+ * @param logits Model outputs arranged as (classes, batch).
+ * @param target_onehot One-hot encoded targets with the same shape as logits.
+ * @return Mean cross-entropy loss across the batch.
+ */
     class CrossEntropyLoss : public Loss
     {
     private:
@@ -113,17 +122,13 @@ namespace nn
         // 3) 梯度 = (softmax - target) / batch：与均值损失定义一致
         //    （旧实现漏掉 1/batch，与 SGD/动量/裁剪的尺度约定不一致）
         /**
-         * @brief Computes cross-entropy loss with numerically stable log_softmax.
-         *
-         * Improvements over previous implementation:
-         * - Uses dynamic allocation instead of fixed stack buffer (avoids overflow for large vocab)
-         * - Computes loss directly from log_softmax (prevents NaN from 0 * -inf)
-         * - Gradient scaled by 1/batch for consistency with mean loss definition
-         *
-         * @param logits Raw model outputs (classes, batch).
-         * @param target_onehot One-hot encoded targets (classes, batch).
-         * @return Mean cross-entropy loss over the batch.
-         */
+     * Computes the mean cross-entropy loss for a batch of logits and one-hot targets.
+     *
+     * @param logits Model outputs arranged as classes by batch.
+     * @param target_onehot One-hot target values matching the dimensions of {@p logits}.
+     * @return The mean cross-entropy loss across the batch.
+     * @throws std::invalid_argument If the target dimensions do not match the logits dimensions.
+     */
         [[nodiscard]] double forward(const Matrix &logits, const Matrix &target_onehot)
         {
             const std::size_t classes = logits.rows();

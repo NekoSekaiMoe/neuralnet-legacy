@@ -102,6 +102,23 @@ namespace nn
             return result;
         }
 
+        /**
+         * Replaces the matrix contents with nested row data.
+         * @param new_data Non-empty rectangular matrix data.
+         * @throws std::invalid_argument If the input is empty or rows have different lengths.
+         */
+        
+        /**
+         * Creates a matrix with rows and columns exchanged.
+         * @returns A transposed copy of the matrix.
+         */
+        
+        /**
+         * Adds another matrix element-wise.
+         * @param other Matrix to add.
+         * @returns A matrix containing the element-wise sum.
+         * @throws std::invalid_argument If the matrices have different dimensions.
+         */
         void set_data(const std::vector<std::vector<double>> &new_data)
         {
             if (new_data.empty())
@@ -329,15 +346,12 @@ namespace nn
         // 访问模式：A 列连续（this^T 的行）+ B 列连续。把 A 的 (K_block × M_block)
         // 子块和 B 的 (K_block × N_block) 子块加载到栈数组，在内核里按 k 累加。
         /**
-         * @brief Matrix multiplication with transpose: this^T * other.
-         *
-         * Computes matrix product without explicit transpose memory allocation.
-         * Equivalent to this.transpose() * other but more efficient.
-         *
-         * @param other Matrix to multiply (K, N).
-         * @return Result matrix (M, N) where this is (K, M).
-         * @throws std::invalid_argument if this->rows() != other.rows().
-         */
+                           * Computes the product of this matrix's transpose and another matrix.
+                           *
+                           * @param other Matrix whose row count matches this matrix's row count.
+                           * @return A matrix with this matrix's column count as rows and other.cols() as columns.
+                           * @throws std::invalid_argument If the matrices have different row counts.
+                           */
         [[nodiscard]] Matrix matmul_TN(const Matrix &other) const
         {
             if (rows_ != other.rows_)
@@ -416,8 +430,8 @@ namespace nn
 
         // 逐元素加法 inplace
         /**
-         * @brief Adds another matrix element-wise in-place.
-         * @param other Matrix to add (must have same shape, otherwise no-op).
+         * Adds the corresponding elements of another matrix to this matrix.
+         * @param other Matrix whose elements are added; it must have the same dimensions.
          */
         void add_inplace(const Matrix &other) noexcept
         {
@@ -447,6 +461,12 @@ namespace nn
             std::fill(data_.begin(), data_.end(), 0.0);
         }
 
+        /**
+         * Changes the matrix dimensions and resizes its storage.
+         *
+         * @param rows Number of rows.
+         * @param cols Number of columns.
+         */
         void resize(std::size_t rows, std::size_t cols)
         {
             if (rows_ == rows && cols_ == cols) return;
@@ -476,11 +496,12 @@ namespace nn
         }
 
         /**
-         * @brief Copies rows from a slice matrix into this matrix.
-         * @param start_row Starting row index where slice will be copied.
-         * @param slice Matrix containing rows to copy.
-         * @throws std::out_of_range if slice exceeds matrix bounds.
-         * @throws std::invalid_argument if column count mismatch.
+         * Copies the rows of a matrix into this matrix starting at the specified row.
+         *
+         * @param start_row The first destination row.
+         * @param slice Matrix containing the rows to copy.
+         * @throws std::out_of_range If the rows do not fit within this matrix.
+         * @throws std::invalid_argument If the matrices have different column counts.
          */
         void set_row_slice(std::size_t start_row, const Matrix &slice)
         {
@@ -497,7 +518,20 @@ namespace nn
         // 全部经 nn:: 自适应分派（小规模串行 / 大规模并行）；空矩阵返回值由各方法文档说明。
         // 存储布局：行主序（data_[row * cols_ + col]）。
 
-        // Frobenius 范数：sqrt(sum(x^2))。空矩阵返回 0。
+        /**
+         * Computes the Frobenius norm of the matrix.
+         * @returns The square root of the sum of squared elements, or 0 for an empty matrix.
+         */
+        
+        /**
+         * Computes the sum of all matrix elements.
+         * @returns The sum of the elements, or 0 for an empty matrix.
+         */
+        
+        /**
+         * Computes the mean of all matrix elements.
+         * @returns The arithmetic mean of the elements, or 0 for an empty matrix.
+         */
         [[nodiscard]] double norm() const noexcept
         {
             const double sumsq = nn::transform_reduce(
