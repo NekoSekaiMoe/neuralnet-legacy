@@ -127,7 +127,7 @@
      * @param logits Model outputs arranged as classes by batch.
      * @param target_onehot One-hot target values matching the dimensions of {@p logits}.
      * @return The mean cross-entropy loss across the batch.
-     * @throws std::invalid_argument If the target dimensions do not match the logits dimensions.
+     * @throws std::invalid_argument If the target dimensions do not match the logits dimensions or the logits are empty.
      */
         [[nodiscard]] double forward(const Matrix &logits, const Matrix &target_onehot)
         {
@@ -135,6 +135,8 @@
             const std::size_t batch = logits.cols();
             if (target_onehot.rows() != classes || target_onehot.cols() != batch)
                 throw std::invalid_argument("cross entropy loss: target shape mismatch");
+            if (logits.empty())
+                throw std::invalid_argument("cross entropy loss cannot be computed on empty logits");
             grad_input_ = Matrix(classes, batch);
 
             // 列（样本）间独立的 scratch：shifted 矩阵与每列 loss，写入互不相交

@@ -432,6 +432,19 @@ static void test_cross_entropy_loss()
     std::puts("  [CrossEntropyLoss] forward & backward ...");
 
     nn::CrossEntropyLoss loss;
+    {
+        bool threw = false;
+        try
+        {
+            (void)loss.forward(nn::Matrix(3, 0), nn::Matrix(3, 0));
+        }
+        catch (const std::invalid_argument &)
+        {
+            threw = true;
+        }
+        assert(threw);
+    }
+
     // 3 类，batch=1，真实标签 = 类 2
     nn::Matrix logits(std::vector<double>{0.1, 0.2, 0.7}, 3, 1);
     std::vector<std::size_t> labels = {2};

@@ -1539,9 +1539,10 @@ const char *name() const override { return "Conv2D"; }
                 double dg = 0.0;
                 for (std::size_t j = 0; j < batch; ++j)
                 {
-                    const double gy_n = grad_output.at_unchecked(i, j) * g_i
-                                        * normalized_cache_.at_unchecked(i, j);
-                    dg += gy_n;
+                    const double grad = grad_output.at_unchecked(i, j);
+                    const double normalized = normalized_cache_.at_unchecked(i, j);
+                    dg += grad * normalized;
+                    const double gy_n = grad * g_i * normalized;
                     m_vec[j] += gy_n;
                 }
                 dgamma_.set_value_unchecked(i, 0, dg);

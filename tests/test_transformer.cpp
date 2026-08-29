@@ -209,6 +209,9 @@ static void test_rmsnorm_gradient_check()
 
     const std::size_t F = 5, B = 3;
     nn::RMSNorm rms(F);
+    auto param_refs = rms.parameters();
+    nn::Matrix &gamma = param_refs[0].get();
+    gamma.set_value_unchecked(1, 0, 2.0);
     nn::Matrix in_m(F, B);
     std::mt19937_64 rng(456);
     std::normal_distribution<double> dist(0.0, 1.0);
@@ -249,9 +252,7 @@ static void test_rmsnorm_gradient_check()
         }
 
     // 2) γ 梯度（dgamma 由上面 backward 填充）
-    auto param_refs = rms.parameters();
     auto grad_refs = rms.param_gradients();
-    nn::Matrix &gamma = param_refs[0].get();
     const nn::Matrix &dgamma = grad_refs[0].get();
     for (std::size_t r = 0; r < F; ++r)
     {
