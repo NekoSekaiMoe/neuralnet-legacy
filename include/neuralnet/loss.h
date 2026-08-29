@@ -11,14 +11,33 @@
 
 namespace nn
 {
+    /**
+     * @brief Abstract base class for loss functions.
+     */
     class Loss
     {
     public:
         virtual ~Loss() = default;
+        /**
+         * @brief Computes the loss between predictions and targets.
+         * @param pred Predicted values.
+         * @param target Target (ground truth) values.
+         * @return Loss value.
+         */
         virtual double forward(const Matrix &pred, const Matrix &target) = 0;
+        /**
+         * @brief Returns gradient with respect to input.
+         * @return Gradient matrix.
+         */
         virtual const Matrix &backward() const = 0;
     };
 
+    /**
+     * @brief Mean Squared Error loss function.
+     *
+     * Computes: loss = mean((pred - target)^2).
+     * Gradient: 2 * (pred - target) / n.
+     */
     class MSELoss : public Loss
     {
     private:
@@ -71,6 +90,12 @@ namespace nn
         [[nodiscard]] const Matrix &backward() const noexcept { return grad_input_; }
     };
 
+    /**
+     * @brief Cross-entropy loss for multi-class classification.
+     *
+     * Computes numerically stable cross-entropy using log_softmax.
+     * Expects one-hot encoded targets.
+     */
     class CrossEntropyLoss : public Loss
     {
     private:
@@ -87,6 +112,18 @@ namespace nn
         //    变 -inf、与 target=0 相乘得 0*(-inf)=NaN
         // 3) 梯度 = (softmax - target) / batch：与均值损失定义一致
         //    （旧实现漏掉 1/batch，与 SGD/动量/裁剪的尺度约定不一致）
+        /**
+         * @brief Computes cross-entropy loss with numerically stable log_softmax.
+         *
+         * Improvements over previous implementation:
+         * - Uses dynamic allocation instead of fixed stack buffer (avoids overflow for large vocab)
+         * - Computes loss directly from log_softmax (prevents NaN from 0 * -inf)
+         * - Gradient scaled by 1/batch for consistency with mean loss definition
+         *
+         * @param logits Raw model outputs (classes, batch).
+         * @param target_onehot One-hot encoded targets (classes, batch).
+         * @return Mean cross-entropy loss over the batch.
+         */
         [[nodiscard]] double forward(const Matrix &logits, const Matrix &target_onehot)
         {
             const std::size_t classes = logits.rows();

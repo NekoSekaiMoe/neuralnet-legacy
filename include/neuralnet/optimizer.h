@@ -13,14 +13,28 @@
 namespace nn
 {
 
+    /**
+     * @brief Abstract base class for optimizers.
+     */
     class Optimizer
     {
     public:
         virtual ~Optimizer() = default;
+        /**
+         * @brief Performs a single optimization step (parameter update).
+         */
         virtual void step() = 0;
+        /**
+         * @brief Zeros all parameter gradients.
+         */
         virtual void zero_grad() = 0;
     };
 
+    /**
+     * @brief Stochastic Gradient Descent optimizer.
+     *
+     * Updates parameters using: param = param - learning_rate * grad.
+     */
     class SGD : public Optimizer
     {
     private:
@@ -65,6 +79,13 @@ namespace nn
         }
     };
 
+    /**
+     * @brief SGD with momentum optimizer.
+     *
+     * Maintains exponentially weighted moving average of gradients.
+     * Updates: velocity = beta * velocity + (1 - beta) * grad,
+     *          param = param - learning_rate * velocity.
+     */
     class SGD_w_Momentum : public Optimizer
     {
     private:
@@ -126,6 +147,12 @@ namespace nn
 
     // ── Adam 优化器 ────────────────────────────────────────────────────────────
     // Adam: A Method for Stochastic Optimization (Kingma & Ba, 2015)
+    /**
+     * @brief Adam optimizer with adaptive learning rates.
+     *
+     * Maintains first and second moment estimates with bias correction.
+     * Reference: Kingma & Ba, "Adam: A Method for Stochastic Optimization" (2015).
+     */
     class Adam : public Optimizer
     {
     private:
@@ -212,6 +239,14 @@ namespace nn
     //   - AdamW: 直接 p *= (1-lr*wd)，梯度更新不受 wd 影响
     //   → 衰减对所有参数等效，不因自适应学习率而被稀释；
     //     transformer/GPT 训练的标准配置。
+    /**
+     * @brief AdamW optimizer with decoupled weight decay.
+     *
+     * Unlike Adam with L2 regularization, weight decay is applied directly to parameters
+     * (p *= (1 - lr*wd)) rather than being added to gradients. This prevents weight decay
+     * from being diluted by adaptive learning rates, making it more effective.
+     * Standard optimizer choice for training transformers and GPT models.
+     */
     class AdamW : public Adam
     {
     private:

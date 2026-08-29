@@ -19,13 +19,34 @@
 
 namespace nn
 {
+    /**
+     * @brief Abstract base class for neural network layers.
+     */
     class Layer
     {
     public:
         virtual ~Layer() = default;
+        /**
+         * @brief Performs forward pass computation.
+         * @param input Input matrix.
+         * @return Output matrix.
+         */
         virtual Matrix forward(const Matrix &input) = 0;
+        /**
+         * @brief Performs backward pass computation.
+         * @param grad_output Gradient with respect to output.
+         * @return Gradient with respect to input.
+         */
         virtual Matrix backward(const Matrix &grad_output) = 0;
+        /**
+         * @brief Returns trainable parameters.
+         * @return Vector of parameter matrix references.
+         */
         virtual std::vector<std::reference_wrapper<Matrix>> parameters() { return {}; }
+        /**
+         * @brief Returns parameter gradients.
+         * @return Vector of gradient matrix references.
+         */
         virtual std::vector<std::reference_wrapper<Matrix>> param_gradients() { return {}; }
         
         // 添加参数更新辅助方法，避免虚函数调用开销
@@ -793,6 +814,13 @@ namespace nn
     // backward: gZ = 重排(grad_out)；grad_W = gZ×colᵀ；grad_b = 行和(gZ)；
     //           grad_col = Wᵀ×gZ → col2im 散射累加 → grad_x
     // 梯度语义：替换（zero 后填），与 Linear 一致。
+    /**
+     * @brief 2D convolution layer using im2col + GEMM algorithm.
+     *
+     * Implements spatial convolution with configurable kernel size, stride, and padding.
+     * Layout: input/output shape is (C*H*W, batch), weights are (C_out, C_in*k*k).
+     * Uses im2col transformation followed by matrix multiplication for efficiency.
+     */
     class Conv2D final : public Layer
     {
     private:
@@ -1003,6 +1031,14 @@ namespace nn
     // 输入/输出 (C*H*W, batch)；Hp = (H-pool)/stride+1，Wp 同理。
     // forward:  每 pool×pool 窗口取 max 并记录行索引；
     // backward: 梯度散射回 argmax 位置（重叠窗口共享 argmax 时累加）。
+    /**
+     * @brief 2D max pooling layer with argmax tracking for backpropagation.
+     *
+     * Downsamples spatial dimensions by taking the maximum value in each pooling window.
+     * Layout: input/output shape is (C*H*W, batch).
+     * Output dimensions: out_h = (in_h - pool) / stride + 1, same for width.
+     * Gradient flows back only to the max element in each window.
+     */
     class MaxPool2D final : public Layer
     {
     private:
@@ -1232,6 +1268,14 @@ namespace nn
     //             normed = x·rms_inv;  out = normed·γ
     //   backward: gy = g·γ;  gy_n = gy⊙normed;  m = (1/F)Σ_f gy_n;
     //             grad_x = (gy − m·normed)·rms_inv;  grad_γ = Σ_batch gy_n
+    /**
+     * @brief Root Mean Square Layer Normalization (LLaMA/Mistral style).
+     *
+     * Simpler than LayerNorm: no mean subtraction, no beta bias parameter.
+     * Normalizes by RMS: out = (x / sqrt(mean(x^2) + eps)) * gamma.
+     * More efficient than LayerNorm (fewer reductions and broadcasts).
+     * Commonly used in modern LLMs like LLaMA and Mistral.
+     */
     class RMSNorm final : public Layer
     {
     private:
@@ -1700,6 +1744,14 @@ namespace nn
     //   backward: grad_gate = g⊙up⊙s⊙(1 + gate⊙(1−s))
     //             grad_up   = g⊙gate⊙s
     //             两者拼回 (2·d_ff, batch)
+    /**
+     * @brief Swish-Gated Linear Unit activation (LLaMA-style).
+     *
+     * Gated activation function: out = SiLU(gate) * up, where SiLU(x) = x * sigmoid(x).
+     * Input shape: (2*d_ff, batch), split into gate (first d_ff rows) and up (last d_ff rows).
+     * Output shape: (d_ff, batch).
+     * Used in modern LLMs as a drop-in replacement for GELU in FFN blocks.
+     */
     class SwiGLU final : public Layer
     {
     private:
@@ -1769,6 +1821,13 @@ namespace nn
     // ── SwiGLUFeedForward（LLaMA 风格 FFN，移植自上游）──────────────────
     // Linear(d_model → 2·d_ff) → SwiGLU → Linear(d_ff → d_model)
     // 与 FeedForward（GELU 版）同构，可直接替换。
+    /**
+     * @brief Feed-forward network with SwiGLU activation (LLaMA-style).
+     *
+     * Architecture: Linear(d_model -> 2*d_ff) -> SwiGLU -> Linear(d_ff -> d_model).
+     * Drop-in replacement for FeedForward (which uses GELU).
+     * Commonly used in LLaMA and similar modern transformer architectures.
+     */
     class SwiGLUFeedForward final : public Layer
     {
     private:

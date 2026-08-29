@@ -18,6 +18,18 @@
 
 namespace nn
 {
+    /**
+     * @brief Clips gradient norm to prevent exploding gradients (PyTorch-style).
+     *
+     * Computes the total L2 norm across all gradients and scales them in-place if it exceeds max_norm.
+     * Formula: if ||g||_2 > max_norm, then g *= max_norm / (||g||_2 + eps).
+     *
+     * @param grads Vector of gradient matrix references to clip in-place.
+     * @param max_norm Maximum allowed gradient norm.
+     * @param eps Small constant for numerical stability (default 1e-6).
+     * @return Pre-clipping total gradient norm (before scaling).
+     * @throws std::runtime_error if gradient contains NaN or Inf.
+     */
     inline double clip_grad_norm_(
         std::vector<std::reference_wrapper<Matrix>> grads,
         double max_norm,

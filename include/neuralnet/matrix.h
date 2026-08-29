@@ -261,6 +261,16 @@ namespace nn
         // 等价于 (*this) * other.transpose() 但跳过显式 transpose 内存分配。
         // 形状：this = (M, K)，other = (N, K)，result = (M, N)。
         // 访问模式：A 行连续 + B 行连续（B^T 的列就是 B 的行），无需 b_block 转置。
+        /**
+         * @brief Matrix multiplication with transpose: this * other^T.
+         *
+         * Computes matrix product without explicit transpose memory allocation.
+         * Equivalent to (*this) * other.transpose() but more efficient.
+         *
+         * @param other Matrix to transpose and multiply (N, K).
+         * @return Result matrix (M, N) where this is (M, K).
+         * @throws std::invalid_argument if this->cols() != other.cols().
+         */
         [[nodiscard]] Matrix matmul_NT(const Matrix &other) const
         {
             if (cols_ != other.cols_)
@@ -318,6 +328,16 @@ namespace nn
         // 形状：this = (K, M)，other = (K, N)，result = (M, N)。
         // 访问模式：A 列连续（this^T 的行）+ B 列连续。把 A 的 (K_block × M_block)
         // 子块和 B 的 (K_block × N_block) 子块加载到栈数组，在内核里按 k 累加。
+        /**
+         * @brief Matrix multiplication with transpose: this^T * other.
+         *
+         * Computes matrix product without explicit transpose memory allocation.
+         * Equivalent to this.transpose() * other but more efficient.
+         *
+         * @param other Matrix to multiply (K, N).
+         * @return Result matrix (M, N) where this is (K, M).
+         * @throws std::invalid_argument if this->rows() != other.rows().
+         */
         [[nodiscard]] Matrix matmul_TN(const Matrix &other) const
         {
             if (rows_ != other.rows_)
@@ -384,6 +404,10 @@ namespace nn
             return result;
         }
 
+        /**
+         * @brief Scales all elements in-place by a scalar.
+         * @param scalar Scaling factor.
+         */
         void scale_inplace(double scalar) noexcept
         {
             nn::for_each(size(), data_.begin(), data_.end(),
@@ -391,6 +415,10 @@ namespace nn
         }
 
         // 逐元素加法 inplace
+        /**
+         * @brief Adds another matrix element-wise in-place.
+         * @param other Matrix to add (must have same shape, otherwise no-op).
+         */
         void add_inplace(const Matrix &other) noexcept
         {
             if (rows_ != other.rows_ || cols_ != other.cols_) return;
@@ -399,6 +427,10 @@ namespace nn
         }
 
         // 逐元素减法 inplace
+        /**
+         * @brief Subtracts another matrix element-wise in-place.
+         * @param other Matrix to subtract (must have same shape, otherwise no-op).
+         */
         void subtract_inplace(const Matrix &other) noexcept
         {
             if (rows_ != other.rows_ || cols_ != other.cols_) return;
@@ -407,6 +439,9 @@ namespace nn
         }
 
         // 填充零
+        /**
+         * @brief Fills the matrix with zeros.
+         */
         void zero() noexcept
         {
             std::fill(data_.begin(), data_.end(), 0.0);
@@ -422,6 +457,13 @@ namespace nn
             cols_ = cols;
         }
 
+        /**
+         * @brief Extracts a contiguous slice of rows.
+         * @param start_row Starting row index.
+         * @param num_rows Number of rows to extract.
+         * @return New matrix containing the specified rows.
+         * @throws std::out_of_range if slice exceeds matrix bounds.
+         */
         [[nodiscard]] Matrix row_slice(std::size_t start_row, std::size_t num_rows) const
         {
             if (start_row > rows_ || num_rows > rows_ - start_row)
@@ -433,6 +475,13 @@ namespace nn
             return result;
         }
 
+        /**
+         * @brief Copies rows from a slice matrix into this matrix.
+         * @param start_row Starting row index where slice will be copied.
+         * @param slice Matrix containing rows to copy.
+         * @throws std::out_of_range if slice exceeds matrix bounds.
+         * @throws std::invalid_argument if column count mismatch.
+         */
         void set_row_slice(std::size_t start_row, const Matrix &slice)
         {
             if (start_row > rows_ || slice.rows_ > rows_ - start_row)
