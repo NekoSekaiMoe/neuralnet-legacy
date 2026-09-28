@@ -4,6 +4,8 @@
 #include <neuralnet/lr_scheduler.h>
 #include <neuralnet/model/model.h>
 #include <neuralnet/model/io.h>
+#include <neuralnet/keyvalue_record.h>
+#include <neuralnet/threadpool.h>
 
 #include <cassert>
 #include <cmath>
@@ -2172,6 +2174,417 @@ static void test_summary_output_stream()
     std::puts("  [Model::summary] output stream PASSED");
 }
 
+// ══════════════════════════════════════════════════════════════════════════
+//  Muon 优化器（移植自上游 compute_optimizer）
+// ══════════════════════════════════════════════════════════════════════════
+static void test_muon()
+{
+    std::puts("  [Muon] rank-1 梯度的闭式解 ...");
+
+    // μ=0、无 Nesterov：v = g；rank-1 梯度 g = 2·e11 的 NS 输出 = e11
+    //（谱范数归一化方向不变），4×4 参数的形状缩放 = 0.2*sqrt(4) = 0.4：
+    // p_new = p − lr * 0.4 * e11
+    nn::Matrix p(4, 4, 0.0);
+    nn::Matrix g(4, 4, 0.0);
+    g.set_value_unchecked(0, 0, 2.0); // ||g||_F = 2 → NS(g) = x5 · e11（谱范数 x5）
+    nn::Muon muon({std::ref(p)}, {std::ref(g)}, /*lr=*/0.1, /*momentum=*/0.0,
+                  /*nesterov=*/false, /*ns_steps=*/5, /*ns_eps=*/1e-7);
+    muon.step();
+
+    // 精确对照：rank-1 情况下 NS 归约为一维迭代
+    //   x ← x·(a + b·x² + c·x⁴)，x0 = 1（归一化后）
+    double x = 1.0;
+    for (int t = 0; t < 5; ++t)
+    {
+        const double x2 = x * x;
+        x = x * (nn::Muon::kNsA + nn::Muon::kNsB * x2 + nn::Muon::kNsC * x2 * x2);
+    }
+    const double expect = -0.1 * 0.2 * std::sqrt(4.0) * x;
+    assert(std::fabs(p.at_unchecked(0, 0) - expect) < 1e-9);
+    for (std::size_t i = 1; i < p.size(); ++i)
+        assert(std::fabs(p.data()[i]) < 1e-12);
+
+    std::puts("  [Muon] rank-1 梯度的闭式解 PASSED");
+}
+
+static void test_muon_tall_matrix()
+{
+    std::puts("  [Muon] 高窄矩阵（列正交化分支） ...");
+
+    // (8, 2) 高窄参数：走 XᵀX 短边分支，同上应保持方向、缩放到谱范数 1
+    nn::Matrix p(8, 2, 0.0);
+    nn::Matrix g(8, 2, 0.0);
+    // ||g||_F = √3 → NS(g) = x5 · g/√3
+    g.set_value_unchecked(0, 0, 1.0);
+    g.set_value_unchecked(1, 0, 1.0);
+    g.set_value_unchecked(2, 0, 1.0);
+    nn::Muon muon({std::ref(p)}, {std::ref(g)}, 0.1, 0.0, false, 5, 1e-7);
+    muon.step();
+    // NS(g) = x5 · g/√3（rank-1，谱范数 x5）；scale = 0.2*sqrt(8)
+    double x = 1.0;
+    for (int t = 0; t < 5; ++t)
+    {
+        const double x2 = x * x;
+        x = x * (nn::Muon::kNsA + nn::Muon::kNsB * x2 + nn::Muon::kNsC * x2 * x2);
+    }
+    const double expect = -0.1 * 0.2 * std::sqrt(8.0) * x / std::sqrt(3.0);
+    assert(std::fabs(p.at_unchecked(0, 0) - expect) < 1e-9);
+    assert(std::fabs(p.at_unchecked(1, 0) - expect) < 1e-9);
+
+    std::puts("  [Muon] 高窄矩阵（列正交化分支） PASSED");
+}
+
+static void test_muon_quadratic_convergence()
+{
+    std::puts("  [Muon] 二次损失下降 ...");
+
+    nn::Matrix p = [&]
+    {
+        std::mt19937_64 rng(7);
+        std::normal_distribution<double> d(0.0, 1.0);
+        nn::Matrix m(6, 6);
+        for (std::size_t i = 0; i < m.size(); ++i)
+            m.data()[i] = d(rng);
+        return m;
+    }();
+    nn::Matrix g(6, 6);
+    nn::Muon muon({std::ref(p)}, {std::ref(g)}, 0.05);
+
+    double prev_norm = 1e30;
+    for (int it = 0; it < 20; ++it)
+    {
+        for (std::size_t i = 0; i < p.size(); ++i)
+            g.data()[i] = p.data()[i]; // ∇ ½Σp² = p
+        muon.step();
+        double norm = 0.0;
+        for (std::size_t i = 0; i < p.size(); ++i)
+            norm += p.data()[i] * p.data()[i];
+        norm = std::sqrt(norm);
+        assert(norm < prev_norm);
+        prev_norm = norm;
+    }
+
+    std::puts("  [Muon] 二次损失下降 PASSED");
+}
+
+// ══════════════════════════════════════════════════════════════════════════
+//  WarmupCosineLR 学习率调度器（移植自上游 cli_lr_scheduler）
+// ══════════════════════════════════════════════════════════════════════════
+static void test_warmup_cosine_lr()
+{
+    std::puts("  [WarmupCosineLR] 预热 + 余弦退火 ...");
+
+    // warmup=3, total=10, lr_max=1, lr_min=0
+    nn::WarmupCosineLR sched(/*lr_max=*/1.0, /*total=*/10, /*warmup=*/3, /*min=*/0.0);
+    auto near = [](double a, double b) { return std::fabs(a - b) < 1e-12; };
+
+    assert(near(sched.get_lr(), 1.0 / 3.0)); // epoch 0: 1*(0+1)/3
+    sched.step();
+    assert(near(sched.get_lr(), 2.0 / 3.0));
+    sched.step();
+    assert(near(sched.get_lr(), 3.0 / 3.0)); // 预热末达到峰值
+    sched.step();
+    // 余弦阶段起点：progress = 0 → lr = lr_max
+    assert(near(sched.get_lr(), 1.0));
+    for (int i = 0; i < 4; ++i)
+        sched.step();
+    // 当前 epoch = 7，progress = (7-3)/(10-3) = 4/7
+    const double expect = 0.5 * (1.0 + std::cos(M_PI * 4.0 / 7.0));
+    assert(near(sched.get_lr(), expect));
+
+    // 超出总轮数：钳制在 lr_min（cos 不回升）
+    for (int i = 0; i < 30; ++i)
+        sched.step();
+    assert(near(sched.get_lr(), 0.0));
+
+    // warmup=0：直接余弦
+    nn::WarmupCosineLR no_warm(2.0, 4, 0, 0.5);
+    assert(near(no_warm.get_lr(), 2.0)); // progress=0 → 峰值
+    no_warm.step();
+    no_warm.step();
+    no_warm.step();
+    no_warm.step();
+    assert(near(no_warm.get_lr(), 0.5)); // progress 钳制到 1 → min
+
+    std::puts("  [WarmupCosineLR] 预热 + 余弦退火 PASSED");
+}
+
+// ══════════════════════════════════════════════════════════════════════════
+//  KeyValueRecord（移植自上游 model_keyvalue_record）
+// ══════════════════════════════════════════════════════════════════════════
+static void test_keyvalue_record_roundtrip()
+{
+    std::puts("  [KeyValueRecord] 全类型序列化往返 ...");
+
+    nn::KeyValueRecord rec;
+    rec.set("u", uint64_t{123456789})
+        .set("d", 3.25)
+        .set("s", std::string("hello"))
+        .set("ua", std::vector<uint64_t>{1, 2, 3, 4294967296ULL})
+        .set("da", std::vector<double>{1.5, -2.5, 0.0});
+
+    const std::string bytes = rec.serialize();
+    nn::KeyValueRecord back = nn::KeyValueRecord::parse(bytes);
+
+    uint64_t u = 0;
+    double d = 0;
+    std::string s;
+    std::vector<uint64_t> ua;
+    std::vector<double> da;
+    assert(back.get("u", u) && u == 123456789);
+    assert(back.get("d", d) && d == 3.25);
+    assert(back.get("s", s) && s == "hello");
+    assert(back.get("ua", ua) && ua.size() == 4 && ua[3] == 4294967296ULL);
+    assert(back.get("da", da) && da.size() == 3 && da[1] == -2.5);
+    assert(back.has("u") && !back.has("missing"));
+    assert(!back.get("u", d)); // 类型不符 → false
+
+    std::puts("  [KeyValueRecord] 全类型序列化往返 PASSED");
+}
+
+static void test_keyvalue_record_skips_unknown_type()
+{
+    std::puts("  [KeyValueRecord] 未知类型按长度跳过（向前兼容） ...");
+
+    // 手工构造：field_count=2，第一条 type=99（未知），第二条正常 UInt
+    std::string bytes;
+    auto u32 = [&](uint32_t v)
+    {
+        for (int i = 0; i < 4; ++i)
+            bytes.push_back(static_cast<char>((v >> (8 * i)) & 0xFF));
+    };
+    u32(2);
+    // ── field 1: key="x", type=99, value_len=5, value="AAAAA" ──
+    u32(1); bytes.push_back('x');
+    bytes.push_back(static_cast<char>(99));
+    u32(5); bytes.append("AAAAA");
+    // ── field 2: key="y", type=0(UInt), value_len=8, value=42 ──
+    u32(1); bytes.push_back('y');
+    bytes.push_back(static_cast<char>(0));
+    u32(8);
+    for (int i = 0; i < 8; ++i)
+        bytes.push_back(static_cast<char>((uint64_t{42} >> (8 * i)) & 0xFF));
+
+    nn::KeyValueRecord rec = nn::KeyValueRecord::parse(bytes);
+    uint64_t y = 0;
+    assert(!rec.has("x"));                  // 未知类型被跳过
+    assert(rec.get("y", y) && y == 42); // 后续字段不受影响
+
+    std::puts("  [KeyValueRecord] 未知类型按长度跳过 PASSED");
+}
+
+// ══════════════════════════════════════════════════════════════════════════
+//  模型序列化 v4（自描述键值格式）
+// ══════════════════════════════════════════════════════════════════════════
+static void test_model_save_load_v4()
+{
+    std::puts("  [model io v4] 自描述键值格式往返 ...");
+
+    nn::Model model;
+    model.add<nn::Linear>(4, 3);
+    model.add<nn::BatchNorm1d>(3);
+
+    // 前向一次更新 running stats 便于验证
+    nn::Matrix x(4, 8);
+    std::mt19937_64 rng(3);
+    std::normal_distribution<double> d(0.0, 1.0);
+    for (std::size_t i = 0; i < x.size(); ++i)
+        x.data()[i] = d(rng);
+    model.train();
+    (void)model.forward(x);
+    model.eval();
+
+    std::stringstream ss;
+    model.save(ss, std::nullopt, /*format_version=*/4);
+
+    // 校验版本号 = 4
+    uint32_t magic = 0, version = 0;
+    ss.read(reinterpret_cast<char *>(&magic), sizeof(magic));
+    ss.read(reinterpret_cast<char *>(&version), sizeof(version));
+    assert(magic == 0x4E4E4E4E);
+    assert(version == 4);
+
+    // 加载到同结构新模型
+    ss.seekg(0);
+    nn::Model loaded;
+    loaded.add<nn::Linear>(4, 3);
+    loaded.add<nn::BatchNorm1d>(3);
+    loaded.load(ss);
+    loaded.eval(); // 与源模型同模式（eval 使用 running stats）
+
+    auto src_params = model.parameters();
+    auto dst_params = loaded.parameters();
+    for (std::size_t i = 0; i < src_params.size(); ++i)
+        for (std::size_t j = 0; j < src_params[i].get().size(); ++j)
+            assert(src_params[i].get().data()[j] == dst_params[i].get().data()[j]);
+
+    // 推理一致性（running stats 已恢复）
+    nn::Matrix y1 = model.forward(x);
+    nn::Matrix y2 = loaded.forward(x);
+    for (std::size_t i = 0; i < y1.size(); ++i)
+        assert(y1.data()[i] == y2.data()[i]);
+
+    std::puts("  [model io v4] 自描述键值格式往返 PASSED");
+}
+
+static void test_model_v4_spec_roundtrip()
+{
+    std::puts("  [model io v4] ModelSpec 键值读写 ...");
+
+    const std::string path = "/tmp/nn_test_model_v4_spec.bin";
+    nn::Model model = nn::build_gpt_model(13, 8, 6, 2, 12, 1);
+    auto spec = nn::make_gpt_spec(13, 8, 6, 2, 12, 1);
+    model.save(path, spec, /*format_version=*/4);
+
+    nn::ModelSpec loaded = nn::read_model_spec(path);
+    assert(loaded.type == nn::ModelType::GPT);
+    assert(loaded.vocab_size == 13);
+    assert(loaded.d_model == 8);
+    assert(loaded.seq_len == 6);
+    assert(loaded.num_heads == 2);
+    assert(loaded.d_ff == 12);
+    assert(loaded.num_layers == 1);
+
+    std::remove(path.c_str());
+    std::puts("  [model io v4] ModelSpec 键值读写 PASSED");
+}
+
+// ══════════════════════════════════════════════════════════════════════════
+//  自包含线程池（移植自上游 core_threadpool）
+// ══════════════════════════════════════════════════════════════════════════
+static void test_threadpool_parallel_for()
+{
+    std::puts("  [ThreadPool] parallel_for 全量执行 + 归约 ...");
+
+    auto &pool = nn::ThreadPool::global();
+    constexpr std::size_t kN = 10000;
+
+    std::vector<int> hits(kN, 0);
+    pool.parallel_for(kN, [&](std::size_t i) { hits[i] = 1; });
+    for (std::size_t i = 0; i < kN; ++i)
+        assert(hits[i] == 1);
+
+    // 确定性归约：块序合并 → 与串行结果完全一致
+    std::vector<double> v(kN);
+    for (std::size_t i = 0; i < kN; ++i)
+        v[i] = static_cast<double>(i) * 0.5;
+    const double sum = pool.parallel_transform_reduce(
+        kN, v.data(), 0.0,
+        [](double a, double b) { return a + b; },
+        [](double x) { return x * x; });
+    double expect = 0.0;
+    for (std::size_t i = 0; i < kN; ++i)
+        expect += v[i] * v[i];
+    assert(sum == expect); // 确定性：逐位一致
+
+    // 异常透传
+    bool threw = false;
+    try
+    {
+        pool.parallel_for(64, [](std::size_t i)
+                          { if (i == 31) throw std::runtime_error("boom"); });
+    }
+    catch (const std::runtime_error &)
+    {
+        threw = true;
+    }
+    assert(threw);
+
+    std::printf("  [ThreadPool] workers=%zu ... PASSED\n", pool.num_workers());
+}
+
+// ══════════════════════════════════════════════════════════════════════════
+//  GEMM 微内核（移植自上游 algebra_matrix）：奇形尺寸正确性 + 与朴素对拍
+// ══════════════════════════════════════════════════════════════════════════
+static nn::Matrix naive_matmul(const nn::Matrix &a, const nn::Matrix &b)
+{
+    nn::Matrix c(a.rows(), b.cols());
+    for (std::size_t i = 0; i < a.rows(); ++i)
+        for (std::size_t j = 0; j < b.cols(); ++j)
+        {
+            double s = 0.0;
+            for (std::size_t k = 0; k < a.cols(); ++k)
+                s += a.at_unchecked(i, k) * b.at_unchecked(k, j);
+            c.set_value_unchecked(i, j, s);
+        }
+    return c;
+}
+
+static void test_gemm_microkernel_odd_shapes()
+{
+    std::puts("  [GEMM microkernel] 奇形尺寸对拍 ...");
+
+    // 覆盖：非 4 对齐的行（尾块标量路径）、非 8 对齐的列（零填充）、
+    // 跨多个 K 块、单块尺寸等
+    const std::size_t shapes[][2][2] = {
+        {{67, 53}, {53, 41}},   // 全奇数，多块
+        {{128, 64}, {64, 128}}, // 整块边界
+        {{5, 200}, {200, 3}},   // 宽扁 + 窄 N
+        {{1, 1}, {1, 1}},       // 最小
+        {{70, 130}, {130, 7}},  // j_len < MK_RB
+        {{257, 65}, {65, 9}},   // 大奇数行
+    };
+
+    std::mt19937_64 rng(99);
+    std::normal_distribution<double> dist(0.0, 1.0);
+
+    for (const auto &shape : shapes)
+    {
+        const std::size_t M = shape[0][0], K = shape[0][1];
+        const std::size_t N = shape[1][1];
+        nn::Matrix a(M, K), b(K, N);
+        for (std::size_t i = 0; i < a.size(); ++i)
+            a.data()[i] = dist(rng);
+        for (std::size_t i = 0; i < b.size(); ++i)
+            b.data()[i] = dist(rng);
+
+        nn::Matrix c = a * b;
+        nn::Matrix ref = naive_matmul(a, b);
+        double worst = 0.0;
+        for (std::size_t i = 0; i < c.size(); ++i)
+            worst = std::max(worst, std::fabs(c.data()[i] - ref.data()[i]));
+        std::printf("    %zux%zu * %zux%zu : max abs err %.2e\n", M, K, K, N, worst);
+        assert(worst < 1e-10);
+    }
+
+    std::puts("  [GEMM microkernel] 奇形尺寸对拍 PASSED");
+}
+
+static void test_matmul_tn_microkernel()
+{
+    std::puts("  [matmul_TN microkernel] 奇形尺寸对拍 ...");
+
+    // a^T * b：a (K, M), b (K, N)
+    std::mt19937_64 rng(101);
+    std::normal_distribution<double> dist(0.0, 1.0);
+    const std::size_t dims[][3] = {
+        {53, 67, 41}, // 全奇数
+        {64, 128, 8}, // j_len < MK_RB 的整块
+        {200, 5, 130},
+        {65, 257, 9},
+    };
+
+    for (const auto &dim : dims)
+    {
+        const std::size_t K = dim[0], M = dim[1], N = dim[2];
+        nn::Matrix a(K, M), b(K, N);
+        for (std::size_t i = 0; i < a.size(); ++i)
+            a.data()[i] = dist(rng);
+        for (std::size_t i = 0; i < b.size(); ++i)
+            b.data()[i] = dist(rng);
+
+        nn::Matrix c = a.matmul_TN(b); // (M, N)
+        nn::Matrix ref = naive_matmul(a.transpose(), b);
+        double worst = 0.0;
+        for (std::size_t i = 0; i < c.size(); ++i)
+            worst = std::max(worst, std::fabs(c.data()[i] - ref.data()[i]));
+        std::printf("    TN %zu×%zu×%zu : max abs err %.2e\n", M, N, K, worst);
+        assert(worst < 1e-10);
+    }
+
+    std::puts("  [matmul_TN microkernel] 奇形尺寸对拍 PASSED");
+}
+
 // ── 测试注册表 ──────────────────────────────────────────────────────────────
 struct test_entry
 {
@@ -2248,6 +2661,17 @@ static const test_entry all_tests[] = {
     {"summary_contains_total_params",    test_summary_contains_total_params},
     {"summary_contains_all_layer_names", test_summary_contains_all_layer_names},
     {"summary_output_stream",            test_summary_output_stream},
+    {"muon",                             test_muon},
+    {"muon_tall_matrix",                 test_muon_tall_matrix},
+    {"muon_quadratic_convergence",       test_muon_quadratic_convergence},
+    {"warmup_cosine_lr",                 test_warmup_cosine_lr},
+    {"keyvalue_record_roundtrip",        test_keyvalue_record_roundtrip},
+    {"keyvalue_record_skips_unknown_type", test_keyvalue_record_skips_unknown_type},
+    {"model_save_load_v4",               test_model_save_load_v4},
+    {"model_v4_spec_roundtrip",          test_model_v4_spec_roundtrip},
+    {"threadpool_parallel_for",          test_threadpool_parallel_for},
+    {"gemm_microkernel_odd_shapes",      test_gemm_microkernel_odd_shapes},
+    {"matmul_tn_microkernel",            test_matmul_tn_microkernel},
 };
 
 static constexpr std::size_t num_tests = sizeof(all_tests) / sizeof(all_tests[0]);

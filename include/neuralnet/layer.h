@@ -14,6 +14,7 @@
 #include <utility>
 #include <vector>
 #include <neuralnet/matrix.h>
+#include <neuralnet/keyvalue_record.h>
 
 #include <neuralnet/nn/config.h>
 
@@ -69,6 +70,13 @@ namespace nn
         virtual void save_state(std::ostream & /*os*/) const {}
         virtual void load_state(std::istream & /*is*/) {}
         virtual bool has_state() const { return false; }
+
+        // ── 持久化 v4：自描述键值状态（移植自上游 KeyValueRecord）───────
+        // 与 save_state 等价的 KV 版本：字段自带 key + 类型 + 长度，未知字段
+        // 可按长度跳过（向前兼容），新增字段不破坏旧文件读取。
+        // 默认空操作；有状态的层（如 BatchNorm1d）同时覆盖两套接口。
+        virtual void save_state_kv(KeyValueRecord & /*rec*/) const {}
+        virtual void load_state_kv(const KeyValueRecord & /*rec*/) {}
 
         // ── 参数计数 (F4) ──────────────────────────────────────────────────────
         // 返回本层可训练参数的元素总数（不含 running stats 等非可训练状态）。
@@ -885,6 +893,31 @@ namespace nn
             is.read(reinterpret_cast<char *>(&num_batches_tracked_),
                     sizeof(num_batches_tracked_));
         }
+
+        // v4：自描述键值状态（与 save_state 内容等价，字段名 + 类型 + 长度）
+        void save_state_kv(KeyValueRecord &rec) const override
+        {
+            rec.set("layer", std::string(name()))
+                .set("num_batches_tracked", static_cast<uint64_t>(num_batches_tracked_))
+                .set("running_mean", std::vector<double>(running_mean_.data().begin(),
+                                                          running_mean_.data().end()))
+                .set("running_var", std::vector<double>(running_var_.data().begin(),
+                                                        running_var_.data().end()));
+        }
+
+        void load_state_kv(const KeyValueRecord &rec) override
+        {
+            std::vector<double> mean, var;
+            uint64_t count = 0;
+            if (!rec.get("num_batches_tracked", count)
+                || !rec.get("running_mean", mean) || !rec.get("running_var", var))
+                throw std::runtime_error("BatchNorm1d::load_state_kv: missing fields");
+            if (mean.size() != running_mean_.size() || var.size() != running_var_.size())
+                throw std::runtime_error("BatchNorm1d::load_state_kv: shape mismatch");
+            std::copy(mean.begin(), mean.end(), running_mean_.data().begin());
+            std::copy(var.begin(), var.end(), running_var_.data().begin());
+            num_batches_tracked_ = static_cast<std::size_t>(count);
+        }
     };
 
     // ── BatchNorm2d ──────────────────────────────────────────────────────────
@@ -1669,6 +1702,131 @@ const char *name() const override { return "Conv2D"; }
         Matrix backward(const Matrix &grad_output) override { return grad_output; }
     };
 
+    // ── RotaryEmbedding（RoPE 旋转位置编码，移植自上游 compute_layer_attention）──
+    // LLaMA 式 rotate_half 实现：cos/sin 沿 d 维 = cat(freqs, freqs)（前后半相同），
+    // 配合 rotate_half（前后半交换+前半取负）构成 2×2 旋转块：
+    //   forward:  out = x·cos + rotate_half(x)·sin
+    //   backward: out = x·cos − rotate_half(x)·sin（旋转正交，逆 = 反角）
+    // 位置表 (head_dim × seq) 按需重建；增量推理用 apply_column 按单列位置旋转。
+    /**
+     * @brief Rotary Position Embedding (RoPE), LLaMA-style rotate_half formulation.
+     *
+     * Maintains a (head_dim x seq_len) cos/sin cache table rebuilt on demand.
+     * forward rotates by +theta; backward (gradient pass) rotates by -theta
+     * (the rotation is orthogonal, so its inverse is the transposed rotation).
+     */
+    class RotaryEmbedding
+    {
+    private:
+        std::size_t head_dim_;
+        double base_;
+        std::size_t cached_len_ = 0; // cos/sin 表已覆盖的位置数
+        Matrix cos_cache_;           // (head_dim, cached_len_)
+        Matrix sin_cache_;
+
+        static void validate_head_dim(std::size_t head_dim)
+        {
+            if (head_dim == 0 || head_dim % 2 != 0)
+                throw std::invalid_argument(
+                    "RotaryEmbedding: head_dim must be positive and even");
+        }
+
+        void fill_pos_column_(Matrix &c, Matrix &s, std::size_t pos, std::size_t col) const
+        {
+            const std::size_t half = head_dim_ / 2;
+            const double pd = static_cast<double>(pos);
+            for (std::size_t j = 0; j < half; ++j)
+            {
+                const double theta = pd / std::pow(
+                    base_, 2.0 * static_cast<double>(j) / static_cast<double>(head_dim_));
+                const double cv = std::cos(theta);
+                const double sv = std::sin(theta);
+                c.set_value_unchecked(j, col, cv);
+                c.set_value_unchecked(half + j, col, cv);
+                s.set_value_unchecked(j, col, sv);
+                s.set_value_unchecked(half + j, col, sv);
+            }
+        }
+
+        // 旋转 m 的行 [row_off, row_off+head_dim_) 中列 col 的一对元素，
+        // 位置取 cos/sin 表的第 pos 列。
+        void rotate_(Matrix &m, std::size_t row_off, std::size_t col,
+                     std::size_t pos, bool backward) const
+        {
+            const std::size_t half = head_dim_ / 2;
+            for (std::size_t j = 0; j < half; ++j)
+            {
+                const double cv = cos_cache_.at_unchecked(j, pos);
+                const double sv = sin_cache_.at_unchecked(j, pos);
+                const double x1 = m.at_unchecked(row_off + j, col);
+                const double x2 = m.at_unchecked(row_off + half + j, col);
+                if (backward)
+                {
+                    m.set_value_unchecked(row_off + j, col, x1 * cv + x2 * sv);
+                    m.set_value_unchecked(row_off + half + j, col, x2 * cv - x1 * sv);
+                }
+                else
+                {
+                    m.set_value_unchecked(row_off + j, col, x1 * cv - x2 * sv);
+                    m.set_value_unchecked(row_off + half + j, col, x1 * sv + x2 * cv);
+                }
+            }
+        }
+
+    public:
+        explicit RotaryEmbedding(std::size_t head_dim = 0, double base = 10000.0)
+            : head_dim_(head_dim), base_(base)
+        {
+            if (head_dim_ != 0)
+                validate_head_dim(head_dim_);
+        }
+
+        [[nodiscard]] std::size_t head_dim() const noexcept { return head_dim_; }
+
+        /**
+         * Rebuilds the cos/sin table to cover positions [0, len) if needed.
+         * Grows monotonically: incremental inference extends the table as the
+         * sequence grows (no length limit, unlike learned absolute embeddings).
+         */
+        void ensure(std::size_t len)
+        {
+            validate_head_dim(head_dim_);
+            if (len <= cached_len_)
+                return;
+            Matrix c(head_dim_, len), s(head_dim_, len);
+            for (std::size_t pos = 0; pos < len; ++pos)
+                fill_pos_column_(c, s, pos, pos);
+            cos_cache_ = std::move(c);
+            sin_cache_ = std::move(s);
+            cached_len_ = len;
+        }
+
+        /**
+         * Rotates rows [row_off, row_off + head_dim) of m in place.
+         * Column j uses position j (full-forward convention).
+         * @param backward true applies the inverse rotation (gradient pass).
+         */
+        void apply_inplace(Matrix &m, std::size_t row_off, std::size_t seq,
+                           bool backward = false)
+        {
+            ensure(seq);
+            for (std::size_t col = 0; col < seq; ++col)
+                rotate_(m, row_off, col, col, backward);
+        }
+
+        /**
+         * Rotates a single column (incremental inference): column col of m at
+         * absolute position pos. Requires pos < cached_len_ (call ensure first).
+         */
+        void apply_column(Matrix &m, std::size_t row_off, std::size_t col,
+                          std::size_t pos, bool backward = false)
+        {
+            if (pos >= cached_len_)
+                ensure(pos + 1);
+            rotate_(m, row_off, col, pos, backward);
+        }
+    };
+
     // ── MultiHeadAttention ───────────────────────────────────────────────────
     class MultiHeadAttention final : public Layer
     {
@@ -1678,6 +1836,11 @@ const char *name() const override { return "Conv2D"; }
         std::size_t head_dim_;
         double scale_;
         bool causal_;
+        bool use_rope_;
+        bool use_alibi_;
+        RotaryEmbedding rope_;
+        std::vector<double> alibi_slopes_;
+        std::vector<std::size_t> doc_ids_; // 每位置文档 id（空 = 未启用 doc 掩码）
 
         Matrix W_q_, W_k_, W_v_, W_o_;
         Matrix dW_q_, dW_k_, dW_v_, dW_o_;
@@ -1685,6 +1848,13 @@ const char *name() const override { return "Conv2D"; }
         Matrix input_cache_;
         Matrix Q_cache_, K_cache_, V_cache_, concat_cache_;
         std::vector<Matrix> attn_cache_;
+
+        // ── KV cache（增量推理，转置布局：第 i 行 = 位置 i 的 K/V 向量）──
+        // 追加新 token = 追加一行，均摊 O(d_model)；均摊容量倍增。
+        std::vector<double> kt_flat_, vt_flat_; // cache_cap_ × d_model 行主序
+        std::size_t cache_len_ = 0;
+        std::size_t cache_cap_ = 0;
+        std::vector<std::size_t> cache_doc_;
 
         inline static thread_local std::mt19937_64 rng_{std::random_device{}()};
 
@@ -1750,12 +1920,83 @@ const char *name() const override { return "Conv2D"; }
             return d_model / num_heads;
         }
 
+        // ── ALiBi 斜率（Press et al., 2021，移植自上游 FoldAttnMask）──
+        // 2 的幂头数：slopes[i] = 2^(−8(i+1)/h)；非幂头数：先取 ≤h 的最大 2 幂
+        // 的完整斜率，再递归取 2·closest 斜率的隔行子集补齐。
+        static std::vector<double> alibi_slopes_power_of_two_(std::size_t heads)
+        {
+            std::vector<double> slopes;
+            slopes.reserve(heads);
+            for (std::size_t i = 0; i < heads; ++i)
+                slopes.push_back(std::pow(
+                    2.0, -8.0 * static_cast<double>(i + 1) / static_cast<double>(heads)));
+            return slopes;
+        }
+
+        static std::vector<double> make_alibi_slopes_(std::size_t heads)
+        {
+            if (heads > 0 && (heads & (heads - 1)) == 0)
+                return alibi_slopes_power_of_two_(heads);
+            std::size_t closest = 1;
+            while (closest * 2 < heads)
+                closest *= 2;
+            std::vector<double> slopes = alibi_slopes_power_of_two_(closest);
+            const std::vector<double> extra = alibi_slopes_power_of_two_(2 * closest);
+            for (std::size_t i = 0; slopes.size() < heads && i < extra.size(); i += 2)
+                slopes.push_back(extra[i]);
+            return slopes;
+        }
+
+        // 掩码 + ALiBi 偏置（forward 用）：causal 未来位 + 跨文档位 → −1e9；
+        // 未掩码位若启用 ALiBi 则加 slope_h·(j−i) 线性偏置（j≤i 时 ≤0）。
+        void apply_score_mask_(Matrix &scores, std::size_t sl, std::size_t head) const
+        {
+            const bool use_doc = doc_ids_.size() == sl;
+            for (std::size_t i = 0; i < sl; ++i)
+            {
+                for (std::size_t j = 0; j < sl; ++j)
+                {
+                    const bool masked = (causal_ && j > i)
+                        || (use_doc && doc_ids_[i] != doc_ids_[j]);
+                    if (masked)
+                        scores.set_value_unchecked(i, j, -1e9);
+                    else if (use_alibi_)
+                        scores.set_value_unchecked(
+                            i, j,
+                            scores.at_unchecked(i, j)
+                                + alibi_slopes_[head]
+                                      * static_cast<double>(
+                                            static_cast<std::ptrdiff_t>(j)
+                                            - static_cast<std::ptrdiff_t>(i)));
+                }
+            }
+        }
+
+        // 掩码位梯度清零（backward 用，条件与 forward 掩码一致）
+        void zero_masked_grads_(Matrix &grad_scores, std::size_t sl) const
+        {
+            const bool use_doc = doc_ids_.size() == sl;
+            if (!causal_ && !use_doc)
+                return;
+            for (std::size_t i = 0; i < sl; ++i)
+                for (std::size_t j = 0; j < sl; ++j)
+                    if ((causal_ && j > i) || (use_doc && doc_ids_[i] != doc_ids_[j]))
+                        grad_scores.set_value_unchecked(i, j, 0.0);
+        }
+
     public:
-        MultiHeadAttention(std::size_t d_model, std::size_t num_heads, bool causal = false)
+        MultiHeadAttention(std::size_t d_model, std::size_t num_heads,
+                           bool causal = false, bool use_rope = false,
+                           bool use_alibi = false)
             : d_model_(d_model), num_heads_(num_heads),
               head_dim_(validated_head_dim(d_model, num_heads)),
               scale_(1.0 / std::sqrt(static_cast<double>(head_dim_))),
               causal_(causal),
+              use_rope_(use_rope),
+              use_alibi_(use_alibi),
+              rope_(use_rope ? head_dim_ : 0),
+              alibi_slopes_(use_alibi ? make_alibi_slopes_(num_heads)
+                                      : std::vector<double>{}),
               W_q_(xavier_init(d_model, d_model)),
               W_k_(xavier_init(d_model, d_model)),
               W_v_(xavier_init(d_model, d_model)),
@@ -1789,6 +2030,17 @@ const char *name() const override { return "Conv2D"; }
             K_cache_ = W_k_ * input;
             V_cache_ = W_v_ * input;
 
+            // RoPE：投影后按头旋转 Q/K（V 不旋转）；列 j 即位置 j。
+            if (use_rope_)
+            {
+                rope_.ensure(sl);
+                for (std::size_t h = 0; h < num_heads_; ++h)
+                {
+                    rope_.apply_inplace(Q_cache_, h * head_dim_, sl);
+                    rope_.apply_inplace(K_cache_, h * head_dim_, sl);
+                }
+            }
+
             concat_cache_ = Matrix(d_model_, sl);
             attn_cache_.resize(num_heads_);
 
@@ -1801,12 +2053,7 @@ const char *name() const override { return "Conv2D"; }
 
                 Matrix scores = Q_h.matmul_TN(K_h);
                 scores.scale_inplace(scale_);
-                if (causal_)
-                {
-                    for (std::size_t i = 0; i < sl; ++i)
-                        for (std::size_t j = i + 1; j < sl; ++j)
-                            scores.set_value_unchecked(i, j, -1e9);
-                }
+                apply_score_mask_(scores, sl, h);
                 softmax_rows_inplace(scores);
                 attn_cache_[h] = scores;
 
@@ -1842,12 +2089,7 @@ const char *name() const override { return "Conv2D"; }
                 Matrix grad_scores = softmax_backward_rows(grad_attn, attn_h);
                 grad_scores.scale_inplace(scale_);
 
-                if (causal_)
-                {
-                    for (std::size_t i = 0; i < sl; ++i)
-                        for (std::size_t j = i + 1; j < sl; ++j)
-                            grad_scores.set_value_unchecked(i, j, 0.0);
-                }
+                zero_masked_grads_(grad_scores, sl);
 
                 Matrix grad_Q_h = K_h.matmul_NT(grad_scores);
                 Matrix grad_K_h = Q_h * grad_scores;
@@ -1855,6 +2097,17 @@ const char *name() const override { return "Conv2D"; }
                 grad_Q.set_row_slice(off, grad_Q_h);
                 grad_K.set_row_slice(off, grad_K_h);
                 grad_V.set_row_slice(off, grad_V_h);
+            }
+
+            // RoPE 梯度回传：grad_Q/grad_K 目前是旋转后空间的梯度，
+            // 逆旋转（−θ）回到投影空间后再对 W_q/W_k 求梯度。
+            if (use_rope_)
+            {
+                for (std::size_t h = 0; h < num_heads_; ++h)
+                {
+                    rope_.apply_inplace(grad_Q, h * head_dim_, sl, /*backward=*/true);
+                    rope_.apply_inplace(grad_K, h * head_dim_, sl, /*backward=*/true);
+                }
             }
 
             dW_q_ = grad_Q.matmul_NT(input_cache_);
@@ -1865,6 +2118,142 @@ const char *name() const override { return "Conv2D"; }
             grad_input.add_inplace(W_k_.matmul_TN(grad_K));
             grad_input.add_inplace(W_v_.matmul_TN(grad_V));
             return grad_input;
+        }
+
+        // ── 增量推理（KV cache，移植自上游 forward_step）──────────────────
+        // 逐 token 追加 K/V 到缓存，仅计算新位置的注意力（因果窗口 [0, pos]
+        // 天然满足掩码，无需显式 −1e9）。K/V 以转置布局（行 = 位置）缓存，
+        // 追加 = 行追加，均摊 O(d_model)；生成 n 个 token 的总代价从 O(n²·d)
+        // 全量重前向降为 O(n²·d) 仅注意力 + O(n·d²) 投影。
+        /**
+         * @brief Clears the incremental-inference KV cache.
+         *
+         * Must be called before starting a new sequence (fresh prompt).
+         * Does not touch training caches (input_cache_ / Q_cache_ / ...).
+         */
+        void clear_cache() noexcept
+        {
+            cache_len_ = 0;
+            cache_doc_.clear();
+        }
+
+        [[nodiscard]] std::size_t cache_length() const noexcept { return cache_len_; }
+
+        /**
+         * @brief Sets per-position document ids for the document mask.
+         *
+         * When set (and covering the current sequence length), position i may
+         * only attend to positions j with doc_ids[j] == doc_ids[i] (plus the
+         * causal mask). Positions beyond the vector length fall back to id 0.
+         */
+        void set_document_ids(const std::vector<std::size_t> &doc_ids)
+        {
+            doc_ids_ = doc_ids;
+        }
+
+        /**
+         * @brief Incremental forward pass over cached keys/values.
+         *
+         * @param x_new Input features, shape (d_model, n_new). Typically n_new
+         *              = 1 during generation, or the full prompt for prefill.
+         * @return Output (d_model, n_new), same as a full forward restricted
+n         *         to the new positions.
+         * @throws std::invalid_argument on shape mismatch or empty input.
+         */
+        Matrix forward_step(const Matrix &x_new)
+        {
+            if (x_new.rows() != d_model_)
+                throw std::invalid_argument("MHA forward_step: input rows != d_model");
+            const std::size_t n_new = x_new.cols();
+            if (n_new == 0)
+                throw std::invalid_argument("MHA forward_step: empty input");
+
+            Matrix Q_all = W_q_ * x_new;
+            Matrix K_all = W_k_ * x_new;
+            Matrix V_all = W_v_ * x_new;
+            Matrix out(d_model_, n_new);
+
+            for (std::size_t t = 0; t < n_new; ++t)
+            {
+                const std::size_t pos = cache_len_;
+
+                if (use_rope_)
+                {
+                    rope_.ensure(pos + 1);
+                    for (std::size_t h = 0; h < num_heads_; ++h)
+                    {
+                        rope_.apply_column(Q_all, h * head_dim_, t, pos);
+                        rope_.apply_column(K_all, h * head_dim_, t, pos);
+                    }
+                }
+
+                // 追加 K/V 行（容量倍增，均摊 O(d_model)）
+                if (pos >= cache_cap_)
+                {
+                    const std::size_t new_cap = cache_cap_ == 0 ? 8 : cache_cap_ * 2;
+                    kt_flat_.resize(new_cap * d_model_);
+                    vt_flat_.resize(new_cap * d_model_);
+                    cache_cap_ = new_cap;
+                }
+                for (std::size_t k = 0; k < d_model_; ++k)
+                {
+                    kt_flat_[pos * d_model_ + k] = K_all.at_unchecked(k, t);
+                    vt_flat_[pos * d_model_ + k] = V_all.at_unchecked(k, t);
+                }
+                cache_doc_.push_back(doc_ids_.size() > pos ? doc_ids_[pos] : 0);
+                ++cache_len_;
+
+                for (std::size_t h = 0; h < num_heads_; ++h)
+                {
+                    const std::size_t off = h * head_dim_;
+                    const bool use_doc = doc_ids_.size() > pos;
+                    const std::size_t cur_doc = cache_doc_[pos];
+
+                    // scores[i] = scale · (q · k_i) + 掩码/偏置，i ∈ [0, pos]
+                    std::vector<double> scores(pos + 1);
+                    double max_s = -std::numeric_limits<double>::infinity();
+                    for (std::size_t i = 0; i <= pos; ++i)
+                    {
+                        double s;
+                        if (use_doc && cache_doc_[i] != cur_doc)
+                        {
+                            s = -1e9;
+                        }
+                        else
+                        {
+                            s = 0.0;
+                            for (std::size_t k = 0; k < head_dim_; ++k)
+                                s += Q_all.at_unchecked(off + k, t)
+                                     * kt_flat_[i * d_model_ + off + k];
+                            s *= scale_;
+                            if (use_alibi_)
+                                s += alibi_slopes_[h]
+                                     * static_cast<double>(
+                                           static_cast<std::ptrdiff_t>(i)
+                                           - static_cast<std::ptrdiff_t>(pos));
+                        }
+                        scores[i] = s;
+                        if (s > max_s)
+                            max_s = s;
+                    }
+
+                    // softmax（数值稳定）+ 加权求和 V
+                    double sum_exp = 0.0;
+                    for (std::size_t i = 0; i <= pos; ++i)
+                    {
+                        scores[i] = std::exp(scores[i] - max_s);
+                        sum_exp += scores[i];
+                    }
+                    for (std::size_t k = 0; k < head_dim_; ++k)
+                    {
+                        double acc = 0.0;
+                        for (std::size_t i = 0; i <= pos; ++i)
+                            acc += scores[i] * vt_flat_[i * d_model_ + off + k];
+                        out.set_value_unchecked(off + k, t, acc / sum_exp);
+                    }
+                }
+            }
+            return W_o_ * out;
         }
     };
 
@@ -2288,8 +2677,9 @@ const char *name() const override { return "Conv2D"; }
 
 
     public:
-        GPTBlock(std::size_t d_model, std::size_t num_heads, std::size_t d_ff)
-            : self_attn_(d_model, num_heads, true),
+        GPTBlock(std::size_t d_model, std::size_t num_heads, std::size_t d_ff,
+                 bool use_rope = false, bool use_alibi = false)
+            : self_attn_(d_model, num_heads, true, use_rope, use_alibi),
               norm1_(d_model),
               ff_(d_model, d_ff),
               norm2_(d_model)
@@ -2355,6 +2745,27 @@ const char *name() const override { return "Conv2D"; }
 
             return grad_input;
         }
+
+        // ── 增量推理（KV cache）：透传给内部注意力 ──
+        void clear_cache() noexcept { self_attn_.clear_cache(); }
+
+        void set_document_ids(const std::vector<std::size_t> &doc_ids)
+        {
+            self_attn_.set_document_ids(doc_ids);
+        }
+
+        /**
+         * @brief Single-token (or short-segment) pre-norm block forward using
+         *        the attention KV cache.
+         * Mirrors forward(): x + Attn(LN₁(x)) then + FFN(LN₂(·)), but the
+         * attention reads/appends the incremental cache instead of a full pass.
+         */
+        Matrix forward_step(const Matrix &x_new)
+        {
+            Matrix sa_out = self_attn_.forward_step(norm1_.forward(x_new));
+            Matrix residual2 = x_new + sa_out;
+            return residual2 + ff_.forward(norm2_.forward(residual2));
+        }
     };
 
     // ── GPTModel ─────────────────────────────────────────────────────────────
@@ -2364,6 +2775,9 @@ const char *name() const override { return "Conv2D"; }
         std::size_t vocab_size_;
         std::size_t d_model_;
         std::size_t seq_len_;
+        bool use_rope_;
+        bool use_alibi_;
+        std::size_t cur_len_ = 0; // 增量推理的已处理位置数（clear_cache 重置）
 
         Matrix token_emb_;
         Matrix grad_token_emb_;
@@ -2381,8 +2795,10 @@ const char *name() const override { return "Conv2D"; }
 
     public:
         GPTModel(std::size_t vocab_size, std::size_t d_model, std::size_t seq_len,
-                 std::size_t num_heads, std::size_t d_ff, std::size_t num_layers)
+                 std::size_t num_heads, std::size_t d_ff, std::size_t num_layers,
+                 bool use_rope = false, bool use_alibi = false)
             : vocab_size_(vocab_size), d_model_(d_model), seq_len_(seq_len),
+              use_rope_(use_rope), use_alibi_(use_alibi),
               token_emb_(vocab_size, d_model),
               grad_token_emb_(vocab_size, d_model),
               pos_emb_(seq_len, d_model),
@@ -2399,10 +2815,14 @@ const char *name() const override { return "Conv2D"; }
                 pos_emb_.data()[i] = dist(rng);
 
             for (std::size_t i = 0; i < num_layers; ++i)
-                blocks_.emplace_back(d_model, num_heads, d_ff);
+                blocks_.emplace_back(d_model, num_heads, d_ff, use_rope, use_alibi);
         }
 
         const char *name() const override { return "GPTModel"; }
+
+        [[nodiscard]] std::size_t vocab_size() const noexcept { return vocab_size_; }
+        [[nodiscard]] std::size_t seq_len() const noexcept { return seq_len_; }
+        [[nodiscard]] bool uses_rope() const noexcept { return use_rope_; }
 
         [[nodiscard]] std::size_t param_count() const noexcept override
         {
@@ -2477,9 +2897,9 @@ const char *name() const override { return "Conv2D"; }
 
                     for (std::size_t d = 0; d < d_model_; ++d)
                     {
-                        double pe = pos_emb_.at_unchecked(t, d);
-                        x.set_value_unchecked(d, t,
-                            token_emb_.at_unchecked(token_id, d) + pe);
+                        // RoPE 模式下位置信息由注意力层注入，跳过可学习绝对位置嵌入
+                        const double pe = use_rope_ ? 0.0 : pos_emb_.at_unchecked(t, d);
+                        x.set_value_unchecked(d, t, token_emb_.at_unchecked(token_id, d) + pe);
                     }
                 }
 
@@ -2544,7 +2964,8 @@ const char *name() const override { return "Conv2D"; }
                     {
                         double g = grad_ln.at_unchecked(d, t);
                         grad_token_emb_.data()[tid * d_model_ + d] += g;
-                        grad_pos_emb_.data()[t * d_model_ + d] += g;
+                        if (!use_rope_)
+                            grad_pos_emb_.data()[t * d_model_ + d] += g;
                     }
                 }
                 
@@ -2564,10 +2985,153 @@ const char *name() const override { return "Conv2D"; }
             return grad_input;
         }
 
+        // ── 增量推理（KV cache，移植自上游 forward_step）──────────────
+        /**
+         * @brief Resets the incremental-inference state (per-block KV caches and
+         *        the model-level position counter).
+         *
+         * Call before starting a new generation with a fresh prompt.
+         */
+        void clear_cache() noexcept
+        {
+            cur_len_ = 0;
+            for (auto &b : blocks_)
+                b.clear_cache();
+        }
+
+        /**
+         * @brief Propagates per-position document ids to every block's attention
+         *        (document mask). See MultiHeadAttention::set_document_ids.
+         */
+        void set_document_ids(const std::vector<std::size_t> &doc_ids)
+        {
+            for (auto &b : blocks_)
+                b.set_document_ids(doc_ids);
+        }
+
+        /**
+         * @brief Incremental forward over the KV cache (batch = 1).
+         *
+         * Feeds tokens one at a time; each token's K/V are appended to every
+         * block's cache, so the cost per token is one projection pass instead
+         * of a full re-forward over the whole prefix.
+         * @param token_ids New tokens to feed (usually a single token).
+         * @return Logits (vocab_size, 1) of the LAST token only — generation
+         *         never needs the other positions.
+         */
+        Matrix forward_step(const std::vector<std::size_t> &token_ids)
+        {
+            if (token_ids.empty())
+                throw std::invalid_argument("GPTModel forward_step: empty token_ids");
+            Matrix logits;
+            for (const std::size_t tid : token_ids)
+            {
+                if (tid >= vocab_size_)
+                    throw std::out_of_range("GPTModel forward_step: token id out of range");
+                const std::size_t pos = cur_len_++;
+                // 可学习绝对位置嵌入限制在 seq_len_ 内（超出时钳制到末位）；
+                // RoPE 无长度限制（位置表按需增长）。
+                const std::size_t pe_pos = use_rope_ ? 0 : std::min(pos, seq_len_ - 1);
+                Matrix x(d_model_, 1);
+                for (std::size_t d = 0; d < d_model_; ++d)
+                    x.set_value_unchecked(d, 0,
+                        token_emb_.at_unchecked(tid, d)
+                        + (use_rope_ ? 0.0 : pos_emb_.at_unchecked(pe_pos, d)));
+                for (auto &b : blocks_)
+                    x = b.forward_step(x);
+                logits = lm_head_.forward(ln_f_.forward(x));
+            }
+            return logits;
+        }
+
+        /**
+         * @brief Samples (or greedily picks) the next token from a logits column.
+         *
+         * temperature > 0: sample from the softmax distribution (T = 1 is plain
+         * sampling; lower T sharpens, higher T flattens).
+         * temperature <= 0: greedy argmax.
+         */
+        std::size_t sample_from_logits_(const Matrix &logits, double temperature,
+                                        std::mt19937_64 &rng) const
+        {
+            std::vector<double> probs(vocab_size_);
+            for (std::size_t v = 0; v < vocab_size_; ++v)
+                probs[v] = logits.at_unchecked(v, 0);
+            if (temperature > 0.0 && temperature != 1.0)
+                for (auto &p : probs)
+                    p /= temperature;
+
+            double max_val = probs[0];
+            for (std::size_t v = 1; v < vocab_size_; ++v)
+                max_val = std::max(max_val, probs[v]);
+            double sum_exp = 0.0;
+            for (auto &p : probs)
+            {
+                p = std::exp(p - max_val);
+                sum_exp += p;
+            }
+
+            if (temperature <= 0.0)
+            {
+                std::size_t best = 0;
+                for (std::size_t v = 1; v < vocab_size_; ++v)
+                    if (probs[v] > probs[best])
+                        best = v;
+                return best;
+            }
+
+            std::uniform_real_distribution<double> dist(0.0, 1.0);
+            const double r = dist(rng);
+            double cumulative = 0.0;
+            for (std::size_t v = 0; v < vocab_size_; ++v)
+            {
+                cumulative += probs[v] / sum_exp;
+                if (r <= cumulative)
+                    return v;
+            }
+            return vocab_size_ - 1;
+        }
+
+        // KV-cache 生成路径：prompt 逐 token 预填（缓存随之构建），之后每步
+        // 只前向最新 token。与全量重前向在相同采样序列下数值等价。
+        std::vector<std::size_t> generate_kv_(const std::vector<std::size_t> &prompt,
+                                              std::size_t max_new_tokens,
+                                              double temperature)
+        {
+            std::vector<std::size_t> generated;
+            std::mt19937_64 rng{std::random_device{}()};
+
+            clear_cache();
+            Matrix logits(vocab_size_, 1);
+            for (const std::size_t tid : prompt)
+                logits = forward_step({tid});
+
+            for (std::size_t step = 0; step < max_new_tokens; ++step)
+            {
+                const std::size_t next_token = sample_from_logits_(logits, temperature, rng);
+                generated.push_back(next_token);
+                if (step + 1 < max_new_tokens)
+                    logits = forward_step({next_token});
+            }
+            return generated;
+        }
+
+        /**
+         * @brief Autoregressive generation.
+         * @param use_kv_cache true (default): incremental forward via per-block
+         *        KV caches — O(1) projection per token instead of a full
+         *        re-forward over the whole prefix. false: legacy full re-forward.
+         */
         std::vector<std::size_t> generate(const std::vector<std::size_t> &prompt,
                                           std::size_t max_new_tokens,
-                                          double temperature = 1.0)
+                                          double temperature = 1.0,
+                                          bool use_kv_cache = true)
         {
+            if (prompt.empty() && max_new_tokens > 0)
+                throw std::invalid_argument("GPTModel generate: prompt must not be empty");
+            if (use_kv_cache)
+                return generate_kv_(prompt, max_new_tokens, temperature);
+
             std::vector<std::size_t> context(prompt);
             std::vector<std::size_t> generated;
             std::mt19937_64 rng{std::random_device{}()};

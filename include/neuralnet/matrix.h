@@ -40,6 +40,54 @@ namespace nn
             }
         }
 
+        // ── GEMM 微内核：NI 行 × MK_RB 列寄存器分块（移植自上游 algebra_matrix）──
+        // 为何这样写：逐 (i,j) 标量累加每次 FMA 需 2 次 load（受 load port 限制），
+        // 内层难以向量化。本微内核一次处理 4 行 × 8 列（AVX2 双精度宽）：
+        //   · B 以 k-major 打包（bp + kk*j_stride + jj）：固定 kk 时 jj 连续，
+        //     列方向是一次宽向量 load；
+        //   · 每个 kk 只从 A 广播 NI 个标量、做 NI×MK_RB 次 FMA。
+        // 累加分组固定（块内 kk 升序、块间 k_start 升序）→ 求和顺序确定可复现。
+        // kk 以 k_len 为界：A 行块直接指向原矩阵（k_start 偏移），越过 K 块
+        // 尾部会读出堆外字节，垃圾 double 可能是 sNaN，sNaN×0=NaN 会污染
+        // 累加器（B 面板零填充也救不回来）。
+        static constexpr std::size_t MK_NI = 4; // 微内核行数
+        static constexpr std::size_t MK_RB = 8; // 微内核列数（AVX2 双精度宽）
+
+        /**
+         * @brief Register-blocked GEMM microkernel:
+         *        acc[ii][jj] += Σ_{kk<k_len} A(ii,kk)·B(kk,jj).
+         *
+         * @param ap A row-block base (row ii at ap + ii * a_stride), k-contiguous.
+         *            Only the first k_len columns of each row are read (reading
+         *            beyond would be OOB; garbage doubles may be sNaN and would
+         *            poison accumulators via sNaN * 0).
+         * @param bp k-major packed B panel (element (kk,jj) at bp + kk * j_stride).
+         *            Zero-padded to MK_RB-aligned width so vector loads are safe.
+         * @param rp Output tile base (element (ii,jj) at rp + ii * r_stride).
+         * @param k_len Active k extent of this block.
+         * @param j_len Active column count (writes guarded; padding columns skipped).
+         */
+        static void gemm_microkernel_(const double *ap, std::size_t a_stride,
+                                      const double *bp, std::size_t j_stride,
+                                      double *rp, std::size_t r_stride,
+                                      std::size_t k_len, std::size_t j_len) noexcept
+        {
+            double acc[MK_NI][MK_RB] = {};
+            for (std::size_t kk = 0; kk < k_len; ++kk)
+            {
+                const double *brow = bp + kk * j_stride;
+                for (std::size_t ii = 0; ii < MK_NI; ++ii)
+                {
+                    const double av = ap[ii * a_stride + kk];
+                    for (std::size_t jj = 0; jj < MK_RB; ++jj)
+                        acc[ii][jj] += av * brow[jj];
+                }
+            }
+            for (std::size_t ii = 0; ii < MK_NI; ++ii)
+                for (std::size_t jj = 0; jj < j_len; ++jj)
+                    rp[ii * r_stride + jj] += acc[ii][jj];
+        }
+
     public:
         Matrix() = default;
 
@@ -244,27 +292,38 @@ namespace nn
                                   const std::size_t k_end = std::min(k_start + BLOCK_SIZE, K);
                                   const std::size_t k_len = k_end - k_start;
                                   const std::size_t j_len = j_end - j_start;
+                                  const std::size_t i_len = i_end - i_start;
 
-                                  // 加载 B 的子块到栈数组并转置：b_block[jj * k_len + kk] = B(k_start+kk, j_start+jj)
-                                  std::array<double, BLOCK_SIZE * BLOCK_SIZE> b_block{};
+                                  // B 面板 k-major 打包（列宽对齐 MK_RB，零填充）：
+                                  // b_pack[kk * j_pad + jj] = B(k_start+kk, j_start+jj)
+                                  // 固定 kk 时 jj 连续 → 微内核列方向宽 load；
+                                  // kk 走满编译期常量 BLOCK_SIZE（零填充补齐）。
+                                  const std::size_t j_pad = (j_len + MK_RB - 1) / MK_RB * MK_RB;
+                                  std::array<double, BLOCK_SIZE * BLOCK_SIZE> b_pack{};
                                   for (std::size_t jj = 0; jj < j_len; ++jj)
-                                  {
                                       for (std::size_t kk = 0; kk < k_len; ++kk)
-                                      {
-                                          b_block[jj * k_len + kk] = other.data_[other.index(k_start + kk, j_start + jj)];
-                                      }
-                                  }
+                                          b_pack[kk * j_pad + jj] =
+                                              other.data_[other.index(k_start + kk, j_start + jj)];
 
-                                  // 累加当前 K 块对 C 块的贡献
-                                  for (std::size_t i = i_start; i < i_end; ++i)
+                                  // 4×8 寄存器分块微内核 + 行尾块标量回退
+                                  const std::size_t i_full = i_start + (i_len / MK_NI) * MK_NI;
+                                  for (std::size_t i = i_start; i < i_full; i += MK_NI)
+                                      for (std::size_t j0 = 0; j0 < j_len; j0 += MK_RB)
+                                          gemm_microkernel_(
+                                              data_.data() + i * K + k_start, K,
+                                              b_pack.data() + j0, j_pad,
+                                              result.data_.data() + i * N + j_start + j0, N,
+                                              k_len, std::min(MK_RB, j_len - j0));
+                                  for (std::size_t i = i_full; i < i_end; ++i)
                                   {
                                       const std::size_t a_base = i * K + k_start;
                                       for (std::size_t j = j_start; j < j_end; ++j)
                                       {
                                           double sum = 0.0;
-                                          const std::size_t b_base = (j - j_start) * k_len;
+                                          const std::size_t b_col = j - j_start;
                                           for (std::size_t kk = 0; kk < k_len; ++kk)
-                                              sum += data_[a_base + kk] * b_block[b_base + kk];
+                                              sum += data_[a_base + kk]
+                                                     * b_pack[kk * j_pad + b_col];
                                           result.data_[result.index(i, j)] += sum;
                                       }
                                   }
@@ -385,30 +444,45 @@ namespace nn
                                   const std::size_t k_end = std::min(k_start + BLOCK_SIZE, K);
                                   const std::size_t k_len = k_end - k_start;
 
-                                  // 加载 A 子块并转置到栈数组：
-                                  // a_block[ii * k_len + kk] = A(k_start+kk, i_start+ii) = this(k, i)
-                                  // 这样内层 kk 循环对 a_block 行连续。
+                                  // A 子块转置打包（行 stride = BLOCK_SIZE，零填充）：
+                                  // a_block[ii * BLOCK_SIZE + kk] = this(k_start+kk, i_start+ii)
+                                  // → 微内核的 A 行块沿 kk 连续。
                                   std::array<double, BLOCK_SIZE * BLOCK_SIZE> a_block{};
                                   for (std::size_t ii = 0; ii < i_len; ++ii)
-                                  {
                                       for (std::size_t kk = 0; kk < k_len; ++kk)
-                                      {
-                                          a_block[ii * k_len + kk] =
+                                          a_block[ii * BLOCK_SIZE + kk] =
                                               data_[(k_start + kk) * cols_ + (i_start + ii)];
-                                      }
-                                  }
 
-                                  // 累加：C(i,j) += Σ a_block[ii,kk] * other(k_start+kk, j)
-                                  for (std::size_t ii = 0; ii < i_len; ++ii)
+                                  // B 面板 k-major 打包（列宽对齐 MK_RB，零填充）：
+                                  // b_pack[kk * j_pad + jj] = other(k_start+kk, j_start+jj)
+                                  const std::size_t j_len = j_end - j_start;
+                                  const std::size_t j_pad = (j_len + MK_RB - 1) / MK_RB * MK_RB;
+                                  std::array<double, BLOCK_SIZE * BLOCK_SIZE> b_pack{};
+                                  for (std::size_t jj = 0; jj < j_len; ++jj)
+                                      for (std::size_t kk = 0; kk < k_len; ++kk)
+                                          b_pack[kk * j_pad + jj] =
+                                              other.data_[(k_start + kk) * other.cols_ + (j_start + jj)];
+
+                                  // 4×8 寄存器分块微内核 + 行尾块标量回退
+                                  const std::size_t i_full = i_len / MK_NI * MK_NI;
+                                  for (std::size_t ii = 0; ii < i_full; ii += MK_NI)
+                                      for (std::size_t j0 = 0; j0 < j_len; j0 += MK_RB)
+                                          gemm_microkernel_(
+                                              a_block.data() + ii * BLOCK_SIZE, BLOCK_SIZE,
+                                              b_pack.data() + j0, j_pad,
+                                              result.data_.data() + (i_start + ii) * N + j_start + j0, N,
+                                              k_len, std::min(MK_RB, j_len - j0));
+                                  for (std::size_t ii = i_full; ii < i_len; ++ii)
                                   {
-                                      const std::size_t a_base = ii * k_len;
+                                      const std::size_t a_base = ii * BLOCK_SIZE;
                                       const std::size_t i = i_start + ii;
                                       for (std::size_t j = j_start; j < j_end; ++j)
                                       {
                                           double sum = 0.0;
+                                          const std::size_t b_col = j - j_start;
                                           for (std::size_t kk = 0; kk < k_len; ++kk)
-                                              sum += a_block[a_base + kk] *
-                                                     other.data_[(k_start + kk) * other.cols_ + j];
+                                              sum += a_block[a_base + kk]
+                                                     * b_pack[kk * j_pad + b_col];
                                           result.data_[result.index(i, j)] += sum;
                                       }
                                   }

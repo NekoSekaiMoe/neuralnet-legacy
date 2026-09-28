@@ -39,6 +39,31 @@ namespace nn
         }
 
         ModelSpec spec;
+        if (version == 4)
+        {
+            // 自描述键值 spec：[len u32][KeyValueRecord bytes]（len=0 → 无 spec）
+            uint32_t len = 0;
+            ifs.read(reinterpret_cast<char *>(&len), sizeof(len));
+            if (len == 0)
+            {
+                spec.type = ModelType::Sequential;
+                return spec;
+            }
+            std::string buf(len, '\0');
+            ifs.read(buf.data(), len);
+            const KeyValueRecord rec = KeyValueRecord::parse(buf);
+            uint64_t u = 0;
+            if (rec.get("type", u))
+                spec.type = static_cast<ModelType>(u);
+            if (rec.get("vocab_size", u)) spec.vocab_size = static_cast<std::size_t>(u);
+            if (rec.get("d_model", u)) spec.d_model = static_cast<std::size_t>(u);
+            if (rec.get("seq_len", u)) spec.seq_len = static_cast<std::size_t>(u);
+            if (rec.get("num_heads", u)) spec.num_heads = static_cast<std::size_t>(u);
+            if (rec.get("d_ff", u)) spec.d_ff = static_cast<std::size_t>(u);
+            if (rec.get("num_layers", u)) spec.num_layers = static_cast<std::size_t>(u);
+            return spec;
+        }
+
         ifs.read(reinterpret_cast<char *>(&spec.type), sizeof(spec.type));
         ifs.read(reinterpret_cast<char *>(&spec.vocab_size), sizeof(std::size_t));
         ifs.read(reinterpret_cast<char *>(&spec.d_model), sizeof(std::size_t));

@@ -65,6 +65,12 @@ if(BUILD_TESTING)
         sgd_momentum
         adam
         adamw
+        muon
+        muon_tall_matrix
+        muon_quadratic_convergence
+        warmup_cosine_lr
+        keyvalue_record_roundtrip
+        keyvalue_record_skips_unknown_type
         step_lr
         cosine_lr
         exp_lr
@@ -76,6 +82,8 @@ if(BUILD_TESTING)
         model_io_member
         model_save_load_v1
         model_save_load_v2
+        model_save_load_v4
+        model_v4_spec_roundtrip
         model_load_state_count_mismatch
         one_hot
         e2e_train
@@ -110,6 +118,9 @@ if(BUILD_TESTING)
         summary_contains_total_params
         summary_contains_all_layer_names
         summary_output_stream
+        threadpool_parallel_for
+        gemm_microkernel_odd_shapes
+        matmul_tn_microkernel
     )
 
     foreach(name ${nn_test_names})
@@ -189,6 +200,15 @@ if(BUILD_TESTING)
         gpt_model_shape
         gpt_model_numeric_grad
         gpt_model_generate
+        rope_known_rotation
+        rope_preserves_norm
+        alibi_single_token_no_bias
+        alibi_causality_and_effect
+        doc_mask_isolation
+        kv_cache_matches_full
+        generate_kv_matches_full
+        generate_rope_beyond_seq_len
+        generate_empty_prompt_throws
     )
     foreach(name ${gpt_test_names})
         add_test(NAME gpt_${name} COMMAND test_gpt ${name})
@@ -210,5 +230,33 @@ if(BUILD_TESTING)
     )
     foreach(name ${tokenizer_test_names})
         add_test(NAME tokenizer_${name} COMMAND test_tokenizer ${name})
+    endforeach()
+
+    add_executable(test_gradcheck test_gradcheck.cpp)
+    target_link_libraries(test_gradcheck PRIVATE neuralnet::neuralnet)
+    target_include_directories(test_gradcheck PRIVATE ${PROJECT_SOURCE_DIR}/include)
+    if(MSVC)
+        target_compile_options(test_gradcheck PRIVATE /UNDEBUG)
+    else()
+        target_compile_options(test_gradcheck PRIVATE -UNDEBUG)
+    endif()
+
+    set(gradcheck_test_names
+        gradcheck_linear
+        gradcheck_gelu
+        gradcheck_softmax
+        gradcheck_layernorm
+        gradcheck_rmsnorm
+        gradcheck_swiglu
+        gradcheck_feedforward
+        gradcheck_mha
+        gradcheck_mha_causal
+        gradcheck_mha_rope
+        gradcheck_mha_alibi
+        gradcheck_gptblock_rope
+        gradcheck_gptmodel_token_emb
+    )
+    foreach(name ${gradcheck_test_names})
+        add_test(NAME ${name} COMMAND test_gradcheck ${name})
     endforeach()
 endif()

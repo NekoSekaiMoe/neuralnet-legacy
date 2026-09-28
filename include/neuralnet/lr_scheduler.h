@@ -61,6 +61,57 @@ namespace nn
         void step() override { ++epoch_count_; }
     };
 
+    // ── WarmupCosineLR：线性预热 + 余弦退火（移植自上游 cli_lr_scheduler）──
+    // 预热阶段（epoch < warmup_epochs）：lr = lr_max * (epoch+1) / warmup_epochs，
+    //   线性上升，第 1 步即有非零学习率；
+    // 预热后：标准余弦退火 lr_min + 0.5*(lr_max−lr_min)*(1+cos(π·progress))，
+    //   progress 钳制到 [0,1]，超出总轮数后停在 lr_min（防 cos 回升导致 lr 振荡）。
+    /**
+     * @brief Linear warmup followed by cosine annealing.
+     *
+     * Warmup phase (epoch < warmup_epochs): lr increases linearly,
+     * lr = lr_max * (epoch + 1) / warmup_epochs.
+     * After warmup: standard cosine annealing to lr_min, with progress clamped
+     * to [0, 1] so the lr stays at lr_min beyond total_epochs.
+     */
+    class WarmupCosineLR : public LRScheduler
+    {
+    private:
+        double lr_max_;
+        double lr_min_;
+        std::size_t warmup_epochs_;
+        std::size_t total_epochs_;
+        std::size_t epoch_count_;
+
+    public:
+        WarmupCosineLR(double lr_max, std::size_t total_epochs,
+                       std::size_t warmup_epochs = 0, double lr_min = 0.0)
+            : lr_max_(lr_max), lr_min_(lr_min), warmup_epochs_(warmup_epochs),
+              total_epochs_(total_epochs), epoch_count_(0)
+        {
+            if (total_epochs_ == 0)
+                throw std::invalid_argument("WarmupCosineLR: total_epochs must be > 0");
+        }
+
+        double get_lr() const override
+        {
+            if (warmup_epochs_ > 0 && epoch_count_ < warmup_epochs_)
+                return lr_max_ * static_cast<double>(epoch_count_ + 1)
+                       / static_cast<double>(warmup_epochs_);
+
+            const std::size_t cosine_epochs = total_epochs_ - warmup_epochs_;
+            if (cosine_epochs == 0)
+                return lr_max_;
+            double progress = static_cast<double>(epoch_count_ - warmup_epochs_)
+                              / static_cast<double>(cosine_epochs);
+            if (progress < 0.0) progress = 0.0;
+            if (progress > 1.0) progress = 1.0;
+            return lr_min_ + 0.5 * (lr_max_ - lr_min_) * (1.0 + std::cos(M_PI * progress));
+        }
+
+        void step() override { ++epoch_count_; }
+    };
+
     // ── ExponentialLR：每个 epoch 乘以 gamma ─────────────────────────────────
     class ExponentialLR : public LRScheduler
     {

@@ -257,6 +257,51 @@ Linear(784, 64) → BatchNorm1d(64) → ReLU
 ctest --test-dir build --output-on-failure       # 跑全部测试
 ```
 
+## 移植自上游 neuralnet.cpp 的特性（v3）
+
+以下特性从上游 `neuralnet.cpp` 移植并适配本库的 C++17 / Matrix / Layer 体系，全部有测试覆盖（含数值梯度检查）：
+
+### 推理加速：KV-cache 增量推理
+
+- `GPTModel::generate()` 默认走 **KV-cache 路径**：每个新 token 只做一次投影前向，不再全量重算前缀（`use_kv_cache=false` 可回退旧路径）
+- 组件级 API：`MultiHeadAttention::forward_step()` / `clear_cache()`、`GPTBlock::forward_step()`、`GPTModel::forward_step(token_ids)`
+- 实测（vocab=65, d=64, 6层, 192 token 生成）：**6.0s → 0.20s（≈31×）**
+
+### 位置编码与注意力变体
+
+- **RoPE** (`RotaryEmbedding`)：LLaMA 式 rotate_half，cos/sin 表按需增长，滑动窗/增量生成支持单列旋转；`GPTModel(vocab, d, seq, heads, d_ff, layers, /*use_rope=*/true)`，RoPE 模式下自动跳过可学习绝对位置嵌入（无长度限制）
+- **ALiBi**：`MultiHeadAttention(..., causal, rope, /*use_alibi=*/true)`，标准斜率公式（含非 2 幂头数的递归扩展）
+- **文档掩码**：`set_document_ids()`（MHA / GPTBlock / GPTModel 均可），同文档内因果可见、跨文档屏蔽
+
+### 训练组件
+
+- **Muon 优化器** (`nn::Muon`)：动量 + Newton-Schulz 五次迭代正交化 + 0.2·√max(m,n) 形状补偿；一维参数自动退化为 SGD-Momentum；短边侧构造母矩阵避免大参数平方矩阵
+- **WarmupCosineLR**：线性预热 + 余弦退火（progress 钳制，超出总轮数停在 min_lr）
+
+### GEMM 微内核（operator* / matmul_TN）
+
+- B 面板 k-major 打包（MK_RB 对齐零填充）+ 4×8 寄存器分块微内核 + 行尾块标量回退
+- 实测（本机 aarch64/NEON，-O3）：**3.5~4× GFLOPS 提升**（512³：7.1→29.5；3072×768×512：16.4→58.0），结果与旧实现逐位一致
+
+### 自包含线程池（可选 TBB 替代）
+
+- `include/neuralnet/threadpool.h`：原子块抢取调度 + 调用线程参与 + 归约块序合并（确定性）；也可直接用 `nn::ThreadPool::global().parallel_for(...)`
+- 编译加 `-DNN_EXEC_POOL` 后 `nn::for_each / transform / for_blocks` 等全部切到本池，**摆脱 libtbb-dev 依赖**（默认仍为 TBB 后端，行为不变）
+
+### v4 模型格式（自描述键值）
+
+- `nn::KeyValueRecord`（`keyvalue_record.h`）：key+类型+长度前缀的自描述二进制，未知字段按长度跳过（向前兼容）
+- `model.save(path, spec, /*format_version=*/4)`：ModelSpec 与每层状态（BatchNorm running stats 等）均以 KV 记录写入；`load()` 支持 v1~v4；`read_model_spec()` 可读 v3/v4 spec
+
+### 数值梯度检查框架
+
+- `tests/test_gradcheck.cpp`：中心差分 vs 解析 backward，覆盖 Linear/GELU/Softmax/LayerNorm/RMSNorm/SwiGLU/FFN/MHA（含 causal/RoPE/ALiBi）/GPTBlock/GPTModel
+
+> 本批次移植过程中踩过的 4 个非显而易见缺陷（GEMM 越界读/sNaN 污染、
+> 微内核写回偏移、线程池 UAF、KV 记录未知字段跳过失效）记录在
+> **[docs/pitfalls-v3-port.md](docs/pitfalls-v3-port.md)**，含症状、定位
+> 手法、根因与教训。
+
 ## 提供的组件
 
 ### 矩阵与工具（`<neuralnet/matrix.h>` / `<neuralnet/nn/nn.h>`）

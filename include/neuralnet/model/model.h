@@ -11,6 +11,7 @@
 #include <vector>
 
 #include <neuralnet/nn/config.h>
+#include <neuralnet/keyvalue_record.h>
 #include <neuralnet/layer.h>
 #include <optional>
 
@@ -161,7 +162,7 @@ namespace nn
         // ── I/O ─────────────────────────────────────────────────────────────
         // 文件格式（binary，little-endian）：
         //   magic    (uint32, 4B) = 0x4E4E4E4E
-        //   version  (uint32, 4B) = 1 | 2
+        //   version  (uint32, 4B) = 1 | 2 | 3 | 4
         //
         // v1:
         //   for each parameter Matrix in parameters() order:
@@ -177,24 +178,46 @@ namespace nn
         //   for each layer in layers_ order where has_state()==true:
         //     layer->save_state(os)
         //
+        // v3: v2 前置原始 ModelSpec（type + 6×size_t，结构需与加载方一致）
+        //
+        // v4（移植自上游 KeyValueRecord，推荐）: 自描述键值格式：
+        //   spec 段  : [len u32][KeyValueRecord bytes]（len=0 表示无 spec；
+        //              字段 type/vocab_size/d_model/seq_len/num_heads/d_ff/num_layers）
+        //   参数段   : 同 v2
+        //   状态段   : size_t n_state_layers，每层 [len u32][KeyValueRecord bytes]
+        //              （字段名/类型/长度自带，未知字段可跳过 → 向前兼容）
+        //
         // 注意：网络结构（各层维度）必须与加载时一致。load() 按版本分发；未知版本抛错。
-        void save(const std::string &filename, const std::optional<ModelSpec>& spec = std::nullopt)
+        // save(format_version=0) 自动选择（有 spec→3，无→2）；传 4 显式写 v4。
+        void save(const std::string &filename, const std::optional<ModelSpec>& spec = std::nullopt,
+                  uint32_t format_version = 0)
         {
             std::ofstream ofs(filename, std::ios::binary);
             if (!ofs)
             {
                 throw std::runtime_error("Cannot write model file: " + filename);
             }
-            save(ofs, spec);
+            save(ofs, spec, format_version);
             std::cout << "Model saved to " << filename << std::endl;
         }
 
-        void save(std::ostream &os, const std::optional<ModelSpec>& spec = std::nullopt)
+        void save(std::ostream &os, const std::optional<ModelSpec>& spec = std::nullopt,
+                  uint32_t format_version = 0)
         {
             const uint32_t magic = 0x4E4E4E4E;
-            const uint32_t version = spec.has_value() ? 3 : 2;
+            const uint32_t version = format_version != 0
+                ? format_version
+                : (spec.has_value() ? 3u : 2u);
             os.write(reinterpret_cast<const char *>(&magic), sizeof(magic));
             os.write(reinterpret_cast<const char *>(&version), sizeof(version));
+
+            auto write_record = [&](const KeyValueRecord &rec)
+            {
+                const std::string bytes = rec.serialize();
+                const uint32_t len = static_cast<uint32_t>(bytes.size());
+                os.write(reinterpret_cast<const char *>(&len), sizeof(len));
+                os.write(bytes.data(), bytes.size());
+            };
 
             if (version == 3)
             {
@@ -206,6 +229,26 @@ namespace nn
                 os.write(reinterpret_cast<const char *>(&spec->num_heads), sizeof(std::size_t));
                 os.write(reinterpret_cast<const char *>(&spec->d_ff), sizeof(std::size_t));
                 os.write(reinterpret_cast<const char *>(&spec->num_layers), sizeof(std::size_t));
+            }
+            else if (version == 4)
+            {
+                if (spec.has_value())
+                {
+                    KeyValueRecord rec;
+                    rec.set("type", static_cast<uint64_t>(spec->type))
+                        .set("vocab_size", spec->vocab_size)
+                        .set("d_model", spec->d_model)
+                        .set("seq_len", spec->seq_len)
+                        .set("num_heads", spec->num_heads)
+                        .set("d_ff", spec->d_ff)
+                        .set("num_layers", spec->num_layers);
+                    write_record(rec);
+                }
+                else
+                {
+                    const uint32_t zero = 0;
+                    os.write(reinterpret_cast<const char *>(&zero), sizeof(zero));
+                }
             }
 
             auto write_matrix = [&](const Matrix &m)
@@ -238,7 +281,16 @@ namespace nn
             {
                 if (layer->has_state())
                 {
-                    layer->save_state(os);
+                    if (version == 4)
+                    {
+                        KeyValueRecord rec;
+                        layer->save_state_kv(rec);
+                        write_record(rec);
+                    }
+                    else
+                    {
+                        layer->save_state(os);
+                    }
                 }
             }
         }
@@ -263,7 +315,7 @@ namespace nn
             {
                 throw std::runtime_error("Invalid model file format");
             }
-            if (version != 1 && version != 2 && version != 3)
+            if (version != 1 && version != 2 && version != 3 && version != 4)
             {
                 throw std::runtime_error("Unsupported model file version");
             }
@@ -278,6 +330,21 @@ namespace nn
                 is.read(reinterpret_cast<char *>(&spec.num_heads), sizeof(std::size_t));
                 is.read(reinterpret_cast<char *>(&spec.d_ff), sizeof(std::size_t));
                 is.read(reinterpret_cast<char *>(&spec.num_layers), sizeof(std::size_t));
+            }
+            else if (version == 4)
+            {
+                // 自描述 spec（解析校验其完整性；结构一致性由参数段形状检查保证）
+                auto read_record = [&]() -> KeyValueRecord
+                {
+                    uint32_t len = 0;
+                    is.read(reinterpret_cast<char *>(&len), sizeof(len));
+                    if (len == 0)
+                        return KeyValueRecord{};
+                    std::string buf(len, '\0');
+                    is.read(buf.data(), len);
+                    return KeyValueRecord::parse(buf);
+                };
+                read_record(); // spec 记录（内容与 read_model_spec 一致）
             }
 
             auto read_matrix = [&](Matrix &m)
@@ -336,7 +403,23 @@ namespace nn
                 {
                     if (layer->has_state())
                     {
-                        layer->load_state(is);
+                        if (version == 4)
+                        {
+                            uint32_t len = 0;
+                            is.read(reinterpret_cast<char *>(&len), sizeof(len));
+                            KeyValueRecord rec;
+                            if (len > 0)
+                            {
+                                std::string buf(len, '\0');
+                                is.read(buf.data(), len);
+                                rec = KeyValueRecord::parse(buf);
+                            }
+                            layer->load_state_kv(rec);
+                        }
+                        else
+                        {
+                            layer->load_state(is);
+                        }
                     }
                 }
             }

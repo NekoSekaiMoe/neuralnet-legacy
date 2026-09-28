@@ -286,6 +286,159 @@ namespace nn
         }
     };
 
+    // ── Muon：MomentUm Orthogonalized by Newton-Schulz（移植自上游）─────
+    // 算法（Keller Jordan et al., 2024，https://kellerjordan.github.io/posts/muon/）：
+    //   1. SGD-Momentum: v = μ*v + g（Nesterov 时 update = g + μ*v）
+    //   2. Newton-Schulz 五次迭代正交化：X ← (a + bA + cA²)X，A = XXᵀ（短边侧）
+    //   3. p -= lr * 0.2 * sqrt(max(m,n)) * NS(update)   （谱范数≈1 的形状补偿）
+    // 仅对二维参数（rows>1 且 cols>1）正交化；一维参数（bias/gain）退化为标准
+    // SGD-Momentum 更新。实践建议：embedding/lm_head 用 AdamW，隐藏层用 Muon。
+    /**
+     * @brief Muon optimizer (momentum orthogonalized by Newton-Schulz iteration).
+     *
+     * For each 2D parameter: velocity accumulates momentum, the update is
+     * orthogonalized via a quintic Newton-Schulz iteration (spectral norm ~ 1),
+     * then scaled by 0.2 * sqrt(max(rows, cols)). 1D params (bias/gain) fall
+     * back to plain SGD-Momentum updates.
+     * Reference: Keller Jordan et al. 2024, https://kellerjordan.github.io/posts/muon/
+     */
+    class Muon final : public Optimizer
+    {
+    public:
+        // 调优后的 quintic 多项式系数：φ^N(x) → 1 for x ∈ [0,1]
+        static constexpr double kNsA = 3.4445;
+        static constexpr double kNsB = -4.7750;
+        static constexpr double kNsC = 2.0315;
+
+    private:
+        double lr_;
+        double momentum_;
+        bool nesterov_;
+        std::size_t ns_steps_;
+        double ns_eps_;
+        std::vector<std::reference_wrapper<Matrix>> params_;
+        std::vector<std::reference_wrapper<Matrix>> grads_;
+        std::vector<Matrix> velocities_;
+
+        /**
+         * Newton-Schulz 正交化：返回谱范数≈1 的矩阵（原矩阵方向不变）。
+         * 母矩阵沿短边构造（宽/方阵用 XXᵀ，高窄用 XᵀX），
+         * 避免大参数（如词嵌入 50257×1024）在长边侧构造平方矩阵。
+         */
+        [[nodiscard]] static Matrix newton_schulz_(const Matrix &G,
+                                                   std::size_t steps, double eps)
+        {
+            // 归一化：X = G / sqrt(||G||_F² + eps²)，使谱范数 ≤ 1（NS 收敛域）
+            double norm_sq = 0.0;
+            for (const double v : G.data())
+                norm_sq += v * v;
+            const double inv_norm = 1.0 / std::sqrt(norm_sq + eps * eps);
+
+            const std::size_t m = G.rows();
+            const std::size_t n = G.cols();
+            Matrix X = G * inv_norm;
+
+            if (m <= n)
+            {
+                // 宽/方阵：行正交化，A = X·Xᵀ（m×m，短边）
+                // X ← (aI + bA + cA²)·X，驱动 X·Xᵀ → I
+                for (std::size_t t = 0; t < steps; ++t)
+                {
+                    Matrix A = X.matmul_NT(X);   // (m, m)
+                    Matrix A2 = A * A;
+                    A.scale_inplace(kNsB);
+                    A2.scale_inplace(kNsC);
+                    A.add_inplace(A2);           // A = bA + cA²
+                    Matrix BX = A * X;
+                    X.scale_inplace(kNsA);       // X = aX + (bA+cA²)X
+                    X.add_inplace(BX);
+                }
+            }
+            else
+            {
+                // 高窄：列正交化，G = Xᵀ·X（n×n，短边）
+                // X ← X·(aI + bG + cG²)，驱动 Xᵀ·X → I
+                for (std::size_t t = 0; t < steps; ++t)
+                {
+                    Matrix Gr = X.matmul_TN(X);  // (n, n)
+                    Matrix Gr2 = Gr * Gr;
+                    Gr.scale_inplace(kNsB);
+                    Gr2.scale_inplace(kNsC);
+                    Gr.add_inplace(Gr2);         // Gr = bG + cG²
+                    Matrix XM = X * Gr;
+                    X.scale_inplace(kNsA);
+                    X.add_inplace(XM);           // X = aX + X(bG+cG²)
+                }
+            }
+            return X;
+        }
+
+    public:
+        Muon(std::vector<std::reference_wrapper<Matrix>> params,
+             std::vector<std::reference_wrapper<Matrix>> grads,
+             double lr, double momentum = 0.95, bool nesterov = true,
+             std::size_t ns_steps = 5, double ns_eps = 1e-7)
+            : lr_(lr), momentum_(momentum), nesterov_(nesterov),
+              ns_steps_(ns_steps), ns_eps_(ns_eps),
+              params_(std::move(params)), grads_(std::move(grads))
+        {
+            if (params_.size() != grads_.size())
+                throw std::invalid_argument("params and grads must have same size");
+            velocities_.reserve(params_.size());
+            for (const auto &p_ref : params_)
+            {
+                const Matrix &p = p_ref.get();
+                velocities_.emplace_back(p.rows(), p.cols());
+            }
+        }
+
+        void step() override
+        {
+            for (std::size_t i = 0; i < params_.size(); ++i)
+            {
+                Matrix &p = params_[i].get();
+                const Matrix &g = grads_[i].get();
+                Matrix &v = velocities_[i];
+
+                // 1. 动量：v = μ*v + g；Nesterov：update = g + μ*v
+                v.scale_inplace(momentum_);
+                v.add_inplace(g);
+                Matrix nesterov_buf;
+                if (nesterov_)
+                {
+                    nesterov_buf = v * momentum_;
+                    nesterov_buf.add_inplace(g);
+                }
+                const Matrix &update = nesterov_ ? nesterov_buf : v;
+
+                if (p.rows() > 1 && p.cols() > 1)
+                {
+                    // 2+3. 正交化 + 形状补偿缩放（0.2*sqrt(max(m,n))）
+                    Matrix ortho = newton_schulz_(update, ns_steps_, ns_eps_);
+                    const std::size_t big = std::max(p.rows(), p.cols());
+                    const double muon_scale = 0.2 * std::sqrt(static_cast<double>(big));
+                    ortho.scale_inplace(-lr_ * muon_scale);
+                    p.add_inplace(ortho);
+                }
+                else
+                {
+                    // 一维参数：标准 SGD-Momentum 更新（与上游一致，用 Nesterov 更新量）
+                    for (std::size_t idx = 0; idx < p.size(); ++idx)
+                        p.data()[idx] -= lr_ * update.data()[idx];
+                }
+            }
+        }
+
+        void zero_grad() override
+        {
+            for (auto &g_ref : grads_)
+            {
+                auto &g = g_ref.get();
+                std::fill(g.data().begin(), g.data().end(), 0.0);
+            }
+        }
+    };
+
 } // namespace nn
 
 #endif // OPTIMIZER_HPP

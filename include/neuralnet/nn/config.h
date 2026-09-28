@@ -5,11 +5,23 @@
 #include <execution>
 #include <iterator>
 #include <numeric>
+#include <type_traits>
 
 // ── 执行策略 ────────────────────────────────────────────────────────────────
 // 默认并行+向量化；编译时可通过 -DNN_EXEC_POLICY=std::execution::seq 覆盖
 #ifndef NN_EXEC_POLICY
 #define NN_EXEC_POLICY std::execution::par_unseq
+#endif
+
+// ── 执行后端（可选）：-DNN_EXEC_POOL 切换到自包含线程池 ──────────────────
+// 默认走 std::execution（TBB 后端，行为与历史版本一致）。定义 NN_EXEC_POOL
+// 后，所有并行分支（for_each / transform / transform_reduce / reduce /
+// for_range / for_blocks）改用 nn::ThreadPool（<neuralnet/threadpool.h>），
+// 摆脱 TBB 运行时依赖。归约类原语按块串行合并，结果确定性优于 TBB。
+// 注意：NN_EXEC_POOL 优先于 NN_EXEC_POLICY（若两者同时定义，seq 覆盖失效）。
+#if defined(NN_EXEC_POOL) && !defined(NN_CONFIG_INCLUDE_GUARD_POOL)
+#define NN_CONFIG_INCLUDE_GUARD_POOL
+#include <neuralnet/threadpool.h>
 #endif
 
 // ── 缓存分块大小 ─────────────────────────────────────────────────────────────
@@ -186,7 +198,19 @@ namespace nn
         void for_each(std::size_t work, Iter first, Iter last, Fn f)
         {
             if (work >= PARALLEL_THRESHOLD)
+#if defined(NN_EXEC_POOL)
+            {
+                static_assert(
+                    std::is_base_of<std::random_access_iterator_tag,
+                                    typename std::iterator_traits<Iter>::iterator_category>::value,
+                    "nn::for_each pool backend requires random-access iterators");
+                const std::size_t n = static_cast<std::size_t>(last - first);
+                nn::ThreadPool::global().parallel_for(n,
+                    [&first, &f](std::size_t i) { f(first[i]); });
+            }
+#else
                 std::for_each(NN_EXEC_POLICY, first, last, std::move(f));
+#endif
             else
                 for (; first != last; ++first)
                     f(*first);
@@ -215,7 +239,18 @@ namespace nn
                               OutIter d_first, Fn f)
         {
             if (work >= PARALLEL_THRESHOLD)
+#if defined(NN_EXEC_POOL)
+            {
+                static_assert(
+                    std::is_base_of<std::random_access_iterator_tag,
+                                    typename std::iterator_traits<InIter>::iterator_category>::value,
+                    "nn::transform pool backend requires random-access iterators");
+                const std::size_t n = static_cast<std::size_t>(last - first);
+                nn::ThreadPool::global().parallel_transform(n, first, d_first, std::move(f));
+            }
+#else
                 std::transform(NN_EXEC_POLICY, first, last, d_first, std::move(f));
+#endif
             else
                 for (; first != last; ++first, ++d_first)
                     *d_first = f(*first);
@@ -246,7 +281,18 @@ namespace nn
                               InIter2 first2, OutIter d_first, Fn f)
         {
             if (work >= PARALLEL_THRESHOLD)
+#if defined(NN_EXEC_POOL)
+            {
+                static_assert(
+                    std::is_base_of<std::random_access_iterator_tag,
+                                    typename std::iterator_traits<InIter1>::iterator_category>::value,
+                    "nn::transform pool backend requires random-access iterators");
+                const std::size_t n = static_cast<std::size_t>(last1 - first1);
+                nn::ThreadPool::global().parallel_transform(n, first1, first2, d_first, std::move(f));
+            }
+#else
                 std::transform(NN_EXEC_POLICY, first1, last1, first2, d_first, std::move(f));
+#endif
             else
                 for (; first1 != last1; ++first1, ++first2, ++d_first)
                     *d_first = f(*first1, *first2);
@@ -278,7 +324,19 @@ namespace nn
                                   T init, Reduce reduce, Transform transform)
         {
             if (work >= PARALLEL_THRESHOLD)
+#if defined(NN_EXEC_POOL)
+            {
+                static_assert(
+                    std::is_base_of<std::random_access_iterator_tag,
+                                    typename std::iterator_traits<Iter>::iterator_category>::value,
+                    "nn::transform_reduce pool backend requires random-access iterators");
+                const std::size_t n = static_cast<std::size_t>(last - first);
+                return nn::ThreadPool::global().parallel_transform_reduce(
+                    n, first, std::move(init), std::move(reduce), std::move(transform));
+            }
+#else
                 return std::transform_reduce(NN_EXEC_POLICY, first, last, init, reduce, transform);
+#endif
             for (; first != last; ++first)
                 init = reduce(init, transform(*first));
             return init;
@@ -313,8 +371,20 @@ namespace nn
                                   InIter2 first2, T init, Reduce reduce, Transform transform)
         {
             if (work >= PARALLEL_THRESHOLD)
+#if defined(NN_EXEC_POOL)
+            {
+                static_assert(
+                    std::is_base_of<std::random_access_iterator_tag,
+                                    typename std::iterator_traits<InIter1>::iterator_category>::value,
+                    "nn::transform_reduce pool backend requires random-access iterators");
+                const std::size_t n = static_cast<std::size_t>(last1 - first1);
+                return nn::ThreadPool::global().parallel_transform_reduce2(
+                    n, first1, first2, std::move(init), std::move(reduce), std::move(transform));
+            }
+#else
                 return std::transform_reduce(NN_EXEC_POLICY, first1, last1, first2,
                                              init, reduce, transform);
+#endif
             for (; first1 != last1; ++first1, ++first2)
                 init = reduce(init, transform(*first1, *first2));
             return init;
@@ -341,7 +411,20 @@ namespace nn
         T reduce(std::size_t work, Iter first, Iter last, T init)
         {
             if (work >= PARALLEL_THRESHOLD)
+#if defined(NN_EXEC_POOL)
+            {
+                static_assert(
+                    std::is_base_of<std::random_access_iterator_tag,
+                                    typename std::iterator_traits<Iter>::iterator_category>::value,
+                    "nn::reduce pool backend requires random-access iterators");
+                const std::size_t n = static_cast<std::size_t>(last - first);
+                return nn::ThreadPool::global().parallel_reduce(
+                    n, first, std::move(init),
+                    [](const T &a, const T &b) { return a + b; });
+            }
+#else
                 return std::reduce(NN_EXEC_POLICY, first, last, init);
+#endif
             for (; first != last; ++first)
                 init = init + *first;
             return init;
@@ -370,7 +453,19 @@ namespace nn
         T reduce(std::size_t work, Iter first, Iter last, T init, BinOp binop)
         {
             if (work >= PARALLEL_THRESHOLD)
+#if defined(NN_EXEC_POOL)
+            {
+                static_assert(
+                    std::is_base_of<std::random_access_iterator_tag,
+                                    typename std::iterator_traits<Iter>::iterator_category>::value,
+                    "nn::reduce pool backend requires random-access iterators");
+                const std::size_t n = static_cast<std::size_t>(last - first);
+                return nn::ThreadPool::global().parallel_reduce(
+                    n, first, std::move(init), std::move(binop));
+            }
+#else
                 return std::reduce(NN_EXEC_POLICY, first, last, init, binop);
+#endif
             for (; first != last; ++first)
                 init = binop(init, *first);
             return init;
@@ -397,9 +492,13 @@ namespace nn
         void for_range(std::size_t work, std::size_t n, Fn f)
         {
             if (work >= PARALLEL_THRESHOLD)
+#if defined(NN_EXEC_POOL)
+                nn::ThreadPool::global().parallel_for(n, std::move(f));
+#else
                 std::for_each(NN_EXEC_POLICY,
                               counting_iterator<std::size_t>(0),
                               counting_iterator<std::size_t>(n), std::move(f));
+#endif
             else
                 for (std::size_t i = 0; i < n; ++i)
                     f(i);
@@ -427,9 +526,13 @@ namespace nn
          */
         void for_blocks(std::size_t n_blocks, Fn f)
         {
+#if defined(NN_EXEC_POOL)
+            nn::ThreadPool::global().parallel_for(n_blocks, std::move(f));
+#else
             std::for_each(NN_EXEC_POLICY,
                           counting_iterator<std::size_t>(0),
                           counting_iterator<std::size_t>(n_blocks), std::move(f));
+#endif
         }
 
 } // namespace nn
