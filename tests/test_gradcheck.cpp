@@ -104,7 +104,13 @@ namespace
             const double lm = loss_of(layer, input, upstream);
             p.data()[i] = old;
             const double numeric = (lp - lm) / (2.0 * eps);
-            worst = std::max(worst, rel_err(numeric, analytic[i]));
+            const double e = rel_err(numeric, analytic[i]);
+            // std::max 与 NaN 比较恒为 false → NaN/Inf 误差会被悄悄忽略；
+            // 汇总前逐项验证有限性，让发散梯度直接失败
+            require(std::isfinite(e),
+                    std::string(what) + ": param[" + std::to_string(pidx)
+                        + "] elem " + std::to_string(i) + " rel err not finite");
+            worst = std::max(worst, e);
         }
         std::printf("  [gradcheck] %-28s param[%zu] worst rel err = %.2e\n",
                     what, pidx, worst);
@@ -136,7 +142,11 @@ namespace
             const double lm = loss_of(layer, x, upstream);
             x.data()[i] = old;
             const double numeric = (lp - lm) / (2.0 * eps);
-            worst = std::max(worst, rel_err(numeric, analytic.data()[i]));
+            const double e = rel_err(numeric, analytic.data()[i]);
+            require(std::isfinite(e),
+                    std::string(what) + ": input elem " + std::to_string(i)
+                        + " rel err not finite");
+            worst = std::max(worst, e);
         }
         std::printf("  [gradcheck] %-28s input     worst rel err = %.2e\n",
                     what, worst);
