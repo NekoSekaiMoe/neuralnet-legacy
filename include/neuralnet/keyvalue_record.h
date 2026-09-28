@@ -24,6 +24,7 @@
 #include <cstddef>
 #include <cstring>
 #include <cstdint>
+#include <limits>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -101,13 +102,21 @@ namespace nn
             return *this;
         }
 
-        // 序列化为字节串（不含总长度前缀；总长度由文件格式负责）
+        // 序列化为字节串（不含总长度前缀；总长度由文件格式负责）。
+        // 与 parse() 对称的硬限制：超限直接抛异常，避免静默截断长度前缀、
+        // 写出加载不回的文件。
         [[nodiscard]] std::string serialize() const
         {
+            constexpr std::size_t kMaxFields = 4096;
+            constexpr std::size_t kMaxKeyLen = 256;
             std::string out;
+            if (fields_.size() > kMaxFields)
+                throw std::length_error("KeyValueRecord::serialize: too many fields");
             append_u32(out, static_cast<uint32_t>(fields_.size()));
             for (const Field &f : fields_)
             {
+                if (f.key.size() > kMaxKeyLen)
+                    throw std::length_error("KeyValueRecord::serialize: key too long");
                 append_u32(out, static_cast<uint32_t>(f.key.size()));
                 out.append(f.key);
                 out.push_back(static_cast<char>(f.type));
@@ -141,6 +150,8 @@ namespace nn
                     }
                     break;
                 }
+                if (value.size() > std::numeric_limits<uint32_t>::max())
+                    throw std::length_error("KeyValueRecord::serialize: value too long");
                 append_u32(out, static_cast<uint32_t>(value.size()));
                 out.append(value);
             }

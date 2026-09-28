@@ -91,6 +91,9 @@ namespace nn
         {
             if (total_epochs_ == 0)
                 throw std::invalid_argument("WarmupCosineLR: total_epochs must be > 0");
+            if (warmup_epochs_ > total_epochs_)
+                throw std::invalid_argument(
+                    "WarmupCosineLR: warmup_epochs must be <= total_epochs");
         }
 
         double get_lr() const override

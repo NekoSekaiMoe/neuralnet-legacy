@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <cassert>
 #include <cstddef>
+#include <cstring>
 #include <execution>
 #include <functional>
 #include <iostream>
@@ -1784,21 +1785,36 @@ const char *name() const override { return "Conv2D"; }
         [[nodiscard]] std::size_t head_dim() const noexcept { return head_dim_; }
 
         /**
-         * Rebuilds the cos/sin table to cover positions [0, len) if needed.
-         * Grows monotonically: incremental inference extends the table as the
-         * sequence grows (no length limit, unlike learned absolute embeddings).
+         * Ensures the cos/sin table covers positions [0, len).
+         * Incremental growth: existing columns are preserved and only newly
+         * added positions are computed; capacity doubles so per-token
+         * extension during incremental inference is amortized O(1) instead
+         * of a full-table rebuild (which made generation quadratic in the
+         * trig calls, multiplied by the number of layers).
          */
         void ensure(std::size_t len)
         {
             validate_head_dim(head_dim_);
             if (len <= cached_len_)
                 return;
-            Matrix c(head_dim_, len), s(head_dim_, len);
-            for (std::size_t pos = 0; pos < len; ++pos)
+            const std::size_t new_len = std::max(len, cached_len_ * 2);
+            Matrix c(head_dim_, new_len), s(head_dim_, new_len);
+            // 行主序布局：旧行是连续段，逐行拷贝保留 [0, cached_len_) 列
+            if (cached_len_ > 0)
+                for (std::size_t r = 0; r < head_dim_; ++r)
+                {
+                    std::memcpy(c.data().data() + r * new_len,
+                                cos_cache_.data().data() + r * cached_len_,
+                                cached_len_ * sizeof(double));
+                    std::memcpy(s.data().data() + r * new_len,
+                                sin_cache_.data().data() + r * cached_len_,
+                                cached_len_ * sizeof(double));
+                }
+            for (std::size_t pos = cached_len_; pos < new_len; ++pos)
                 fill_pos_column_(c, s, pos, pos);
             cos_cache_ = std::move(c);
             sin_cache_ = std::move(s);
-            cached_len_ = len;
+            cached_len_ = new_len;
         }
 
         /**
@@ -3028,15 +3044,20 @@ n         *         to the new positions.
             {
                 if (tid >= vocab_size_)
                     throw std::out_of_range("GPTModel forward_step: token id out of range");
+                // 可学习绝对位置嵌入限制在 seq_len_ 内：越界时直接拒绝，
+                // 否则 KV 路径（钳位到末行）会与非 KV 路径（滑窗重算）
+                // 静默分歧。RoPE 无长度限制（位置表按需增长）。
+                if (!use_rope_ && cur_len_ >= seq_len_)
+                    throw std::out_of_range(
+                        "GPTModel forward_step: sequence length exceeds seq_len "
+                        "(learned absolute positional embeddings; use RoPE "
+                        "for unbounded lengths)");
                 const std::size_t pos = cur_len_++;
-                // 可学习绝对位置嵌入限制在 seq_len_ 内（超出时钳制到末位）；
-                // RoPE 无长度限制（位置表按需增长）。
-                const std::size_t pe_pos = use_rope_ ? 0 : std::min(pos, seq_len_ - 1);
                 Matrix x(d_model_, 1);
                 for (std::size_t d = 0; d < d_model_; ++d)
                     x.set_value_unchecked(d, 0,
                         token_emb_.at_unchecked(tid, d)
-                        + (use_rope_ ? 0.0 : pos_emb_.at_unchecked(pe_pos, d)));
+                        + (use_rope_ ? 0.0 : pos_emb_.at_unchecked(pos, d)));
                 for (auto &b : blocks_)
                     x = b.forward_step(x);
                 logits = lm_head_.forward(ln_f_.forward(x));

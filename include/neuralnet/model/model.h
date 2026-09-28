@@ -208,6 +208,13 @@ namespace nn
             const uint32_t version = format_version != 0
                 ? format_version
                 : (spec.has_value() ? 3u : 2u);
+            // 只接受已知版本；v3 需要 spec（否则下面会解引用空 optional，UB）
+            if (version < 1 || version > 4)
+                throw std::invalid_argument(
+                    "Model::save: unsupported format_version (supported: 1-4)");
+            if (version == 3 && !spec.has_value())
+                throw std::invalid_argument(
+                    "Model::save: format_version 3 requires a ModelSpec");
             os.write(reinterpret_cast<const char *>(&magic), sizeof(magic));
             os.write(reinterpret_cast<const char *>(&version), sizeof(version));
 
@@ -320,6 +327,26 @@ namespace nn
                 throw std::runtime_error("Unsupported model file version");
             }
 
+            // v4 记录读取：[len u32][KeyValueRecord bytes]（len=0 → 空记录）。
+            // 每次读取后检查流状态，拒绝截断；长度上限防损坏文件触发巨额分配。
+            auto read_record = [&]() -> KeyValueRecord
+            {
+                uint32_t len = 0;
+                is.read(reinterpret_cast<char *>(&len), sizeof(len));
+                if (!is)
+                    throw std::runtime_error("Truncated v4 record length");
+                if (len == 0)
+                    return KeyValueRecord{};
+                constexpr uint32_t kMaxRecordLen = 1u << 28; // 256 MiB
+                if (len > kMaxRecordLen)
+                    throw std::runtime_error("Implausible v4 record length");
+                std::string buf(len, '\0');
+                is.read(buf.data(), len);
+                if (!is)
+                    throw std::runtime_error("Truncated v4 record body");
+                return KeyValueRecord::parse(buf);
+            };
+
             if (version == 3)
             {
                 ModelSpec spec;
@@ -334,16 +361,6 @@ namespace nn
             else if (version == 4)
             {
                 // 自描述 spec（解析校验其完整性；结构一致性由参数段形状检查保证）
-                auto read_record = [&]() -> KeyValueRecord
-                {
-                    uint32_t len = 0;
-                    is.read(reinterpret_cast<char *>(&len), sizeof(len));
-                    if (len == 0)
-                        return KeyValueRecord{};
-                    std::string buf(len, '\0');
-                    is.read(buf.data(), len);
-                    return KeyValueRecord::parse(buf);
-                };
                 read_record(); // spec 记录（内容与 read_model_spec 一致）
             }
 
@@ -405,16 +422,7 @@ namespace nn
                     {
                         if (version == 4)
                         {
-                            uint32_t len = 0;
-                            is.read(reinterpret_cast<char *>(&len), sizeof(len));
-                            KeyValueRecord rec;
-                            if (len > 0)
-                            {
-                                std::string buf(len, '\0');
-                                is.read(buf.data(), len);
-                                rec = KeyValueRecord::parse(buf);
-                            }
-                            layer->load_state_kv(rec);
+                            layer->load_state_kv(read_record());
                         }
                         else
                         {

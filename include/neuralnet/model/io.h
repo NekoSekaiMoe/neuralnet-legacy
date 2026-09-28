@@ -44,13 +44,21 @@ namespace nn
             // 自描述键值 spec：[len u32][KeyValueRecord bytes]（len=0 → 无 spec）
             uint32_t len = 0;
             ifs.read(reinterpret_cast<char *>(&len), sizeof(len));
+            if (!ifs)
+                throw std::runtime_error("Truncated model spec record: " + filename);
             if (len == 0)
             {
                 spec.type = ModelType::Sequential;
                 return spec;
             }
+            // 上限防损坏文件触发巨额分配（spec 只有几个短字段，远小于此）
+            constexpr uint32_t kMaxSpecRecordLen = 1u << 20; // 1 MiB
+            if (len > kMaxSpecRecordLen)
+                throw std::runtime_error("Implausible model spec record length: " + filename);
             std::string buf(len, '\0');
             ifs.read(buf.data(), len);
+            if (!ifs)
+                throw std::runtime_error("Truncated model spec record: " + filename);
             const KeyValueRecord rec = KeyValueRecord::parse(buf);
             uint64_t u = 0;
             if (rec.get("type", u))

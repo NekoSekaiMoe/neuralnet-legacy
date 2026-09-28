@@ -14,7 +14,9 @@
 //    · 调用线程也参与执行（不空等），少量块时近似串行开销；
 //    · 队列支持多个并发 parallel_* 调用（FIFO 串行化，不嵌套不死锁）；
 //    · 归约类原语按块部分归约 + 投递线程按块序串行合并 → 确定性结果
-//      （比 TBB 的非确定归约树更可复现）。
+//      （比 TBB 的非确定归约树更可复现）；
+//    · 队头任务的块全部被抢完但仍在执行时，worker 在条件变量上等待
+//      最后一个块完成（持锁 notify），而不是忙等争用锁。
 // ══════════════════════════════════════════════════════════════════════════
 
 #include <algorithm>
@@ -81,11 +83,38 @@ namespace nn
                     bool expected = false;
                     if (job.error_set.compare_exchange_strong(expected, true))
                         job.error = std::current_exception();
-                    // 让其他块快速收敛（错误优先抛出）
-                    job.next.store(job.n_chunks, std::memory_order_relaxed);
+                    // 让其他块快速收敛（错误优先抛出）；被跳过的未抢块必须
+                    // 计入 remaining，否则任务永远无法归零（投递线程死等）。
+                    // exchange 返回的 prev 之前的块均已有人认领（各自会减一），
+                    // [prev, n_chunks) 是再也无人认领的块，由这里统一扣减。
+                    const std::size_t prev =
+                        job.next.exchange(job.n_chunks, std::memory_order_relaxed);
+                    if (prev < job.n_chunks)
+                        job.remaining.fetch_sub(job.n_chunks - prev,
+                                                std::memory_order_acq_rel);
                 }
-                job.remaining.fetch_sub(1, std::memory_order_acq_rel);
+                if (job.remaining.fetch_sub(1, std::memory_order_acq_rel) == 1)
+                {
+                    // 最后一个块完成：唤醒在 cv_ 上等待的 worker 与投递线程。
+                    // 先持锁再 notify，为等待者的谓词读取建立同步边，
+                    // 避免经典的 lost-wakeup 竞态。
+                    std::lock_guard<std::mutex> lock(mtx_);
+                    cv_.notify_all();
+                }
             }
+        }
+
+        // 队头任务是否可处理：还有可抢的块，或已完成待清理。
+        // 调用方必须持有 mtx_。“块已抢完但仍在执行”的任务不可处理：
+        // worker 应在 cv_ 上等待最后一个块完成，而不是反复加锁空转
+        // 争用 mtx_（GEMM 长块场景下会拖慢所有正在干活的线程）。
+        [[nodiscard]] bool head_actionable_() const
+        {
+            if (queue_.empty())
+                return false;
+            const Job &head = *queue_.front();
+            return head.remaining.load(std::memory_order_acquire) == 0
+                || head.next.load(std::memory_order_relaxed) < head.n_chunks;
         }
 
         void worker_loop_()
@@ -96,7 +125,7 @@ namespace nn
                 {
                     std::unique_lock<std::mutex> lock(mtx_);
                     cv_.wait(lock, [this]
-                             { return stop_ || !queue_.empty(); });
+                             { return (stop_ && queue_.empty()) || head_actionable_(); });
                     if (stop_ && queue_.empty())
                         return;
                     job = queue_.front(); // shared_ptr 拷贝：任务对象生命周期安全
@@ -134,8 +163,13 @@ namespace nn
 
             run_chunks_(*job);
 
-            while (job->remaining.load(std::memory_order_acquire) != 0)
-                std::this_thread::yield();
+            // 等待完成：在 cv_ 上等待（最后一个完成的块会持锁 notify 唤醒），
+            // 替代 yield 自旋空耗 CPU。
+            {
+                std::unique_lock<std::mutex> lock(mtx_);
+                cv_.wait(lock, [&job]
+                         { return job->remaining.load(std::memory_order_acquire) == 0; });
+            }
 
             {
                 std::lock_guard<std::mutex> lock(mtx_);

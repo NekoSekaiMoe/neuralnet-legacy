@@ -69,8 +69,10 @@ if(BUILD_TESTING)
         muon_tall_matrix
         muon_quadratic_convergence
         warmup_cosine_lr
+        warmup_cosine_rejects_warmup_gt_total
         keyvalue_record_roundtrip
         keyvalue_record_skips_unknown_type
+        keyvalue_record_serialize_limits
         step_lr
         cosine_lr
         exp_lr
@@ -84,6 +86,8 @@ if(BUILD_TESTING)
         model_save_load_v2
         model_save_load_v4
         model_v4_spec_roundtrip
+        model_save_rejects_bad_format_version
+        model_load_v4_truncated_rejected
         model_load_state_count_mismatch
         one_hot
         e2e_train
@@ -119,6 +123,7 @@ if(BUILD_TESTING)
         summary_contains_all_layer_names
         summary_output_stream
         threadpool_parallel_for
+        threadpool_exception_skipped_chunks
         gemm_microkernel_odd_shapes
         matmul_tn_microkernel
     )
@@ -208,6 +213,7 @@ if(BUILD_TESTING)
         kv_cache_matches_full
         generate_kv_matches_full
         generate_rope_beyond_seq_len
+        generate_abs_beyond_seq_len_throws
         generate_empty_prompt_throws
     )
     foreach(name ${gpt_test_names})

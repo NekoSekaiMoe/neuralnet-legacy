@@ -8,7 +8,9 @@
 #include <neuralnet/threadpool.h>
 
 #include <cassert>
+#include <atomic>
 #include <cmath>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <fstream>
@@ -16,7 +18,9 @@
 #include <numeric>
 #include <random>
 #include <sstream>
+#include <stdexcept>
 #include <string>
+#include <thread>
 #include <tuple>
 #include <vector>
 
@@ -2309,6 +2313,35 @@ static void test_warmup_cosine_lr()
     std::puts("  [WarmupCosineLR] 预热 + 余弦退火 PASSED");
 }
 
+// warmup > total 回绕 size_t 减法 → lr 永远停在峰值：构造时必须拒绝
+static void test_warmup_cosine_rejects_warmup_gt_total()
+{
+    std::puts("  [WarmupCosineLR] warmup > total 拒绝 ...");
+
+    bool threw = false;
+    try
+    {
+        nn::WarmupCosineLR bad(/*lr_max=*/1.0, /*total=*/10, /*warmup=*/11);
+        (void)bad;
+    }
+    catch (const std::invalid_argument &)
+    {
+        threw = true;
+    }
+    assert(threw);
+
+    // 合法边界：warmup == total 仍接受（预热全程爬坡；余弦段长度为 0，
+    // 结束后恒为 lr_max，不会回绕）
+    nn::WarmupCosineLR edge(1.0, 10, 10);
+    edge.step();
+    assert(approx(edge.get_lr(), 0.2)); // epoch 1: 1*(1+1)/10
+    for (int i = 0; i < 9; ++i)
+        edge.step();
+    assert(approx(edge.get_lr(), 1.0)); // 预热结束后恒峰值
+
+    std::puts("  [WarmupCosineLR] warmup > total 拒绝 PASSED");
+}
+
 // ══════════════════════════════════════════════════════════════════════════
 //  KeyValueRecord（移植自上游 model_keyvalue_record）
 // ══════════════════════════════════════════════════════════════════════════
@@ -2371,6 +2404,44 @@ static void test_keyvalue_record_skips_unknown_type()
     assert(rec.get("y", y) && y == 42); // 后续字段不受影响
 
     std::puts("  [KeyValueRecord] 未知类型按长度跳过 PASSED");
+}
+
+// serialize 与 parse 对称的长度限制：超限必须抛异常而不是静默截断
+// 长度前缀（否则写出加载不回的文件）
+static void test_keyvalue_record_serialize_limits()
+{
+    std::puts("  [KeyValueRecord] serialize 长度限制 ...");
+
+    // key 超过 256 字节
+    nn::KeyValueRecord long_key;
+    long_key.set(std::string(257, 'k'), uint64_t{1});
+    bool threw = false;
+    try
+    {
+        (void)long_key.serialize();
+    }
+    catch (const std::length_error &)
+    {
+        threw = true;
+    }
+    assert(threw);
+
+    // 字段数超过 4096
+    nn::KeyValueRecord many;
+    for (std::size_t i = 0; i < 4097; ++i)
+        many.set("k" + std::to_string(i), uint64_t{i});
+    threw = false;
+    try
+    {
+        (void)many.serialize();
+    }
+    catch (const std::length_error &)
+    {
+        threw = true;
+    }
+    assert(threw);
+
+    std::puts("  [KeyValueRecord] serialize 长度限制 PASSED");
 }
 
 // ══════════════════════════════════════════════════════════════════════════
@@ -2449,6 +2520,113 @@ static void test_model_v4_spec_roundtrip()
     std::puts("  [model io v4] ModelSpec 键值读写 PASSED");
 }
 
+// save 拒绝未知版本号（旧实现会解引用空 optional 或写出无法加载的文件）
+static void test_model_save_rejects_bad_format_version()
+{
+    std::puts("  [model io] save 拒绝非法 format_version ...");
+
+    nn::Model model;
+    model.add<nn::Linear>(2, 2);
+
+    bool threw = false;
+    try
+    {
+        std::stringstream ss;
+        model.save(ss, std::nullopt, /*format_version=*/5);
+    }
+    catch (const std::invalid_argument &)
+    {
+        threw = true;
+    }
+    assert(threw); // 未知版本
+
+    threw = false;
+    try
+    {
+        std::stringstream ss;
+        model.save(ss, std::nullopt, /*format_version=*/3);
+    }
+    catch (const std::invalid_argument &)
+    {
+        threw = true;
+    }
+    assert(threw); // v3 必须提供 spec
+
+    // 1-4 均可写出（v3 需带 spec）
+    for (uint32_t v = 1; v <= 4; ++v)
+    {
+        std::stringstream ss;
+        if (v == 3)
+        {
+            nn::ModelSpec spec;
+            model.save(ss, spec, v);
+        }
+        else
+        {
+            model.save(ss, std::nullopt, v);
+        }
+    }
+
+    std::puts("  [model io] save 拒绝非法 format_version PASSED");
+}
+
+// v4 加载拒绝截断文件（旧实现静默当空记录/零值继续解析）
+static void test_model_load_v4_truncated_rejected()
+{
+    std::puts("  [model io v4] 截断文件拒绝加载 ...");
+
+    nn::Model model;
+    model.add<nn::Linear>(4, 3);
+    model.add<nn::BatchNorm1d>(3);
+
+    nn::ModelSpec spec;
+    std::stringstream ss;
+    model.save(ss, spec, /*format_version=*/4);
+    const std::string full = ss.str();
+
+    // 布局：[magic 4][version 4][spec 记录：len 4 + body][参数段…][状态记录…]
+    // 截断在 spec 记录的长度前缀内 / 记录体内 → 必须报错而不是静默继续
+    for (const std::size_t cut : {9u, 10u, 11u, 13u, 40u})
+    {
+        assert(cut < full.size());
+        std::stringstream trunc(full.substr(0, cut));
+        nn::Model loaded;
+        loaded.add<nn::Linear>(4, 3);
+        loaded.add<nn::BatchNorm1d>(3);
+        bool threw = false;
+        try
+        {
+            loaded.load(trunc);
+        }
+        catch (const std::runtime_error &)
+        {
+            threw = true;
+        }
+        assert(threw);
+    }
+
+    // 截断在尾部状态记录体内（BatchNorm 状态记录远大于截掉的尾部）
+    for (const std::size_t back : {1u, 3u, 7u})
+    {
+        std::stringstream trunc(full.substr(0, full.size() - back));
+        nn::Model loaded;
+        loaded.add<nn::Linear>(4, 3);
+        loaded.add<nn::BatchNorm1d>(3);
+        bool threw = false;
+        try
+        {
+            loaded.load(trunc);
+        }
+        catch (const std::runtime_error &)
+        {
+            threw = true;
+        }
+        assert(threw);
+    }
+
+    std::puts("  [model io v4] 截断文件拒绝加载 PASSED");
+}
+
 // ══════════════════════════════════════════════════════════════════════════
 //  自包含线程池（移植自上游 core_threadpool）
 // ══════════════════════════════════════════════════════════════════════════
@@ -2491,6 +2669,38 @@ static void test_threadpool_parallel_for()
     assert(threw);
 
     std::printf("  [ThreadPool] workers=%zu ... PASSED\n", pool.num_workers());
+}
+
+// 异常路径回归：某块抛出时仍有大量块未被认领，被跳过的块必须计入
+// remaining，否则任务永远无法归零 → 投递线程死等（修复前仅靠时序侥幸
+// 不挂）。用小睡拉长块执行时间，确保抛出时后续块尚未被抢。
+static void test_threadpool_exception_skipped_chunks()
+{
+    std::puts("  [ThreadPool] 异常路径：被跳过的块计入 remaining ...");
+
+    auto &pool = nn::ThreadPool::global();
+    bool threw = false;
+    try
+    {
+        pool.parallel_for(4096, [](std::size_t i)
+                          {
+                              if (i == 31)
+                                  throw std::runtime_error("boom");
+                              std::this_thread::sleep_for(std::chrono::microseconds(200));
+                          });
+    }
+    catch (const std::runtime_error &)
+    {
+        threw = true;
+    }
+    assert(threw);
+
+    // 池仍可正常工作（任务出队、状态干净）
+    std::atomic<std::size_t> done{0};
+    pool.parallel_for(1000, [&](std::size_t) { done.fetch_add(1, std::memory_order_relaxed); });
+    assert(done.load() == 1000);
+
+    std::puts("  [ThreadPool] 异常路径 PASSED");
 }
 
 // ══════════════════════════════════════════════════════════════════════════
@@ -2665,11 +2875,16 @@ static const test_entry all_tests[] = {
     {"muon_tall_matrix",                 test_muon_tall_matrix},
     {"muon_quadratic_convergence",       test_muon_quadratic_convergence},
     {"warmup_cosine_lr",                 test_warmup_cosine_lr},
+    {"warmup_cosine_rejects_warmup_gt_total", test_warmup_cosine_rejects_warmup_gt_total},
     {"keyvalue_record_roundtrip",        test_keyvalue_record_roundtrip},
     {"keyvalue_record_skips_unknown_type", test_keyvalue_record_skips_unknown_type},
+    {"keyvalue_record_serialize_limits", test_keyvalue_record_serialize_limits},
     {"model_save_load_v4",               test_model_save_load_v4},
     {"model_v4_spec_roundtrip",          test_model_v4_spec_roundtrip},
+    {"model_save_rejects_bad_format_version", test_model_save_rejects_bad_format_version},
+    {"model_load_v4_truncated_rejected", test_model_load_v4_truncated_rejected},
     {"threadpool_parallel_for",          test_threadpool_parallel_for},
+    {"threadpool_exception_skipped_chunks", test_threadpool_exception_skipped_chunks},
     {"gemm_microkernel_odd_shapes",      test_gemm_microkernel_odd_shapes},
     {"matmul_tn_microkernel",            test_matmul_tn_microkernel},
 };

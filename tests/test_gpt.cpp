@@ -260,8 +260,13 @@ static void test_alibi_causality_and_effect()
         for (std::size_t d = 0; d < 8; ++d)
             assert(std::fabs(o1.at_unchecked(d, t) - o2.at_unchecked(d, t)) < 1e-12);
 
-    // 与无 ALiBi 的输出不同（偏置生效）
+    // 与无 ALiBi 的输出不同（偏置生效）。两个实例的随机初始化不同，
+    // 若不同步权重，"输出不同"恒真（权重差异即可造成），测不到 ALiBi 本身。
     nn::MultiHeadAttention plain(8, 2, true);
+    auto wp = plain.parameters();
+    auto wa = attn.parameters();
+    for (std::size_t k = 0; k < wp.size(); ++k)
+        wp[k].get() = wa[k].get();
     nn::Matrix o0 = plain.forward(x1);
     bool differs = false;
     for (std::size_t i = 0; i < o0.size(); ++i)
@@ -368,6 +373,24 @@ static void test_generate_rope_beyond_seq_len()
     std::puts("  PASSED  generate_rope_beyond_seq_len");
 }
 
+// 学习式绝对位置嵌入：生成超出 seq_len_ 时 KV 路径显式报错，而不是钳位到
+// 末行静默偏离非 KV 路径（滑窗重算）的结果
+static void test_generate_abs_beyond_seq_len_throws()
+{
+    nn::GPTModel model(9, 8, 4, 2, 12, 1, /*use_rope=*/false);
+    bool threw = false;
+    try
+    {
+        (void)model.generate({1, 2, 3}, 8, 0.0, /*use_kv_cache=*/true);
+    }
+    catch (const std::out_of_range &)
+    {
+        threw = true;
+    }
+    assert(threw);
+    std::puts("  PASSED  generate_abs_beyond_seq_len_throws");
+}
+
 static void test_generate_empty_prompt_throws()
 {
     nn::GPTModel model(9, 8, 4, 2, 12, 1);
@@ -404,6 +427,7 @@ static const TestEntry tests[] = {
     {"kv_cache_matches_full", test_kv_cache_matches_full},
     {"generate_kv_matches_full", test_generate_kv_matches_full},
     {"generate_rope_beyond_seq_len", test_generate_rope_beyond_seq_len},
+    {"generate_abs_beyond_seq_len_throws", test_generate_abs_beyond_seq_len_throws},
     {"generate_empty_prompt_throws", test_generate_empty_prompt_throws}
 };
 

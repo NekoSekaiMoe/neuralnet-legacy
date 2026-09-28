@@ -12,15 +12,23 @@
 #include "test_runner.h"
 
 #include <algorithm>
-#include <cassert>
 #include <cmath>
 #include <cstdio>
 #include <random>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
 namespace
 {
+    // 断言改抛异常：assert 失败会 abort()，无法被 run_tests 捕获输出统一的
+    // FAILED 汇总；抛 runtime_error 可报告失败信息并继续跑同进程的其他用例
+    // （CMake 已加 -UNDEBUG，Release 下本也可生效，这里是可观测性问题）。
+    void require(bool cond, const std::string &msg)
+    {
+        if (!cond)
+            throw std::runtime_error(msg);
+    }
 
     std::mt19937_64 &grad_rng()
     {
@@ -61,7 +69,7 @@ namespace
     {
         auto params = layer.parameters();
         auto grads = layer.param_gradients();
-        assert(pidx < params.size());
+        require(pidx < params.size(), "param index out of range");
 
         nn::Matrix &p = params[pidx].get();
 
@@ -100,7 +108,10 @@ namespace
         }
         std::printf("  [gradcheck] %-28s param[%zu] worst rel err = %.2e\n",
                     what, pidx, worst);
-        assert(worst < tol);
+        require(worst < tol,
+                std::string(what) + ": param[" + std::to_string(pidx)
+                    + "] rel err " + std::to_string(worst)
+                    + " >= tol " + std::to_string(tol));
     }
 
     // ── 输入梯度检查（抽样 max_elem 个元素）────────────────────────────
@@ -129,7 +140,9 @@ namespace
         }
         std::printf("  [gradcheck] %-28s input     worst rel err = %.2e\n",
                     what, worst);
-        assert(worst < tol);
+        require(worst < tol,
+                std::string(what) + ": input rel err " + std::to_string(worst)
+                    + " >= tol " + std::to_string(tol));
     }
 
     // ════════════════════════════════════════════════════════════════════
@@ -269,7 +282,9 @@ namespace
         auto grads = model.param_gradients();
         const nn::Matrix &pos_grad = grads[1].get();
         for (std::size_t i = 0; i < pos_grad.size(); ++i)
-            assert(pos_grad.data()[i] == 0.0); // RoPE 下位置嵌入不参与前向
+            require(pos_grad.data()[i] == 0.0,
+                    "pos_emb grad must be zero under RoPE (i=" + std::to_string(i)
+                        + ")"); // RoPE 下位置嵌入不参与前向
     }
 
 } // namespace
